@@ -139,6 +139,7 @@ class TargetSelection:
     outcome: str = "selected"
     snapshot: dict = None
     reason: str = ""
+    gpu_impact: dict = None
 
     @property
     def paths(self):
@@ -270,7 +271,7 @@ class GitHub:
 class InferenceHub:
     """Same bearer-authenticated chat-completions integration as cuDNN triage."""
 
-    def __init__(self, api_key=None, base_url=None, model=None):
+    def __init__(self, api_key=None, base_url=None, model=None, reasoning_effort=None):
         self.api_key = (
             api_key if api_key is not None else os.getenv("INFERENCE_API_KEY", "")
         )
@@ -279,6 +280,7 @@ class InferenceHub:
         ).rstrip("/")
         self.model = model or os.getenv("CI_BOT_TARGET_MODEL") or DEFAULT_MODEL
         self.deadline = None
+        self.reasoning_effort = reasoning_effort
         parsed = urlsplit(self.base_url)
         if (
             parsed.scheme != "https"
@@ -303,6 +305,8 @@ class InferenceHub:
                 {"role": "user", "content": json.dumps(context)},
             ],
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         for attempt in range(3):
             request = urllib.request.Request(
                 self.base_url + "/chat/completions",
@@ -468,14 +472,14 @@ class PytestTargetSelector:
         if not 0 < self.timeout <= 420:
             raise ValueError("CI_BOT_TARGET_TIMEOUT_SECONDS must be between 0 and 420")
 
-    def select(self, pr):
+    def select(self, pr, *, include_gpu_impact=False):
         if not self.inference.api_key:
             raise TargetSelectionError("INFERENCE_API_KEY is not configured")
         deadline = time.monotonic() + self.timeout
         self.inference.deadline = deadline
         self.github.deadline = deadline
         try:
-            return self._select(pr)
+            return self._select(pr, include_gpu_impact=include_gpu_impact)
         except TargetSelectionError:
             raise
         except Exception as error:
@@ -483,7 +487,7 @@ class PytestTargetSelector:
         finally:
             self.github.close_merge_snapshot()
 
-    def _select(self, pr):
+    def _select(self, pr, *, include_gpu_impact=False):
         snapshot = resolve_merge_snapshot(self.github, pr)
         repo = pr["base"]["repo"]["full_name"]
         tree = self.github.get_repository_tree(repo, snapshot["tree_sha"])
@@ -521,25 +525,51 @@ class PytestTargetSelector:
             and path.count("/") <= 2
             or path in ("pytest.ini", "pyproject.toml")
         )
+        warnings = []
+        secrets = (
+            os.getenv("GH_TOKEN"),
+            os.getenv("GITHUB_TOKEN"),
+            os.getenv("INFERENCE_API_KEY"),
+            self.inference.api_key,
+        )
+
+        def optional_error(message, path=None):
+            if not include_gpu_impact:
+                raise TargetSelectionError(message)
+            if isinstance(path, str):
+                message += ": " + _redact_credentials(path, secrets)[:200]
+            warnings.append(message)
+
         ci_files = {}
-        for path in (
-            ".github/workflows/pr-test.yml",
-            "scripts/infra/pr_checks/targeted_lane_scope.py",
-        ):
-            text = self.read_ci_file(path)
+
+        def read_routing(path):
+            try:
+                text = self.read_ci_file(path)
+            except OSError:
+                if not include_gpu_impact:
+                    raise
+                text = None
             if not text:
-                raise TargetSelectionError("CI routing evidence is unavailable")
-            ci_files[path] = text
+                optional_error("CI routing evidence is unavailable", path)
+            else:
+                ci_files[path] = text
+
+        pr_test = ".github/workflows/pr-test.yml"
+        read_routing(pr_test)
+        read_routing("scripts/infra/pr_checks/targeted_lane_scope.py")
         # Historical replay reads routing at its selected CI revision. Older
-        # monolithic workflows need no dispatcher; split workflows must supply it.
-        if "# CI_BOT_PR_TEST_DISPATCH_V1:" in ci_files[".github/workflows/pr-test.yml"]:
-            path = ".github/workflows/pr-test-dispatch.yml"
-            text = self.read_ci_file(path)
-            if not text:
-                raise TargetSelectionError("CI routing evidence is unavailable")
-            ci_files[path] = text
+        # monolithic workflows need no dispatcher.
+        if "# CI_BOT_PR_TEST_DISPATCH_V1:" in ci_files.get(pr_test, ""):
+            read_routing(".github/workflows/pr-test-dispatch.yml")
         candidates = [path for path in inventory if _TEST_FILE.fullmatch(path)]
         candidate_set = set(candidates)
+        if include_gpu_impact:
+            from gpu_impact import outside_experimental_scope
+
+            # Preserve outside diffs first when the gate needs to verify isolation.
+            changed = sorted(
+                changed, key=lambda item: not outside_experimental_scope(item)
+            )
         try:
             budget = EvidenceContext(
                 pr,
@@ -554,17 +584,15 @@ class PytestTargetSelector:
             raise TargetSelectionError(str(error)) from error
         context = budget.context
         files = context["source_files"]
-        visible_paths = set(
-            context["inventory_at_merged_tree"]
-            + context["candidate_test_files"]
-            + context["configuration_files"]
-        )
-
-        secrets = (
-            os.getenv("GH_TOKEN"),
-            os.getenv("GITHUB_TOKEN"),
-            os.getenv("INFERENCE_API_KEY"),
-            self.inference.api_key,
+        # Ordinary bot commands retain their original, bounded evidence inventory.
+        readable_paths = (
+            blobs
+            if include_gpu_impact
+            else set(
+                context["inventory_at_merged_tree"]
+                + context["candidate_test_files"]
+                + context["configuration_files"]
+            )
         )
 
         def infer(task):
@@ -606,32 +634,93 @@ class PytestTargetSelector:
                 reserve,
             )
 
+        def inspect_optional(path, reserve=0):
+            try:
+                inspect(path, reserve)
+            except (
+                TargetSelectionError,
+                ValueError,
+                OSError,
+                subprocess.SubprocessError,
+            ):
+                if not include_gpu_impact:
+                    raise
+                budget.unavailable(path, "file could not be read")
+            if include_gpu_impact and path not in files:
+                optional_error("Supplemental evidence is unavailable", path)
+
+        added_source_evidence = set()
+        if include_gpu_impact:
+            added_source_evidence = {
+                item["filename"]
+                for item in context["changed_files"]
+                if item.get("status") == "added"
+                and item["filename"] in blobs
+                and not item.get("patch")
+                and outside_experimental_scope(item)
+            }
+            # A complete new file can stand in for a patch trimmed from the context.
+            for path in sorted(added_source_evidence):
+                inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+
         for path in context["configuration_files"]:
-            inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+            inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         # Include changed test bodies before asking the model for more evidence.
-        for path in sorted(changed_paths & set(context["candidate_test_files"])):
-            inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+        changed_candidates = changed_paths & set(context["candidate_test_files"])
+        for path in sorted(changed_candidates - added_source_evidence):
+            inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+
+        if include_gpu_impact:
+            # Include changed implementations and nonstandard added tests too;
+            # GPU impact is not limited to the selected pytest candidates.
+            for path in sorted(
+                (changed_paths & blobs.keys())
+                - changed_candidates
+                - added_source_evidence
+            ):
+                inspect_optional(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         evidence = infer(EVIDENCE_PROMPT)
         requested = evidence.get("read_paths")
         if not isinstance(requested, list) or len(requested) > MAX_READ_FILES:
-            raise TargetSelectionError("AI returned an invalid evidence-file list")
+            optional_error("AI returned an invalid evidence-file list")
+            requested = []
         for path in sorted(
             requested,
             key=lambda path: not isinstance(path, str) or path not in candidate_set,
         ):
             if not isinstance(path, str) or (
-                path not in visible_paths and path not in ci_files
+                path not in readable_paths and path not in ci_files
             ):
-                raise TargetSelectionError(
-                    "AI requested a file outside the supplied repository inventory"
+                optional_error(
+                    "AI requested a file outside the supplied repository inventory",
+                    path,
                 )
+                continue
             # Trusted routing is already in context and may not exist in the merged tree.
             if path in ci_files:
                 continue
-            inspect(path)
-        result = infer(SELECTION_PROMPT)
+            inspect_optional(path)
+        selection_prompt = SELECTION_PROMPT
+        if include_gpu_impact:
+            from gpu_impact import PROMPT
+
+            selection_prompt += PROMPT
+        result = infer(selection_prompt)
+        impact = None
+        if include_gpu_impact:
+            from gpu_impact import validate_impact
+
+            impact = validate_impact(
+                result.get("gpu_impact"), context, file_count_mismatch
+            )
+            impact["evidence_warnings"] = warnings
+
+        def invalid_selection(message):
+            optional_error(message)
+            return TargetSelection([], "needs_maintainer", snapshot, message, impact)
+
         outcome, raw = result.get("outcome"), result.get("targets")
         if outcome not in (
             "selected",
@@ -639,13 +728,13 @@ class PytestTargetSelector:
             "no_pytest_change",
             "needs_maintainer",
         ) or not isinstance(raw, list):
-            raise TargetSelectionError("AI returned an invalid target selection")
+            return invalid_selection("AI returned an invalid target selection")
         if outcome != "selected":
             if raw:
-                raise TargetSelectionError("AI returned contradictory target selection")
+                return invalid_selection("AI returned contradictory target selection")
             reason = result.get("reason")
             if not isinstance(reason, str) or not reason.strip():
-                raise TargetSelectionError("AI decision is missing its explanation")
+                return invalid_selection("AI decision is missing its explanation")
             reason = _public_prose(reason, secrets)
             if outcome == "full_suite" and (
                 file_count_mismatch
@@ -657,10 +746,11 @@ class PytestTargetSelector:
                     "needs_maintainer",
                     snapshot,
                     "The complete PR change description could not be verified; review the scope manually.",
+                    impact,
                 )
-            return TargetSelection([], outcome, snapshot, reason)
+            return TargetSelection([], outcome, snapshot, reason, impact)
         if not 1 <= len(raw) <= MAX_TARGETS:
-            raise TargetSelectionError("AI must select between one and ten targets")
+            return invalid_selection("AI must select between one and ten targets")
         inspected_tests = {
             name
             for name in candidates
@@ -669,10 +759,12 @@ class PytestTargetSelector:
         targets = []
         for item in raw:
             if not isinstance(item, dict):
-                raise TargetSelectionError("AI returned an invalid target")
+                optional_error("AI returned an invalid target")
+                continue
             path = item.get("path", "")
             if not isinstance(path, str) or not _PATH.fullmatch(path):
-                raise TargetSelectionError("AI returned an invalid pytest path")
+                optional_error("AI returned an invalid pytest path")
+                continue
             normalized = path.rstrip("/")
             inspected = any(
                 name == normalized or name.startswith(normalized + "/")
@@ -681,20 +773,26 @@ class PytestTargetSelector:
             if not inspected or (
                 normalized.endswith(".py") and normalized not in candidate_set
             ):
-                raise TargetSelectionError(
-                    "AI target has no inspected executable test candidate in the merged tree"
+                optional_error(
+                    "AI target has no inspected executable test candidate in the merged tree",
+                    normalized,
                 )
-            fields = []
-            for key in ("reason", "gpu_requirement", "ci_evidence"):
-                value = item.get(key)
-                if not isinstance(value, str) or not value.strip():
-                    raise TargetSelectionError(
-                        "AI target is missing applicability or CI execution evidence"
-                    )
-                # Reasons are public prose, never HTML/comments or notification markers.
-                fields.append(_public_prose(value, secrets))
+                continue
+            fields = [
+                item.get(key) for key in ("reason", "gpu_requirement", "ci_evidence")
+            ]
+            if any(not isinstance(value, str) or not value.strip() for value in fields):
+                optional_error(
+                    "AI target is missing applicability or CI execution evidence",
+                    normalized,
+                )
+                continue
+            # Reasons are public prose, never HTML/comments or notification markers.
+            fields = [_public_prose(value, secrets) for value in fields]
             if normalized not in [target.path for target in targets]:
                 targets.append(PytestTarget(normalized, *fields))
+        if not targets:
+            return TargetSelection([], "needs_maintainer", snapshot, gpu_impact=impact)
         # A directory already covers its descendant files; preserve rationale order.
         targets = [
             target
@@ -704,7 +802,7 @@ class PytestTargetSelector:
                 for other in targets
             )
         ]
-        return TargetSelection(targets, snapshot=snapshot)
+        return TargetSelection(targets, snapshot=snapshot, gpu_impact=impact)
 
 
 def parse_run_command(command):

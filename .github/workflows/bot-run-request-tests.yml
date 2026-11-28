@@ -1,0 +1,26 @@
+name: Bot Run Request Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bot-run-request*.yml'
+      - 'scripts/infra/pr_checks/**'
+      - 'scripts/infra/tests/test_check_bot_run_request.py'
+      - 'tests/infra/test_sharding/test_ai*.py'
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Bot run request CPU tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Untrusted PR code is tested here with no inference or write credential.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/infra/tests -p test_check_bot_run_request.py -v
+      - run: python3 -m unittest discover -s tests/infra/test_sharding -p test_ai_scope_transport.py -v

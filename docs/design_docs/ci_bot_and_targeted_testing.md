@@ -273,3 +273,127 @@ bounded to 15 seconds each, with a five-second forced-termination grace period.
 A helper timeout follows the rejection path before publishing statuses or
 applying a CI label. Feedback still depends on GitHub availability and the runner
 remaining alive within the ten-minute job limit.
+
+## Bot Run Request Check
+
+`Bot Run Request Check` is a separate merge gate for internal `/bot run`
+requests. It does **not** aggregate pipeline results or establish test coverage.
+All prompts and diagnostics appear in Check Details and the Actions summary;
+the check never posts conversation comments or reactions.
+
+The gate first scans the PR's paginated comment history for a response from the
+trusted `flashinfer-bot` account to an internal `/bot run` request. Pipeline
+acknowledgements, AI advice saying no pipeline was started, authorization
+rejections and trigger errors all qualify. A qualifying historical response
+continues to satisfy this policy after new commits. The gate does not require
+pipeline creation, a passing result or a matching tested commit. Unrelated
+bot reports, public `@flashinfer-bot` suggestions and copied replies do not count.
+Finding a qualifying response skips base SHA lookup, source inspection and
+inference. The gate still verifies that the PR head and target branch are current.
+
+Without a reply, the gate exempts documentation-only, CPU-only and
+experimental-only changes. It checks for documentation first, including
+Python comment and docstring edits verified against both versions of the file.
+Changes confined to the experimental source/test trees and documentation can
+also be classified without inference. An experimental
+opt-in in core can qualify if the evidence establishes that stable GPU behavior
+is unchanged. The analysis prioritizes outside diffs and can use the full
+source of an added file. The Check cites the evidence that supports the
+conclusion. An uncited supplemental diff does not by itself prevent exemption.
+Mixed changes that affect stable GPU behavior still require a bot
+response. Experimental tests run in their own lane. To run a specific
+experimental test via the internal bot, use
+`/bot run tests/experimental/<test-file>.py`. The default `/bot run all`
+collection skips this directory.
+
+The optional GPU-impact analysis extends `ai_test_scope.py` with the same
+inspected source/test/CI evidence and an independent impact assessment. File
+extensions and `tests/cpu/` alone cannot establish CPU-only behavior. CUDA
+compilation can run on the host. CI scheduling, cache population, lint and
+other host-only build checks can qualify as CPU-only if GPU-free validation
+covers the change and runtime behavior stays unchanged. Changes affecting
+device execution, such as emitted device code, runtime dispatch, layouts,
+workspace, CUDA graphs, synchronization and communication, can require GPU
+validation even when a build runs on a CPU runner. New PR tests are included
+even if they are not among the recommended targets.
+Stable GPU changes still require a bot response when no test case was selected.
+The gate skips missing or invalid supplemental file requests and drops invalid
+test suggestions. Check Details lists warnings alongside the impact result.
+The gate can read requested regular files from the pinned PR tree. Ordinary
+bot commands use the model's bounded file inventory.
+The GPU-impact response uses compact JSON with default reasoning. If analysis
+fails validation or returns `unknown`, the gate retries once with
+`reasoning_effort=minimal`. A validated evidence-file request is reused only
+when its context is unchanged. If the second impact analysis is still
+uncertain or invalid, the check fails and requires
+`/bot run` and an internal bot response. A known stable GPU change requires a
+reply immediately, without a model retry.
+
+Use retained patches and supplied file bodies whenever they are available.
+Only when neither content source is supplied and the context budget omitted it
+may GPU classification fall back to the filename/path. The check records this
+as filename-only evidence. The model still must not infer CPU-only merely from
+a `.py` suffix or a `tests/cpu/` location. Under this gate's policy, filename-only
+evidence does not by itself trigger a hard rejection of a model's CPU/docs
+classification; the model should return `unknown` if it cannot support one. Missing patch text
+is informational and does not automatically override a documentation/CPU-only
+model conclusion. The model should return `unknown` when the available evidence
+cannot support a conclusion. An incomplete changed-file list or invalid
+classification evidence still prevents an exemption. A verified bot
+response remains sufficient even when analysis is unavailable.
+
+| State without a qualifying bot response | Check result |
+| --- | --- |
+| Documentation/CPU-only change | Success: bot run not required, with reason |
+| Experimental-only change | Success: bot run optional, with an explicit experimental test command |
+| Stable GPU change, no command | Failure: comment `/bot run` |
+| Stable GPU change, command found | Failure: waiting for `flashinfer-bot`, with command link |
+| Unable to establish GPU impact | Failure: specific missing evidence/error and next action |
+
+Commands with multiple spaces or tabs, such as `/bot  run tests/attention`, are
+recognized. This check does not repeat the internal bot's path validation;
+invalid trailing arguments still count as a request for the waiting message,
+and the bot's rejection response satisfies the agreed response-only policy.
+Quoted examples, fenced code and prose mentions do not issue commands.
+
+Changed files are read from an immutable comparison of the captured base and
+head commit SHAs, and that same list/base is used throughout source analysis.
+A partial comparison (including GitHub's 300-file compare limit) cannot grant
+an exemption. The gate rechecks the live PR before completing the Check.
+For conclusions that depend on source, it also rechecks the base after
+preparing the Check payload, immediately before writing it. A detected
+snapshot change completes the captured Check as stale and re-evaluates once.
+A second snapshot change finishes with a failure and rerun instruction.
+Post-start evidence read failures complete the Check with a failure reason.
+The ref read and Check write are separate GitHub API calls, so a base advance
+between them can still occur.
+
+The trusted default-branch workflow handles PR open/synchronize/reopen/ready and
+base-edit events, plus PR comment creation/edit/deletion. It publishes a stable
+Check on the PR head through the Checks API (not on `issue_comment`'s default
+branch SHA). A per-head/base/analysis-version result can reuse its impact
+assessment, but comments are read again on every event so deleted responses do
+not persist as cached exemptions. Stale head/base completions are discarded.
+A manual dispatch with `pr_number` can re-evaluate an existing PR.
+PR source is evidence only: no imports, installs or test collection are allowed
+in the credential-bearing job. A separate read-only PR workflow runs CPU tests
+of this implementation before its default-branch handler is deployed.
+
+### Enabling the merge blocker
+
+After the implementation is merged to the default branch and has emitted its
+first check, a repository administrator must add the exact **Bot Run Request
+Check** context from GitHub Actions as a required status check in the `main`
+branch protection/ruleset. Preserve other required checks and review/bypass
+settings. Verify that a missing/failing result blocks merging and that a
+qualifying response or CPU/docs exemption satisfies this requirement. The
+workflow alone does not configure branch protection. If merge queue is enabled,
+add merge-group evaluation before requiring this context for queued merges;
+this version handles individual PR heads.
+
+Verify comment-trigger refresh in the target repository after deployment;
+GitHub suppresses follow-up workflows for events produced using `GITHUB_TOKEN`,
+whereas the internal bot uses its separate account token. Existing bot replies
+can be consumed without changing the internal service or accessing GitLab APIs.
+The existing `PR Test / Test Results Summary` remains independent: passing this
+response check does not waive any other required test result.
