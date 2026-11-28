@@ -24,7 +24,6 @@ from shutil import which
 import subprocess
 import sys
 import tempfile
-import zipfile
 
 import click
 from packaging.requirements import InvalidRequirement, Requirement
@@ -191,21 +190,14 @@ def _detect_jit_cache_target_tags() -> tuple[str, ...]:
 
 
 def _read_jit_cache_provider_tags(
-    shim_wheel: Path, expected_version: str
+    shim_dir: Path, expected_version: str
 ) -> tuple[str, ...]:
-    """Read the provider inventory from an exact shim wheel."""
+    """Read the provider inventory from an exact shim installed into shim_dir."""
     try:
-        with zipfile.ZipFile(shim_wheel) as archive:
-            metadata_paths = [
-                path
-                for path in archive.namelist()
-                if path.endswith(".dist-info/METADATA")
-            ]
-            if len(metadata_paths) != 1:
-                raise ValueError(
-                    f"expected one METADATA file, found {len(metadata_paths)}"
-                )
-            metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+        metadata_paths = sorted(shim_dir.glob("*.dist-info/METADATA"))
+        if len(metadata_paths) != 1:
+            raise ValueError(f"expected one METADATA file, found {len(metadata_paths)}")
+        metadata = BytesParser().parsebytes(metadata_paths[0].read_bytes())
 
         if canonicalize_name(metadata["Name"] or "") != "flashinfer-jit-cache":
             raise ValueError(f"unexpected distribution {metadata['Name']!r}")
@@ -232,10 +224,10 @@ def _read_jit_cache_provider_tags(
         InvalidVersion,
         OSError,
         ValueError,
-        zipfile.BadZipFile,
     ) as error:
         raise click.ClickException(
-            f"Could not read provider inventory from {shim_wheel.name}: {error}"
+            f"Could not read the flashinfer-jit-cache {expected_version} provider "
+            f"inventory: {error}"
         ) from error
 
     if not provider_tags:
@@ -251,36 +243,28 @@ def _get_available_jit_cache_provider_tags(
     index_url: str,
     nightly: bool,
 ) -> tuple[str, ...]:
-    """Download the small shim wheel and return its published provider set."""
+    """Install the small shim into a temporary directory and return its published
+    provider set."""
     with tempfile.TemporaryDirectory(prefix="flashinfer-jit-cache-shim-") as temp_dir:
         cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "download",
-            "--disable-pip-version-check",
+            *_get_pip_install_cmd(),
+            "--target",
+            temp_dir,
             "--no-deps",
             "--only-binary=:all:",
-            "--dest",
-            temp_dir,
         ]
         if nightly:
             cmd.append("--pre")
         cmd.extend(["--index-url", index_url, shim_requirement])
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if result.returncode != 0:
+            output = (result.stderr or result.stdout).strip()
             raise click.ClickException(
                 "Could not resolve the flashinfer-jit-cache shim needed to select "
-                f"a minimal provider (pip download exited with {result.returncode})."
+                f"a minimal provider ({cmd[0]} exited with {result.returncode})"
+                + (f":\n{output}" if output else ".")
             )
-
-        shim_wheels = sorted(Path(temp_dir).glob("*.whl"))
-        if len(shim_wheels) != 1:
-            raise click.ClickException(
-                f"Expected one downloaded flashinfer-jit-cache shim, found "
-                f"{len(shim_wheels)}."
-            )
-        return _read_jit_cache_provider_tags(shim_wheels[0], expected_version)
+        return _read_jit_cache_provider_tags(Path(temp_dir), expected_version)
 
 
 def _select_jit_cache_provider_tags(
@@ -335,6 +319,11 @@ def _get_pip_install_cmd() -> list[str]:
         )
         if created_by_uv or find_spec("pip") is None:
             return [uv, "pip", "install", "--python", sys.executable]
+    elif find_spec("pip") is None:
+        raise click.ClickException(
+            f"Neither pip nor uv is available to install packages into "
+            f"{sys.prefix}. Install pip into this environment or put uv on PATH."
+        )
     return [sys.executable, "-m", "pip", "install"]
 
 
