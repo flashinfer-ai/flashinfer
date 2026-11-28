@@ -41,7 +41,7 @@ def _bind_trace_reference_dependencies(wrapper: Any, *dependencies: Any) -> Any:
 def _fp4_e2m1_quantize_block(
     block: torch.Tensor, amax_per_block: torch.Tensor
 ) -> torch.Tensor:
-    """Round a float block to the nearest FP4 e2m1fn value and pack sign/magnitude.
+    """Round a float block to FP4 e2m1fn with ties to even and pack sign/magnitude.
 
     Returns an int64 tensor with values in [0, 15] matching the nibble codes
     used by ``_unpack_fp4_e2m1`` in moe.py: low 3 bits = magnitude index,
@@ -62,6 +62,8 @@ def _fp4_e2m1_quantize_block(
     # Nearest-magnitude index among the 8 e2m1 values.
     diffs = (mag.unsqueeze(-1) - values).abs()
     idx = diffs.argmin(dim=-1)
+    # argmin picks the lower code at ties. Only these E2M1 midpoints round up.
+    idx += (mag == 0.75) | (mag == 1.75) | (mag == 3.5)
     return (idx | sign_bit) & 0x0F
 
 
