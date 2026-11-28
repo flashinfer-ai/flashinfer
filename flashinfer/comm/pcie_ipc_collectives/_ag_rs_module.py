@@ -22,12 +22,21 @@ import torch
 
 from ...jit.comm import gen_pcie_ipc_ag_rs_module
 from ...utils import register_custom_op
+from ..pcie_ipc_ar import _spin_timeout_ns
 
 
 @functools.cache
 def get_pcie_ipc_ag_rs_module():
     """Build and register the standalone AllGather/ReduceScatter module."""
-    module = gen_pcie_ipc_ag_rs_module().build_and_load()
+    timeout_ns = _spin_timeout_ns()
+    # Without a timeout, call the generator with no argument: benchmarks and
+    # tests swap it for zero-argument debug generators.
+    spec = (
+        gen_pcie_ipc_ag_rs_module(timeout_ns)
+        if timeout_ns
+        else gen_pcie_ipc_ag_rs_module()
+    )
+    module = spec.build_and_load()
 
     @register_custom_op(
         "flashinfer::pcie_ipc_all_gather_workspace_size", mutates_args=[]

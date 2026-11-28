@@ -31,6 +31,7 @@
 
 #include "pcie_ipc_all_reduce.cuh"
 #include "pcie_ipc_ce_memop.cuh"
+#include "pcie_ipc_spin_guard.cuh"
 
 // This file follows the surrounding style: plain cudaError_t returns, no
 // framework headers. Scoped to the file and undefined at the bottom.
