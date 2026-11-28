@@ -40,21 +40,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PEER_COUNTS_OFF 0
-#define SMEM_PEER_COUNTS_STAGE_BYTES 16
-#define SMEM_PEER_COUNTS_STRIDE 16
-#define SMEM_PREFIX_OFF 0
-#define SMEM_PREFIX_STAGE_BYTES 128
-#define SMEM_PREFIX_STRIDE 128
-#define SMEM_TOTAL 128
-#define THREADS 1024
-
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(1024) void
 kernel_cake_mok_rows_4_4(int* __restrict__ topk_all, int* __restrict__ counts, int* __restrict__ tokens_per_expert, int* __restrict__ num_tokens, int* __restrict__ schedule_peer_rank, int* __restrict__ schedule_peer_token_idx, int local_tokens, int top_k, int capacity, int rank)
 {
     const int tid = threadIdx.x;
@@ -76,17 +66,15 @@ kernel_cake_mok_rows_4_4(int* __restrict__ topk_all, int* __restrict__ counts, i
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
-    int* peer_counts = reinterpret_cast<int*>(smem_raw + SMEM_PEER_COUNTS_OFF);
-    const int peer_counts_addr = smem + SMEM_PEER_COUNTS_OFF;
+    // Prologue
+    int* peer_counts = reinterpret_cast<int*>(smem_raw + 0);
+    const int peer_counts_addr = smem + 0;
     int* prefix = reinterpret_cast<int*>(smem_static_raw + 0);
     const int prefix_addr = (int)(unsigned long long)__cvta_generic_to_shared(prefix);
 
     // === Task calls (declaration order) ===
     int rank_stride = local_tokens * top_k;
     int first_expert = rank * 4;
-    int lane_1 = tid % 32;
-    int warp_1 = tid / 32;
     if (num_tokens[0] > capacity) {
         asm volatile("trap;" ::: "memory");
     }
@@ -107,35 +95,31 @@ kernel_cake_mok_rows_4_4(int* __restrict__ topk_all, int* __restrict__ counts, i
             int expert = topk_all[peer * rank_stride + token];
             owned = owned + ((expert - first_expert == local_expert) ? 1 : 0);
         }
-        int inclusive = owned;
-        #pragma unroll
-        for (int bit = 0; bit < 5; bit++) {
-            int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1 << bit, 32);
-            if (lane_1 >= 1 << bit) {
-                inclusive = inclusive + _shfl_up_0;
-            }
+        // CtaScanSum: threads=1024, warps=32
+        int _cta_scan_sum_prefix_0;
+        int _cta_scan_sum_total_0;
+        {
+            const uint32_t _cta_scan_sum_prefix_0_own = (uint32_t)(owned);
+            uint32_t _cta_scan_sum_prefix_0_ws = _cta_scan_sum_prefix_0_own;
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 1, 32); if (lane >= 1) { _cta_scan_sum_prefix_0_ws += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 2, 32); if (lane >= 2) { _cta_scan_sum_prefix_0_ws += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 4, 32); if (lane >= 4) { _cta_scan_sum_prefix_0_ws += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 8, 32); if (lane >= 8) { _cta_scan_sum_prefix_0_ws += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 16, 32); if (lane >= 16) { _cta_scan_sum_prefix_0_ws += peer; } }
+            if (lane == 31) { prefix[warp] = (int)_cta_scan_sum_prefix_0_ws; }
+            __syncthreads();
+            const uint32_t _cta_scan_sum_prefix_0_wt = (uint32_t)prefix[lane];
+            uint32_t _cta_scan_sum_prefix_0_wsum = _cta_scan_sum_prefix_0_wt;
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 1, 32); if (lane >= 1) { _cta_scan_sum_prefix_0_wsum += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 2, 32); if (lane >= 2) { _cta_scan_sum_prefix_0_wsum += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 4, 32); if (lane >= 4) { _cta_scan_sum_prefix_0_wsum += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 8, 32); if (lane >= 8) { _cta_scan_sum_prefix_0_wsum += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 16, 32); if (lane >= 16) { _cta_scan_sum_prefix_0_wsum += peer; } }
+            _cta_scan_sum_total_0 = (int)__shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 31);
+            const uint32_t _cta_scan_sum_prefix_0_before = __shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum - _cta_scan_sum_prefix_0_wt, warp);
+            _cta_scan_sum_prefix_0 = (int)(_cta_scan_sum_prefix_0_ws - _cta_scan_sum_prefix_0_own + _cta_scan_sum_prefix_0_before);
         }
-        if (lane_1 == 31) {
-            prefix[warp_1] = inclusive;
-        }
-        __syncthreads();
-        if (warp_1 == 0) {
-            int warp_total = prefix[lane_1];
-            #pragma unroll
-            for (int bit_1 = 0; bit_1 < 5; bit_1++) {
-                int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, warp_total, 1 << bit_1, 32);
-                if (lane_1 >= 1 << bit_1) {
-                    warp_total = warp_total + _shfl_up_1;
-                }
-            }
-            prefix[lane_1] = warp_total;
-        }
-        __syncthreads();
-        int previous = 0;
-        if (warp_1 > 0) {
-            previous = prefix[warp_1 - 1];
-        }
-        int ordinal = previous + inclusive - owned;
+        int ordinal = _cta_scan_sum_prefix_0;
         for (int token_1 = tid; token_1 < rank_stride; token_1 += 1024) {
             int expert_1 = topk_all[peer * rank_stride + token_1];
             if (expert_1 - first_expert == local_expert) {

@@ -33,15 +33,11 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 1
-#define WORLD_SIZE 1
-
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(1) void
 kernel_cake_mok_pad_1(int* __restrict__ counts, int* __restrict__ tokens_per_expert, int* __restrict__ num_tokens)
 {
     const int tid = threadIdx.x;
@@ -57,8 +53,8 @@ kernel_cake_mok_pad_1(int* __restrict__ counts, int* __restrict__ tokens_per_exp
     // === Task calls (declaration order) ===
     int total = 0;
     #pragma unroll 1
-    for (int peer = 0; peer < WORLD_SIZE; peer++) {
-        total = total + counts[bid * WORLD_SIZE + peer];
+    for (int peer = 0; peer < 1; peer++) {
+        total = total + counts[bid * 1 + peer];
     }
     int padded = (total + 255) / 256 * 256;
     tokens_per_expert[bid] = padded;

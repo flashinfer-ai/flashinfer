@@ -40,6 +40,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#if __CUDA_ARCH__ == 1070
+#else
+#define LAUNCH_MIN_BLOCKS 4
+
+#endif
 #include <math_constants.h>
 
 
@@ -71,7 +76,11 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
+#if __CUDA_ARCH__ == 1070
 __global__ __launch_bounds__(256) void
+#else
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+#endif
 kernel_cake_mok_epilogue_backward_8(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ routed, float* __restrict__ scores, unsigned int* __restrict__ output, int tokens, int hidden, int ctas)
 {
     const int tid = threadIdx.x;
