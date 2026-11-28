@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Exact-workload cache for Blackwell performance knobs.
+"""Cache for Blackwell performance knobs.
 
 Entries share the MoE EP cache file but use a distinct device namespace.
-Capacity, live-token bucket, operation attributes, hardware and compiler must
-match. Missing or invalid entries fall back to the geometry estimate.
+Capacity, operation attributes, hardware and compiler must match. Serving
+replay can reuse a compatible live-token bucket at that capacity.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from flashinfer.moe_ep.core.tuning import token_bucket_sort_key
 from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
     knob_keys,
     is_valid_sm100_knobs,
@@ -172,12 +173,40 @@ def live_token_buckets(config, *, constraints=None, device=None) -> list[int]:
     )
 
 
-def lookup_knobs(config, *, live_tokens=None, constraints=None, device=None):
-    """Return an exact profile for this workload, or None on a cache miss."""
-    tokens = config.max_tokens_per_rank if live_tokens is None else live_tokens
-    for entry in reversed(_entries(config, device)):
-        if type(entry.get("live_tokens")) is not int or entry["live_tokens"] != tokens:
-            continue
+def _replay_entries(entries, live_tokens, capacity):
+    return sorted(
+        (
+            entry
+            for entry in entries
+            if type(entry.get("live_tokens")) is int
+            and 0 <= entry["live_tokens"] <= capacity
+        ),
+        key=lambda entry: token_bucket_sort_key(entry["live_tokens"], live_tokens),
+    )
+
+
+def lookup_knobs(
+    config,
+    *,
+    live_tokens=None,
+    constraints=None,
+    device=None,
+    allow_live_token_fallback=False,
+):
+    """Return the exact profile, optionally reusing a compatible live-token bucket."""
+    capacity = config.max_tokens_per_rank
+    tokens = capacity if live_tokens is None else live_tokens
+    entries = reversed(_entries(config, device))
+    matches = (
+        _replay_entries(entries, tokens, capacity)
+        if allow_live_token_fallback
+        else (
+            entry
+            for entry in entries
+            if type(entry.get("live_tokens")) is int and entry["live_tokens"] == tokens
+        )
+    )
+    for entry in matches:
         knobs = _decode(entry, config, constraints)
         if knobs is not None:
             return knobs
@@ -192,10 +221,11 @@ def resolve_knobs(
     constraints=None,
     device=None,
     use_cache=True,
+    allow_live_token_fallback=False,
 ) -> tuple[dict[str, Any], str]:
-    """Return exact cached knobs or a heuristic, together with their source.
+    """Return cached knobs or a heuristic, together with their source.
 
-    Cache hits must match the live-token count and explicit constraints.
+    Cache hits match the live-token count unless bucket replay is enabled.
     ``use_cache=False`` starts from the heuristic for a fresh tuning sweep.
     """
     candidates = (
@@ -209,7 +239,11 @@ def resolve_knobs(
     )
     if use_cache:
         knobs = lookup_knobs(
-            config, live_tokens=live_tokens, constraints=constraints, device=device
+            config,
+            live_tokens=live_tokens,
+            constraints=constraints,
+            device=device,
+            allow_live_token_fallback=allow_live_token_fallback,
         )
         if knobs is not None:
             return knobs, "cache"
@@ -227,7 +261,17 @@ def record_knobs(
     )
 
 
-def make_record(knobs, config, *, live_tokens, p50_us, device=None):
+def allows_nondeterministic(entry) -> bool:
+    """Read the search permission, including older records with an IKR winner."""
+    if "allow_nondeterministic" in entry:
+        return entry["allow_nondeterministic"] is True
+    knobs = entry.get("knobs")
+    return isinstance(knobs, dict) and knobs.get("reduce_topk_in_kernel") is True
+
+
+def make_record(
+    knobs, config, *, live_tokens, p50_us, device=None, allow_nondeterministic=None
+):
     if set(knobs) != set(knob_keys(config)) or not is_valid_sm100_knobs(knobs, config):
         raise ValueError("cannot cache invalid Blackwell knobs")
     if (
@@ -237,8 +281,14 @@ def make_record(knobs, config, *, live_tokens, p50_us, device=None):
         raise ValueError("live_tokens must be within workspace capacity")
     if not math.isfinite(p50_us) or p50_us <= 0:
         raise ValueError("p50_us must be finite and positive")
+    uses_ikr = knobs.get("reduce_topk_in_kernel", False)
+    if allow_nondeterministic is None:
+        allow_nondeterministic = uses_ikr
+    if uses_ikr and not allow_nondeterministic:
+        raise ValueError("cannot cache in-kernel reduction without search permission")
     return dict(
         **_key(config, device),
+        **({"allow_nondeterministic": True} if allow_nondeterministic else {}),
         live_tokens=live_tokens,
         knobs=knobs,
         p50_us=p50_us,
@@ -246,7 +296,7 @@ def make_record(knobs, config, *, live_tokens, p50_us, device=None):
     )
 
 
-def write_record(entry):
+def write_record(entry, *, overwrite=True):
     """Publish the selected managed record to the compatibility file."""
     path = knob_cache_path()
     if path is None:
@@ -260,15 +310,20 @@ def write_record(entry):
         with open(path + ".lock", "a") as lock:
             filelock.lock(lock.fileno())
             data = _read(path)
-            data["entries"] = [
-                e
-                for e in data["entries"]
-                if not isinstance(e, dict)
-                or not (
-                    all(e.get(k) == entry[k] for k in identity)
-                    and e.get("timing_boundary", "kernel")
+
+            def same_profile(saved):
+                return (
+                    isinstance(saved, dict)
+                    and all(saved.get(k) == entry[k] for k in identity)
+                    and allows_nondeterministic(saved) == allows_nondeterministic(entry)
+                    and saved.get("timing_boundary", "kernel")
                     == entry.get("timing_boundary", "kernel")
                 )
+
+            if not overwrite and any(same_profile(saved) for saved in data["entries"]):
+                return True
+            data["entries"] = [
+                saved for saved in data["entries"] if not same_profile(saved)
             ]
             data["entries"].append(entry)
             with tempfile.NamedTemporaryFile(

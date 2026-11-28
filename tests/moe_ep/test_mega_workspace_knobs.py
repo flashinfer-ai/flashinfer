@@ -541,13 +541,17 @@ def test_standard_compute_returns_output(supplied_output, monkeypatch):
     view = torch.full((2, 128), 3.0)
 
     def launch(y, *args, **kwargs):
+        assert kwargs["num_tokens"] == view.shape[0]
         if y is None:
             return view
         y.copy_(view)
         return None
 
     monkeypatch.setattr(pkg, "sm100_block_scaled_mega_moe", launch)
-    workspace = SimpleNamespace(config=SimpleNamespace(use_custom_finalize=False))
+    workspace = SimpleNamespace(
+        config=SimpleNamespace(use_custom_finalize=False),
+        staged_tokens=lambda: view.shape[0],
+    )
     result = backend.compute(workspace, (None, None), output=output)
     assert result is (output if supplied_output else view)
     torch.testing.assert_close(result, view)
@@ -1038,6 +1042,152 @@ def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials
         )
     reference.assert_not_called()
     record.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message,code,recoverable",
+    [
+        ("operation not permitted when stream is capturing (900)", None, True),
+        ("CUDA error: operation not permitted when stream is capturing", None, True),
+        ("capture rejected", 900, True),
+        ("CUDA error: an illegal memory access was encountered", 700, False),
+        ("CUDA out of memory", None, False),
+        ("invalid argument", None, False),
+    ],
+)
+def test_capture_rejection_checks_original_cuda_error(message, code, recoverable):
+    from flashinfer.moe_ep.core.tuning_measurement import _is_capture_rejection
+
+    error = RuntimeError(message)
+    error.error_code = code
+    invalidated = RuntimeError(
+        "CUDA error: operation failed due to a previous error during capture"
+    )
+    invalidated.__context__ = error
+    assert _is_capture_rejection(error) is recoverable
+    assert _is_capture_rejection(invalidated) is recoverable
+
+
+@pytest.mark.parametrize("peer_fatal", [False, True])
+def test_collective_capture_status_checks_peer_before_cleanup(monkeypatch, peer_fatal):
+    from flashinfer.moe_ep.core import tuning_measurement
+
+    graph = mock.Mock()
+    trial = mock.Mock()
+    trial.config.world_size = 2
+    trial.launch.side_effect = RuntimeError(
+        "CUDA error: operation not permitted when stream is capturing"
+    )
+
+    def gather(statuses, local, *, group):
+        peer = (False, "CUDA out of memory") if peer_fatal else None
+        statuses[:] = [local, peer]
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph", lambda _: nullcontext())
+    monkeypatch.setattr(torch.distributed, "barrier", lambda **kw: None)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+
+    settings = {"timer": "native_events", "cuda_graph_profile_replays": 1}
+    with pytest.raises(RuntimeError, match="Candidate graph capture failed") as caught:
+        tuning_measurement.measure_samples(trial, (), 1, settings, None)
+    assert isinstance(caught.value, tuning_measurement.CaptureUnsupported) == (
+        not peer_fatal
+    )
+    assert graph.reset.call_count == (not peer_fatal)
+
+
+@pytest.mark.parametrize("result", ["skip", "all_rejected", "fatal"])
+def test_blackwell_genphase_sweep_continues_after_capture_rejection(
+    monkeypatch, result
+):
+    from flashinfer.moe_ep.core import tuning as core_tuning, tuning_measurement
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        autotune,
+        correctness,
+        knob_cache,
+    )
+
+    tracks = []
+    cfg = _genphase_tuning_config()
+    candidates = sm100_genphase_candidates(cfg, sm_count=148, live_tokens=16)[:2]
+
+    class Workspace:
+        _build_kernel = staticmethod(mock.Mock())
+        note_staged_tokens = mock.Mock()
+        prepare = mock.Mock()
+        launch = mock.Mock()
+
+        def __init__(self, config):
+            self.config = config
+            self.x = self.x_sf = self.topk_idx = self.topk_weights = torch.zeros(1)
+            self.output_activation = torch.zeros(16)
+
+        def destroy(self):
+            tracks.append(("destroy", self.config.mma_tiler_mnk))
+
+    def measure(trial, *args):
+        knob = trial.config.mma_tiler_mnk
+        tracks.append(("measure", knob))
+        if result == "fatal":
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        if result == "all_rejected" or knob == candidates[0]["mma_tiler_mnk"]:
+            raise tuning_measurement.CaptureUnsupported("candidate does not capture")
+        return [1.0]
+
+    def gather(proposals, proposal, *, group):
+        proposals[:] = [proposal, proposal]
+
+    tensor = torch.tensor
+    monkeypatch.setattr(
+        torch, "tensor", lambda *args, device, **kw: tensor(*args, **kw)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: mock.Mock(multi_processor_count=148),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _: cfg.world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _: cfg.rank)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kw: None)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda **kw: None)
+    monkeypatch.setattr(core_tuning, "tuning_live_tokens", lambda *args: 16)
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "test")
+    monkeypatch.setattr(
+        correctness, "sampled_reference", lambda *args, **kw: (None, None)
+    )
+    monkeypatch.setattr(correctness, "output_error", lambda *args: 0)
+    monkeypatch.setattr(tuning_measurement, "measure_samples", measure)
+
+    def sweep():
+        return autotune._sweep_sm100_mega_moe(
+            None, None, None, Workspace(cfg), num_tokens=16, candidates=candidates
+        )
+
+    first, second = [candidate["mma_tiler_mnk"] for candidate in candidates]
+    if result == "fatal":
+        with pytest.raises(RuntimeError, match="illegal memory access"):
+            sweep()
+        assert tracks == [("measure", first)]
+    else:
+        if result == "all_rejected":
+            with pytest.raises(autotune.NoPassingCandidate):
+                sweep()
+        else:
+            assert sweep() == (candidates[1], 1.0, 1)
+        assert tracks == [
+            ("measure", first),
+            ("destroy", first),
+            ("measure", second),
+            ("destroy", second),
+        ]
 
 
 def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_record(

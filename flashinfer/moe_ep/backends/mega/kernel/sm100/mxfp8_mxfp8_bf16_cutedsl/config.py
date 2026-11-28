@@ -31,7 +31,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     dictionaries and explicit tile/cluster/schedule fields constrain selection.
     GenPhase and standard inference use ``knobs="auto"``
     with ``autotune_v2()`` for collective warmup before graph capture.
-    Both variants support independent automatic handles through
+    Set ``kernel_variant="auto", knobs="auto"`` to compare their complete
+    forwards during warmup. Both variants support independent handles through
     ``create_workspace()``.
 
     ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"`` selects the standard
@@ -66,7 +67,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # constrain native knobs; "auto" searches within autotune_v2().
     knobs: dict | str | None = None
     # Select standard inference or the GenPhase decoding pipeline.
-    kernel_variant: Literal["inference", "genphase"] = "inference"
+    kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
     # GenPhase only: None selects cached knobs or geometry-based heuristics.
     # Explicit fields constrain the heuristic and automatic candidate sweep.
     mma_tiler_mnk: tuple[int, int, int] | None = None

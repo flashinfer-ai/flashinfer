@@ -35,6 +35,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     finalization and a K256/N128/CGA4 Gather4 tile. It supports standard SwiGLU
     and early or late routing weights, without per-token FC1 scales.
 
+    Set ``kernel_variant="auto", knobs="auto"`` to compare standard and
+    GenPhase complete forwards during warmup.
+
     ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"`` retains the older
     implementation and its tuning cache. Its knobs use the legacy scheduler
     names; the sources-backed adapter translates equivalent controls and
@@ -87,7 +90,7 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # and on the first forward for the legacy implementation.
     knobs: dict | str | None = None
     # GenPhase is available through the unsuffixed selector.
-    kernel_variant: Literal["inference", "genphase"] = field(
+    kernel_variant: Literal["inference", "genphase", "auto"] = field(
         default="inference", kw_only=True
     )
     mma_tiler_mnk: tuple[int, int, int] | None = field(default=None, kw_only=True)

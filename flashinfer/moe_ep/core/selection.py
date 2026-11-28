@@ -102,8 +102,8 @@ class Collective:
     def __init__(self, bootstrap):
         from .bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
 
-        self.group = bootstrap_comm_group(bootstrap)
         self.rank, self.world = bootstrap_ep_rank_world(bootstrap)
+        self.group = bootstrap_comm_group(bootstrap) if self.world > 1 else None
 
     def gather(self, value):
         if self.world == 1:

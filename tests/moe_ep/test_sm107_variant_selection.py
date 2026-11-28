@@ -393,7 +393,7 @@ def test_prepared_eager_execution_does_not_poll_cache_or_peers(
 
     with monkeypatch.context() as patch:
         patch.setattr(backend, "_gather", unexpected)
-        patch.setattr(selection, "_cache_identity", unexpected)
+        patch.setattr(type(backend), "_cache_identity", unexpected)
         patch.setattr(native, "_unique_candidates", unexpected)
         # Rank-local invalidation is reconciled in an explicit context.
         AutoTuner.get().clear_cache()

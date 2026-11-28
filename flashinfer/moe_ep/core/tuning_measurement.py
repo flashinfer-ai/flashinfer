@@ -11,6 +11,29 @@ class CaptureUnsupported(RuntimeError):
     """A prepared candidate could not be captured on every EP rank."""
 
 
+def _is_capture_rejection(error: BaseException | None) -> bool:
+    while error is not None:
+        if isinstance(error, CaptureUnsupported):
+            return True
+        code = getattr(error, "error_code", None)
+        if code is None and isinstance(error, RuntimeError):
+            message = str(error).partition("\n")[0].removeprefix("CUDA error: ")
+            # Some PyTorch versions expose only the CUDA runtime error string.
+            code = {
+                "operation not permitted when stream is capturing": 900,
+                "operation not permitted when stream is capturing (900)": 900,
+                "operation failed due to a previous error during capture": 901,
+                "operation failed due to a previous error during capture (901)": 901,
+            }.get(message)
+        if code == 900:
+            return True
+        if code != 901:
+            return False
+        # capture_end can report invalidation instead of the original exception.
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def measurement_settings(context, *, native_graph_calls=None, native_warmups=0):
     policy = context.measurement_policy
     native = policy is None or (
@@ -83,17 +106,27 @@ def measure_samples(trial, weights, repeats, settings, process_group):
         if graph_replays is not None:
             graph = torch.cuda.CUDAGraph()
             barrier()
-            error = None
+            error = status = None
             try:
-                with torch.cuda.graph(graph):
+                # Keep the caller's stream if capture_end raises.
+                with (
+                    torch.cuda.stream(torch.cuda.current_stream()),
+                    torch.cuda.graph(graph),
+                ):
                     for _ in range(calls):
                         launch()
             except Exception as exc:
-                error = str(exc)
-            errors = gather(error)
-            if any(errors):
+                error = exc
+                status = (_is_capture_rejection(exc), f"{type(exc).__name__}: {exc}")
+            failures = [failure for failure in gather(status) if failure is not None]
+            if any(not recoverable for recoverable, _ in failures):
+                if status is not None and not status[0]:
+                    assert error is not None
+                    raise error
+                raise RuntimeError(f"Candidate graph capture failed: {failures}")
+            if failures:
                 graph.reset()
-                raise CaptureUnsupported(f"Candidate graph capture failed: {errors}")
+                raise CaptureUnsupported(f"Candidate graph capture failed: {failures}")
             for _ in range(max(1, settings.get("warmup_iters", 0))):
                 graph.replay()
             torch.cuda.synchronize()

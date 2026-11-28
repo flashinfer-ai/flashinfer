@@ -592,30 +592,29 @@ Unsupported layouts or `FLASHINFER_MEGA_FUSED_STAGE=0` use Torch staging.
 As on the other Blackwell paths, callers supply valid routing values.
 This configuration supports default/fixed knobs and `knobs="auto"` below;
 offline tuning uses `--arch sm100 --dtype mxfp4_mxfp8`.
-For GenPhase, use `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`
-with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
+Set `kernel_variant="genphase"` on the same config to use GenPhase.
 
 Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
 weight, staging and shared-workspace graph-replay checks.
 
 The `sm100_nvfp4_nvfp4_bf16_cutedsl` and
 `sm100_mxfp8_mxfp8_bf16_cutedsl` selectors support `knobs="auto"` through
-`autotune_v2()`. The retained NVFP4 `_legacy` selector keeps its existing tuner. Standard
-`knobs=None` still uses built-in defaults; explicit dictionaries retain the
-legacy spelling and also accept the native dictionaries returned by
-`get_tuned_knobs()`. Pass those results to `create_workspace(..., knobs=knobs)`
-to prepare fixed handles without a file handoff.
+`autotune_v2()`. With `knobs=None`, standard inference uses a compatible
+saved profile at the workspace capacity. To pin
+a result, pass the dictionary returned by `get_tuned_knobs()` to
+`create_workspace(..., knobs=knobs)`. The retained NVFP4 `_legacy`
+selector has its own knobs and tuner.
 
 The standard search varies tile N, uniform or mixed-cluster launch, epilogue
 flag batches and FC2 bulk stores. In-kernel reduction is considered only with
 `enable_in_kernel_fc2_reduce=True` and a compatible finalization mode. Numerical
 attributes, input scalars and per-token scales retain their configured values.
-The measured boundary is the native collective kernel; a separate terminal
-reducer, staging and weight preparation are outside it.
+Finalized trials time staging, the collective kernel, and any separate
+terminal reducer. Weight preparation happens before timing. Enabling
+in-kernel reduction uses a separate tuning cache entry so the expanded
+search gets measured.
 
-If your offline tuner defaults to the legacy NVFP4 kernel, pass
-`--implementation next` with the following options to select Standard.
-With a tuner that defaults to Standard, run:
+The offline CLI tunes standard inference by default on SM100:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
@@ -624,8 +623,16 @@ torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
   --max-tokens 128 --live-tokens 65
 ```
 
-Both new Blackwell paths use exact capacity/live-token matching. Managed cache
-hits also write the configured MegaMoE file. `persistent_cache=False` disables
+Use `--implementation legacy` to tune the retained SM100 NVFP4 inference
+kernel. Its cache entries are separate from standard's.
+
+For a fixed Standard or GenPhase variant, replay prefers an exact live-token
+profile, then the smallest compatible saved count above the request at the
+same capacity. If there is no upper profile, it uses the largest compatible
+count below the request. With no compatible profile, it uses the heuristic.
+An unspecified live count uses workspace capacity. Searches and
+`kernel_variant="auto"` still use exact live-token profiles. Managed replay
+can restore a missing MegaMoE file entry. `persistent_cache=False` disables
 both disk paths and uses the tuner's memory partition. Cache placement and
 invalidation follow v2. Records without measurement provenance can be replayed;
 a tune context searches again. `tuning_buckets` and `round_up=True` are rejected
@@ -682,8 +689,8 @@ per-token FC1 scales, SiTU and custom finalization remain unsupported.
 finalization and is rejected. Explicit `finalize_mode=DEFAULT` remains a
 static-capacity path, even when a live-token count tensor is supplied.
 
-With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
-host-side estimate based on EP size, expert count, top-k, intermediate width,
+With `knobs=None` (the default), GenPhase uses the same fixed-variant replay
+rule. Its fallback estimate uses EP size, expert count, top-k, intermediate width,
 SM count and the planned live-token bucket (capacity when no bucket is known).
 The estimate favors N64 for sparse expert batches and CGA2 when estimated FC1
 work underfills a CGA4 wave; the grouped hint starts at four resident-cluster
@@ -708,12 +715,20 @@ with autotune_v2():
 knobs = layer.get_tuned_knobs()
 ```
 
+To tune both variants, set `kernel_variant="auto"` with `knobs="auto"`.
+This applies to SM100 NVFP4/NVFP4, MXFP8/MXFP8 (E4M3 or E5M2), and
+MXFP8 activations with MXFP4 weights. Warm up as above, then call
+`layer.get_tuned_config()` to get the selected variant and its knobs.
+GenPhase participates when its existing feature and geometry checks pass.
+Batch-invariant and unfinalized execution require an explicit variant.
+
 The search retains the three admitted geometries and original/two/four/eight-wave
 grouped hints. It checks a sampled Torch oracle before and after timing, then
 selects the median of per-sample maximum-rank durations. Native timing uses a
 warm CUDA graph with eight calls, eight warmup replays and 32 samples. Explicit
 v2 measurement policies select eager or graph execution, event or CUPTI timing,
-and hot or cold L2. Staging and weight preparation remain outside measurement.
+and hot or cold L2. Finalized forward timing includes staging and output
+handling. Weight preparation stays outside measurement.
 
 Automatic handles created by `create_workspace()` have independent selection
 state. Tune before capture in the normal flow. If later selection needs to change
@@ -734,6 +749,8 @@ torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
   --max-tokens 1024 --live-tokens 65
 ```
 
+Use `--kernel-variant auto` to compare the eligible variants and save the choice.
+Runs with `--max-candidates` are smoke tests and keep their results in memory.
 Use `knobs="auto"` with `autotune_v2(mode="replay")` to consume the managed
 results. The existing file-based lookup also remains available: construct a
 layer with `knobs=None` and prepare the matching profile before capture:

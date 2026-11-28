@@ -17,6 +17,10 @@ from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
 )
 
 
+class NoPassingCandidate(RuntimeError):
+    """No candidate passed the sweep's admission and reference checks."""
+
+
 def _sweep_sm100_mega_moe(
     y,
     transformed_l1,
@@ -253,9 +257,14 @@ def _sweep_sm100_mega_moe(
                     settings,
                     process_group,
                 )
-            except CaptureUnsupported:
+            except CaptureUnsupported as exc:
+                if cfg.rank == 0:
+                    print(f"[megamoe-autotune] rejected {knobs}: {exc}", flush=True)
+                scores.append(math.inf)
+                errors.append(math.inf)
                 trial.destroy()
-                raise
+                barrier()
+                continue
             # A bad clock sample on one rank must invalidate the candidate,
             # even if another rank has a positive elapsed duration.
             samples = [t if math.isfinite(t) and t > 0 else math.inf for t in samples]
@@ -277,7 +286,9 @@ def _sweep_sm100_mega_moe(
             )
     best = min(range(len(scores)), key=scores.__getitem__)
     if not math.isfinite(scores[best]):
-        raise RuntimeError("no Blackwell candidate passed correctness and admission")
+        raise NoPassingCandidate(
+            "no Blackwell candidate passed correctness and admission"
+        )
     winner = dict(candidates[best])
     return winner, scores[best], sum(math.isfinite(score) for score in scores)
 
@@ -316,6 +327,8 @@ def autotune_sm100_block_scaled_mega_moe(
     force_tune=True,
     install_winner=False,
     allow_nondeterministic=None,
+    make_trial=None,
+    execution_contract=None,
 ):
     """Select native Blackwell knobs through managed autotune v2.
 
@@ -344,6 +357,8 @@ def autotune_sm100_block_scaled_mega_moe(
         process_group=process_group,
         install_winner=install_winner,
         allow_nondeterministic=allow_nondeterministic,
+        make_trial=make_trial,
+        execution_contract=execution_contract,
     )
     tuner = AutoTuner.get()
     if force_tune and not tuner._in_v2_context:

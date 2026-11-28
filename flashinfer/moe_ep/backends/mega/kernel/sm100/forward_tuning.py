@@ -11,6 +11,16 @@ class ForwardExecution:
         self.backend, self.tensors = backend, tensors
         self.quantize_input, self.output = quantize_input, output
 
+    def prepare_trial_output(self):
+        """Match the output layout without letting trials overwrite caller inputs."""
+        import torch
+
+        if self.output is not None:
+            output = self.output[: self.tensors.num_tokens]
+            self.output = torch.empty_strided(
+                output.shape, output.stride(), dtype=output.dtype, device=output.device
+            )
+
     def contract(self):
         from .....batch_invariant.spec import f32_bits
 

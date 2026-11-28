@@ -31,6 +31,11 @@ def live_buckets(entries: list[dict[str, Any]], capacity: int) -> list[int]:
     )
 
 
+def token_bucket_sort_key(bucket: int, workload: int) -> tuple[bool, int]:
+    """Prefer the smallest bucket at or above the workload, then the largest below."""
+    return bucket < workload, abs(bucket - workload)
+
+
 def select_token_entries(
     entries: list[dict[str, Any]], capacity: int, live_tokens: int | None
 ) -> list[dict[str, Any]]:
@@ -42,7 +47,7 @@ def select_token_entries(
     buckets = live_buckets(entries, capacity)
     if buckets:
         workload = capacity if live_tokens is None else live_tokens
-        bucket = next((b for b in buckets if b >= workload), buckets[-1])
+        bucket = min(buckets, key=lambda b: token_bucket_sort_key(b, workload))
         return [
             e
             for e in entries

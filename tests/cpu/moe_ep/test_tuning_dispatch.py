@@ -105,16 +105,45 @@ def test_bare_sm100_command_tunes_serving_nvfp4(dispatched, monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_blackwell_nvfp4_legacy_tuner_is_explicit(dispatched):
+@pytest.mark.parametrize(
+    "options",
+    [[], ["--no-do-finalize", "--no-apply-routing-weights-before-fc2"]],
+)
+def test_blackwell_nvfp4_legacy_tuner_is_explicit(dispatched, options):
     assert (
-        tune.main([*_GEOMETRY, "--arch", "sm100", "--implementation", "legacy"]) == 17
+        tune.main(
+            [*_GEOMETRY, "--arch", "sm100", "--implementation", "legacy", *options]
+        )
+        == 17
     )
     assert dispatched == [".backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner"]
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["legacy", "next"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--arch", "sm100", "--dtype", "bf16"],
+        ["--arch", "sm107"],
+        ["--dtype", "sm90_mxfp4"],
+        ["--dtype", "sm120_mxfp4_mxfp8"],
+    ],
+)
+def test_implementation_option_requires_supported_backend(
+    implementation, options, dispatched, capsys
+):
+    assert tune.main([*_GEOMETRY, *options, "--implementation", implementation]) == 2
+    assert not dispatched
+    assert f"--implementation {implementation}" in capsys.readouterr().err
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
-@pytest.mark.parametrize("implementation", ["default", "next"])
+@pytest.mark.parametrize(
+    "implementation",
+    [[], ["--implementation", "default"], ["--implementation", "next"]],
+)
 def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
     assert (
         tune.main(
@@ -126,8 +155,7 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
                 dtype,
                 "--kernel-variant",
                 "genphase",
-                "--implementation",
-                implementation,
+                *implementation,
                 "--no-apply-routing-weights-before-fc2",
             ]
         )
@@ -160,12 +188,19 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
             "--kernel-variant",
             "genphase",
         ],
-        ["--arch", "sm107", "--implementation", "legacy"],
-        ["--dtype", "sm90_mxfp4", "--implementation", "legacy"],
-        ["--dtype", "sm120_mxfp4_mxfp8", "--implementation", "legacy"],
+        [
+            "--arch",
+            "sm100",
+            "--implementation",
+            "legacy",
+            "--kernel-variant",
+            "auto",
+        ],
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
-        ["--arch", "sm100", "--kernel-variant", "auto"],
+        ["--arch", "sm100", "--kernel-variant", "auto", "--dtype", "bf16"],
+        ["--arch", "sm100", "--kernel-variant", "auto", "--base-knobs", "{}"],
+        ["--arch", "sm100", "--kernel-variant", "auto", "--no-do-finalize"],
         ["--dtype", "sm90_fp8_e4m3", "--kernel-variant", "auto"],
         ["--dtype", "sm120_mxfp4_mxfp8", "--kernel-variant", "auto"],
         ["--arch", "sm107", "--kernel-variant", "auto", "--max-candidates", "0"],
@@ -372,11 +407,42 @@ def test_variant_reaches_sm107_tuner(dispatched, variant, dtype):
 
 
 @pytest.mark.cpu_only
-def test_auto_variant_rejects_detected_blackwell(dispatched, monkeypatch, capsys):
+def test_auto_variant_reaches_detected_blackwell(dispatched, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
-    assert tune.main([*_GEOMETRY, "--kernel-variant", "auto"]) == 2
-    assert not dispatched
-    assert "requires SM107" in capsys.readouterr().err
+    assert tune.main([*_GEOMETRY, "--kernel-variant", "auto"]) == 17
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "implementation",
+    [[], ["--implementation", "default"], ["--implementation", "next"]],
+)
+def test_auto_variant_reaches_sm100_tuner(dispatched, dtype, implementation):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm100",
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                "auto",
+                *implementation,
+                "--combine-dtype",
+                "mxfp8",
+                "--activation",
+                "situ",
+                "--situ-beta",
+                "1",
+                "--no-apply-routing-weights-before-fc2",
+            ]
+        )
+        == 17
+    )
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]
 
 
 @pytest.mark.cpu_only
