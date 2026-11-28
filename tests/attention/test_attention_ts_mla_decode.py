@@ -1205,6 +1205,45 @@ def _schedule_slot(entry):
     return id(resource), schedule_stage, call_id
 
 
+def _work_tile_head_tail(task):
+    """Return ``(skip_if, [(resource, stage, is_skippable), ...])`` for a task.
+
+    The entries are the persistent work tile's HEAD/TAIL steps, i.e. those
+    outside the K ``DomainLoop``. DSL < 4.9 tasks keep them in
+    ``head/tail_schedule_list``; tree-walking tasks keep a schedule tree where
+    ``skippable()`` regions are ``SKIPPABLE`` conditional blocks.
+    """
+    if hasattr(task, "head_schedule_list"):
+        return task.skip_if, [
+            (entry[0], entry[1], _schedule_slot(entry) in skippable_slots)
+            for entries, skippable_slots in (
+                (task.head_schedule_list, task.skippable_head_slots),
+                (task.tail_schedule_list, task.skippable_tail_slots),
+            )
+            for entry in entries
+        ]
+    from cutlass.experimental.task_scheduling.enums import SKIPPABLE
+    from cutlass.experimental.task_scheduling.schedule_builder import (
+        ConditionalBlock,
+        DomainLoop,
+        Step,
+    )
+
+    def walk(nodes, skippable):
+        for node in nodes:
+            if isinstance(node, Step):
+                yield (node.memory_resource, node.schedule_stage, skippable)
+            elif isinstance(node, ConditionalBlock):
+                yield from walk(node.body, skippable or node.condition is SKIPPABLE)
+            elif not isinstance(node, DomainLoop) and hasattr(node, "body"):
+                yield from walk(node.body, skippable)
+
+    work_tile_loop = task._find_work_tile_loop()
+    if work_tile_loop is None:
+        return None, []
+    return work_tile_loop.skip_if, list(walk(work_tile_loop.body, False))
+
+
 def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
     return mla_decode_module._MLARuntime(
         query=torch.empty(8),
@@ -1560,25 +1599,20 @@ def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
     queue_entries = 0
     throttle_stages = set()
     for task in task_manager.tasks:
-        assert task.skip_if is not None
-        for entries, skippable_slots in (
-            (task.head_schedule_list, task.skippable_head_slots),
-            (task.tail_schedule_list, task.skippable_tail_slots),
-        ):
-            for entry in entries:
-                resource, stage, _, _ = entry
-                is_skippable = _schedule_slot(entry) in skippable_slots
-                if resource is work_queue:
-                    # A zero-K tile still has to fetch and retire its CLC work.
-                    assert not is_skippable
-                    queue_entries += 1
-                elif resource.name == "work_throttle":
-                    # Both sides of the cross-CTA throttle disappear together.
-                    assert is_skippable
-                    throttle_stages.add(stage.name)
-                elif not is_skippable:
-                    # Register initializers must dominate the loop and tail.
-                    assert stage.name in {"ProducerAuxWork", "ConsumerAuxWork"}
+        skip_if, entries = _work_tile_head_tail(task)
+        assert skip_if is not None
+        for resource, stage, is_skippable in entries:
+            if resource is work_queue:
+                # A zero-K tile still has to fetch and retire its CLC work.
+                assert not is_skippable
+                queue_entries += 1
+            elif resource.name == "work_throttle":
+                # Both sides of the cross-CTA throttle disappear together.
+                assert is_skippable
+                throttle_stages.add(stage.name)
+            elif not is_skippable:
+                # Register initializers must dominate the loop and tail.
+                assert stage.name in {"ProducerAuxWork", "ConsumerAuxWork"}
 
     assert queue_entries
     assert {
@@ -1756,6 +1790,8 @@ def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
     """Quiet default builds retain errors and expose advisories in debug mode."""
     import warnings
 
+    from cutlass.experimental.task_scheduling.task_manager import TaskManager
+
     from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.diagnostics import (
         mla_build_diagnostics,
     )
@@ -1788,7 +1824,10 @@ def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
                 domain=2,
                 exhaustive_deadlock_race_check=False,
             )
-    assert "[head-loop-overlap]" in capsys.readouterr().out
+    debug_output = capsys.readouterr().out
+    # Tree-walking TaskManagers (DSL 4.9+) have no HEAD/LOOP overlap check.
+    if hasattr(TaskManager, "_verify_head_loop_producer_overlap"):
+        assert "[head-loop-overlap]" in debug_output
     assert any("never routed" in str(item.message) for item in emitted)
 
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")

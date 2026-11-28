@@ -35,6 +35,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ...._hardware import is_sm107_compile_target
+from ...task_compat import consumer_work_stage
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
@@ -620,7 +621,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             else:
                 src = self.src_smem_k0 if inst_id == KV_INST0 else self.src_smem_k1
         assert src is not None
-        src_stage_idx = src.state_src.consumer_work_stage
+        src_stage_idx = consumer_work_stage(src)
         src_stage_elems = cfg.smem_kv_tile_elements
         src_base = src._smem_base_kv.subview(src_stage_idx * src_stage_elems)
         src_word_base = cutlass.Array(
@@ -693,7 +694,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         if cutlass.const_expr(self.src_smem_kv is None):
             src = self.src_smem_v0 if is_v else self.src_smem_k0
         assert src is not None
-        src_stage_idx = src.state_src.consumer_work_stage
+        src_stage_idx = consumer_work_stage(src)
         src_base = src._smem_base_kv.subview(src_stage_idx * cfg.smem_kv_tile_elements)
         self._transform_nvfp4_rows(
             src_base,

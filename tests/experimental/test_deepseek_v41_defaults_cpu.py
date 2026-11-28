@@ -1021,6 +1021,9 @@ def native_task():
             assert self.initialized
             self.body_calls.append(kwargs)
 
+    class TaskCacheStageInfoMixin:
+        """Host stand-in for task_compat's mixin, which adds no host state."""
+
     context_kwargs = extract(
         kernels / "task_compat.py",
         "task_context_kwargs",
@@ -1029,6 +1032,7 @@ def native_task():
     )
     namespace = dict(
         Task=HostTask,
+        TaskCacheStageInfoMixin=TaskCacheStageInfoMixin,
         Int32=int,
         cutlass=SimpleNamespace(const_expr=bool),
         cute=SimpleNamespace(
