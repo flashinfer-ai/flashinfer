@@ -574,6 +574,8 @@ def prims_ts_fp4_block_scale_moe(
         slot, otherwise that tile's first valid config runs. Autotuning profiles the call
         with routing included. NVFP4 activations and precomputed routing only; not
         supported with ``routing_replay_out`` or fused shared experts (``ValueError``).
+        With ``do_finalize=False`` the returned routing outputs share the slot's storage:
+        consume them before the slot is repopulated, or copy them to keep them.
         Default ``None`` (route inside the call).
 
     Returns
