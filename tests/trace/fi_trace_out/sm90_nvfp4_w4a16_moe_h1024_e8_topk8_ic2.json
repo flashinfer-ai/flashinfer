@@ -1,0 +1,131 @@
+{
+  "name": "sm90_nvfp4_w4a16_moe_h1024_e8_topk8_ic2",
+  "description": "SM90 fused MoE with NVFP4 expert weights (packed for the in-register decoder) and BF16 activations: SwiGLU experts, optional per-route RMSNorm, top-k sum. Precomputed routing with local expert ids.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.sm90_nvfp4_w4a16.sm90_nvfp4_w4a16_moe",
+    "moe",
+    "sm90",
+    "quantization:fp4"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1024
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8
+    },
+    "top_k": {
+      "type": "const",
+      "value": 8
+    },
+    "gate_up_k_chunks": {
+      "type": "const",
+      "value": 4,
+      "description": "hidden_size / 256."
+    },
+    "gate_up_row_blocks": {
+      "type": "const",
+      "value": 4,
+      "description": "2 * intermediate_size / 256."
+    },
+    "down_k_chunks": {
+      "type": "const",
+      "value": 2,
+      "description": "intermediate_size / 256."
+    },
+    "down_row_blocks": {
+      "type": "const",
+      "value": 4,
+      "description": "hidden_size / 256."
+    },
+    "weight_block_bytes": {
+      "type": "const",
+      "value": 35840,
+      "description": "35840."
+    },
+    "two": {
+      "type": "const",
+      "value": 2,
+      "description": "2 (gate, up)."
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "topk_ids": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "Local expert ids; ids outside [0, num_local_experts) are skipped."
+    },
+    "topk_weights": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "float32"
+    },
+    "w13": {
+      "shape": [
+        "num_local_experts",
+        "gate_up_k_chunks",
+        "gate_up_row_blocks",
+        "weight_block_bytes"
+      ],
+      "dtype": "uint8"
+    },
+    "w13_global_scale": {
+      "shape": [
+        "two",
+        "num_local_experts"
+      ],
+      "dtype": "float32"
+    },
+    "w2": {
+      "shape": [
+        "num_local_experts",
+        "down_k_chunks",
+        "down_row_blocks",
+        "weight_block_bytes"
+      ],
+      "dtype": "uint8"
+    },
+    "w2_global_scale": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32"
+    },
+    "post_norm_weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

@@ -868,6 +868,39 @@ launch. Use :func:`has_monomoe` to check availability before calling.
     interleave_for_tma_wgmma_up
     mono_moe
 
+SM90 NVFP4 x BF16 (W4A16) Fused MoE
+-----------------------------------
+
+Fused MoE for Hopper (SM90a: H100 / H200 / H20) with NVFP4 expert weights and
+BF16 activations. Hopper has no FP4 tensor cores: the kernels decode E2M1 codes
+and E4M3 block scales in registers into exact BF16 products and run BF16 MMAs
+with FP32 accumulation, so activations are never quantized. One call runs
+gate/up, SwiGLU, down and the top-k sum (optionally with a per-route RMSNorm of
+each expert output) for up to 32 local experts and top-k up to 8, with
+precomputed routing (ids outside ``[0, E)`` are skipped, as under expert
+parallelism). Up to 1024 tokens run in one persistent launch; larger batches
+use a persistent expert-grouped kernel on CTA pairs, from a token count chosen
+per shape (:func:`sm90_nvfp4_w4a16_moe_prefill_min_tokens`) unless
+``prefill_min_tokens`` is given. Hidden size: multiple of 512 in ``[1024, 8192]``; intermediate size:
+multiple of 256 in ``[512, 8192]``.
+
+Weights are repacked once with :func:`prepare_sm90_nvfp4_w4a16_weights`
+(lossless; it requires each matrix's nonzero block scales to span at most a
+factor of 112, or up to 224 depending on the largest scale: see that function).
+Create the workspace (:func:`get_sm90_nvfp4_w4a16_moe_workspace` or
+:class:`Sm90Nvfp4W4A16MoEWorkspace`) before CUDA graph capture.
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_sm90_nvfp4_w4a16_weights
+    dequantize_sm90_nvfp4_w4a16_weights
+    Sm90Nvfp4W4A16Weights
+    Sm90Nvfp4W4A16MoEWorkspace
+    get_sm90_nvfp4_w4a16_moe_workspace
+    sm90_nvfp4_w4a16_moe
+    sm90_nvfp4_w4a16_moe_prefill_min_tokens
+
 cuDNN Grouped-GEMM MoE
 ----------------------
 

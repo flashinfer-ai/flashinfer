@@ -129,6 +129,7 @@ mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_native_sf1d_N256_K1024_K_packed512_block_size16_SF_dim_016384.json
 mono_moe_topk8_h2048_i512.json
+sm90_nvfp4_w4a16_moe_h1024_e8_topk8_ic2.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_ds_shared_experts_s1_e33_topk8_h256_i128_act3_ng8_kg4.json
@@ -1678,6 +1679,29 @@ with contextlib.suppress(Exception):
         top_k=8,
         scoring_func="softmax",
         renormalize=True,
+    )
+
+# ── sm90_nvfp4_w4a16_moe (SM90 NVFP4-weight x BF16-activation fused MoE) ──────
+# Small shape; SM90a-only and JIT-built, so wrapped in suppress(): the trace JSON
+# dumps before the kernel launches.
+with contextlib.suppress(Exception):
+    _w4_H, _w4_I, _w4_E, _w4_K, _w4_M = 1024, 512, 8, 8, 4
+    _w4_packed = flashinfer.fused_moe.prepare_sm90_nvfp4_w4a16_weights(
+        torch.zeros(_w4_E, 2 * _w4_I, _w4_H // 2, dtype=torch.uint8, device=device),
+        torch.zeros(_w4_E, 2 * _w4_I, _w4_H // 16, dtype=torch.uint8, device=device),
+        torch.ones(_w4_E, device=device),
+        torch.zeros(_w4_E, _w4_H, _w4_I // 2, dtype=torch.uint8, device=device),
+        torch.zeros(_w4_E, _w4_H, _w4_I // 16, dtype=torch.uint8, device=device),
+        torch.ones(_w4_E, device=device),
+    )
+    flashinfer.fused_moe.sm90_nvfp4_w4a16_moe(
+        torch.randn(_w4_M, _w4_H, dtype=torch.bfloat16, device=device),
+        torch.randint(0, _w4_E, (_w4_M, _w4_K), dtype=torch.int32, device=device),
+        torch.full((_w4_M, _w4_K), 1.0 / _w4_K, device=device),
+        _w4_packed.w13,
+        _w4_packed.w13_global_scale,
+        _w4_packed.w2,
+        _w4_packed.w2_global_scale,
     )
 
 # ── CuTe-DSL NVFP4 routing weights before FC2 ──────────────────────────────
