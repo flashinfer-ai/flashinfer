@@ -1300,6 +1300,9 @@ class GqaDecodeTcgen05:
                 cute.copy(tma_atom_o, sO_stage, gO_hpb)
                 cute.arch.cp_async_bulk_commit_group()
 
+            # The last tile's O store still reads sO: wait for the bulk read before the
+            # CTA exits (the in-loop wait only runs when there is a next work tile)
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.griddepcontrol_launch_dependents()
 
         ##############################
