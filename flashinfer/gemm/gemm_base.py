@@ -560,6 +560,7 @@ def _cutlass_mm_bf16_requirement(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if bias is not None:
         raise ValueError(
@@ -593,6 +594,7 @@ def _cublaslt_mm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if bias is not None:
         if out_dtype != torch.bfloat16:
@@ -630,6 +632,7 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -662,6 +665,7 @@ def _tgv_gemm_requirement(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     # FP32 output only when TGV is named, so backend="auto" keeps its candidates.
     if out_dtype != torch.bfloat16 and not (
@@ -706,6 +710,7 @@ def _cute_dsl_mm_bf16_requirement(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
@@ -777,6 +782,7 @@ def _cutile_mm_bf16_requirement(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
@@ -805,6 +811,7 @@ def _tinygemm_mm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
@@ -843,6 +850,7 @@ def _check_mm_bf16_problem_size(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     if tactic is not None and backend != "tgv":
         raise ValueError("tactic applies to the TGV backend only; pass backend='tgv'.")
@@ -890,6 +898,7 @@ def _heuristic_func_mm_bf16(
     ] = "cudnn",
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ):
     # pdl does not narrow the candidates: cuDNN, cuBLASLt and CUTLASS have no
     # PDL launch and run without it here (CUTLASS and cuBLASLt reject
@@ -920,6 +929,33 @@ def _heuristic_func_mm_bf16(
         heuristic_backends.append("tinygemm")
 
     return heuristic_backends
+
+
+def _check_mm_bf16_full_tuning(
+    backend: str, batch_invariant: bool, tactic: Optional[int]
+) -> None:
+    """Reject mm_bf16(full=True) where it cannot mean v1 full tuning."""
+    if batch_invariant:
+        raise ValueError("full=True does not apply to batch_invariant=True.")
+    if tactic is not None:
+        raise ValueError("full=True does not apply to an explicit tactic.")
+    if backend == "cutile":
+        raise ValueError(
+            'full=True does not apply to backend="cutile", which is not autotuned.'
+        )
+    tuner = AutoTuner.get()
+    if tuner._in_v2_context:
+        raise ValueError(
+            "full=True is a mode of autotune(True) and is not supported inside "
+            "autotune_v2()."
+        )
+    if tuner.is_tuning_mode and tuner._active_managed_store is not None:
+        raise ValueError(
+            "full=True tuning would write its results into the managed autotune "
+            "cache that autotune_v2() left attached to this process (it cannot "
+            "be detached). Run full tuning in a process that has not used "
+            "autotune_v2() with persistent_cache=True."
+        )
 
 
 def _batch_invariant_requested(*args, **kwargs) -> bool:
@@ -964,6 +1000,7 @@ def mm_bf16(
     *,
     batch_invariant: bool = False,
     tactic: Optional[int] = None,
+    full: bool = False,
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -1054,6 +1091,20 @@ def mm_bf16(
         are ``0 .. 28`` on SM100/SM103 and ``0 .. 46`` on SM107. For callers
         that pick the tile per shape themselves. Defaults to ``None``.
 
+    full: bool
+        Full tuning for this call inside ``autotune(True)``: every available
+        tactic is timed with all of its cold-L2 samples as single launches,
+        each after the SM clock has recovered (power-limited GPUs throttle
+        under load, which otherwise favours the tactics timed after a pause).
+        Slower to tune. The result is cached like an ordinary tuning result
+        and serves ordinary lookups and ordinary tuning calls; an ordinary
+        cached result does not satisfy a ``full=True`` call. Without
+        ``autotune(True)`` it only looks up the cache, like ``full=False``.
+        Not supported with ``batch_invariant=True``, an explicit ``tactic``,
+        ``backend="cutile"``, inside ``autotune_v2()``, or for tuning while a
+        managed cache from ``autotune_v2()`` is attached (ValueError).
+        Defaults to ``False``.
+
     Returns
     -------
     torch.Tensor
@@ -1096,6 +1147,9 @@ def mm_bf16(
     # None (accepted since #8032, shipped in 0.7.4rc1) behaves as False. The
     # requirement checkers already ran and treat None as falsy, like False.
     pdl = bool(pdl)
+
+    if full:
+        _check_mm_bf16_full_tuning(backend, batch_invariant, tactic)
 
     if batch_invariant:
         if tactic is not None:
@@ -1154,7 +1208,7 @@ def mm_bf16(
     else:
         backends = [backend]
 
-    bf16_gemm_sm100(a, b, bias, pdl, out, workspace_buffer, backends)
+    bf16_gemm_sm100(a, b, bias, pdl, out, workspace_buffer, backends, full=full)
     return out
 
 
@@ -3251,6 +3305,10 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         ),
     ),
 )
+# mm_bf16(full=True): full tuning of the same GEMM, see TuningConfig.full_profiling.
+_BF16_GEMM_SM100_FULL_TUNING_CONFIG = replace(
+    _BF16_GEMM_SM100_TUNING_CONFIG, full_profiling=True
+)
 
 
 @functools.lru_cache(maxsize=64)
@@ -3675,6 +3733,7 @@ def bf16_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    full: bool = False,
 ) -> None:
     use_sm_100f = is_sm100f_supported(a.device)
 
@@ -3728,7 +3787,7 @@ def bf16_gemm_sm100(
     runner, tactic = tuner.choose_one(
         custom_op,
         runners,
-        _BF16_GEMM_SM100_TUNING_CONFIG,
+        _BF16_GEMM_SM100_FULL_TUNING_CONFIG if full else _BF16_GEMM_SM100_TUNING_CONFIG,
         inputs,
     )
 

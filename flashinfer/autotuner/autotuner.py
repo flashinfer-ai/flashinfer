@@ -13,6 +13,7 @@ import pkgutil
 import statistics
 import tempfile
 import threading
+import time
 import weakref
 
 import tqdm
@@ -610,6 +611,18 @@ class TuningConfig:
             Cold-L2 profiling uses a separate measurement path. This
             choice is recorded as tuning provenance because it can change the
             winner; ordinary lookup can still consume that winner.
+        full_profiling: Time every tactic with all ``profiling_repeat`` (times
+            ``cuda_graph_profile_replays``) cold-L2 samples as single launches,
+            without the cold-chain time budget, and before each sample wait
+            (outside the timed interval) until NVML reports the SM clock
+            recovered. On a power-limited GPU the clock drops under load, so
+            otherwise the tactics timed right after a pause run faster than
+            the rest. Recorded as tuning provenance: an ordinary winner does
+            not answer a full-profiling request, while ordinary lookup and
+            ordinary tuning use a full-profiling winner of the same call (see
+            ``AutoTuner._accepted_profiling_policies``). A comparison in which
+            the clock could not be confirmed for some sample (on any rank of
+            the autotune process group) is not cached.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -631,12 +644,14 @@ class TuningConfig:
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
     use_cuda_graph_individual_timing: bool = False
+    full_profiling: bool = False
 
     @property
     def uses_cold_chain(self) -> bool:
         """Whether cold-L2 samples time a multi-launch arena chain."""
         return (
-            self.cold_chain_launches > 1
+            not self.full_profiling
+            and self.cold_chain_launches > 1
             and self.use_cuda_graph
             and self.use_cold_l2_cache
             and bool(self.profile_arena_input_indices or self.value_aware_input_indices)
@@ -2028,6 +2043,92 @@ class _V2Local(threading.local):
     strict_replay: bool = False
 
 
+# NVML clocks event reasons that hold the SM clock below its maximum under
+# load: SW power cap, HW slowdown, SW thermal, HW thermal, HW power brake.
+_NVML_CLOCK_LIMIT_REASONS = 0x4 | 0x8 | 0x20 | 0x40 | 0x80
+_NVML_GPU_IDLE_REASON = 0x1
+_FULL_PROFILING_CUPTI_ERROR = (
+    "full_profiling cannot be tuned under the CUPTI timer: CUPTI timing does not "
+    "wait for the SM clock before each sample, so the result would not be a "
+    "full-profiling result. Tune it without MeasurementPolicy(_timer='cupti')."
+)
+_FULL_PROFILING_RANK_TACTICS_ERROR = (
+    "full_profiling is not supported by rank_tactics with k > 1 in tuning mode: "
+    "the shortlist and its cached winner would not get the full-profiling "
+    "clock checks. Use k=1 (choose_one) for full profiling."
+)
+_nvml_handles: dict[int, Any] = {}
+_nvml_lock = threading.Lock()
+
+
+def _nvml_handle(device: torch.device) -> Any:
+    """NVML handle of a CUDA device, or None when NVML cannot be used."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        import pynvml
+
+        with _nvml_lock:
+            if index not in _nvml_handles:
+                pynvml.nvmlInit()
+                uuid = str(torch.cuda.get_device_properties(index).uuid)
+                if not uuid.startswith("GPU-"):
+                    uuid = "GPU-" + uuid
+                _nvml_handles[index] = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            return _nvml_handles[index]
+    except Exception:
+        return None
+
+
+def _nvml_sm_clock_state(device: torch.device) -> tuple[int, int, int] | None:
+    """(SM clock, its maximum, active clocks event reasons), or None."""
+    handle = _nvml_handle(device)
+    if handle is None:
+        return None
+    try:
+        import pynvml
+
+        reasons = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None)
+        if reasons is None:
+            reasons = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
+        return (
+            pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM),
+            pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM),
+            int(reasons(handle)),
+        )
+    except Exception:
+        return None
+
+
+def _wait_for_sm_clock(
+    device: torch.device, timeout_s: float, tolerance_mhz: int = 15
+) -> bool | None:
+    """Idle until the SM clock has recovered from power or thermal limiting.
+
+    Recovered means no limiting reason is active and the clock is at its
+    maximum (within one clock step) or the GPU is idle, for three polls in a
+    row. Returns True when recovered, False after ``timeout_s`` and None when
+    NVML cannot report the clock.
+    """
+    if _nvml_sm_clock_state(device) is None:
+        return None
+    deadline = time.perf_counter() + timeout_s
+    stable = 0
+    while True:
+        state = _nvml_sm_clock_state(device)
+        if state is None:
+            return None
+        sm_mhz, max_mhz, reasons = state
+        recovered = not (reasons & _NVML_CLOCK_LIMIT_REASONS) and (
+            sm_mhz >= max_mhz - tolerance_mhz or bool(reasons & _NVML_GPU_IDLE_REASON)
+        )
+        stable = stable + 1 if recovered else 0
+        if stable >= 3:
+            return True
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(0.002)
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -2042,6 +2143,8 @@ class AutoTuner:
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _COLD_CHAIN_SAMPLE_BUDGET_MS = 10.0
+    # Longest wait for the SM clock before one full-profiling sample.
+    _FULL_PROFILING_CLOCK_TIMEOUT_S = 2.0
     # Near-tie settling (autotune(tie_tolerance=...)); see _settle_near_ties.
     _TIE_MAX_CONTENDERS = 4
     _TIE_CONFIRM_ROUNDS = 2
@@ -2080,6 +2183,9 @@ class AutoTuner:
         # holds the single-subscriber slot): timer="cupti" then falls back
         # to CUDA events for the rest of the process.
         self._cupti_disabled = False
+        # Full-profiling samples taken without a confirmed SM clock (timeout,
+        # or NVML unavailable); a comparison that adds any is not cached.
+        self._full_profiling_unconfirmed_samples = 0
 
         # Reentrant lock protecting all mutable state on this instance.
         # RLock is used because choose_one() calls search_cache() internally.
@@ -2769,6 +2875,12 @@ class AutoTuner:
             check_memory_policy = require_profiling_policy or (
                 self.is_tuning_mode and self._active_managed_store is None
             )
+            # Serving lookups (no policy checks) do not pay for this.
+            accepted_policies = (
+                self._accepted_profiling_policies(tuning_config)
+                if check_memory_policy or self.is_tuning_mode
+                else ()
+            )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -2785,7 +2897,7 @@ class AutoTuner:
                         (winner_identity, cache_key),
                         default_policy if winner_identity is None else None,
                     )
-                    if check_memory_policy and cached_policy != requested_policy:
+                    if check_memory_policy and cached_policy not in accepted_policies:
                         if profiling_candidates is not None:
                             return False, 0, -1, None
                         if (
@@ -2845,7 +2957,7 @@ class AutoTuner:
                         if (
                             self.is_tuning_mode
                             and self._file_config_policies.get(file_key, default_policy)
-                            != requested_policy
+                            not in accepted_policies
                         ):
                             if profiling_candidates is not None:
                                 return False, 0, -1, None
@@ -3430,6 +3542,20 @@ class AutoTuner:
                 "All Given runners must be subclass of TunableRunner"
             )
 
+            # CUPTI timing skips the SM clock waits of full profiling, so its
+            # winner would be stored as a full result it is not. Rejected
+            # before any measurement; under a tuning group through the
+            # profile gate below, so every rank fails at the same collective.
+            full_error = (
+                _FULL_PROFILING_CUPTI_ERROR
+                if tuning_config.full_profiling
+                and measure_policy is not None
+                and measure_policy.timer == "cupti"
+                else None
+            )
+            if full_error is not None and _tune_process_group is None:
+                raise ValueError(full_error)
+
             plan_error = None
             profiles = []
             profiling_candidates = None
@@ -3451,7 +3577,7 @@ class AutoTuner:
             _check_tuning_group_phase(
                 ("profiles", custom_op),
                 (len(profiles), self._profiling_policy(tuning_config)),
-                plan_error,
+                plan_error or full_error,
             )
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
@@ -3593,6 +3719,7 @@ class AutoTuner:
                         runner_id, tactic = None, None
                         skipped_count = 0
                         comparison_complete = True
+                        unconfirmed_before = self._full_profiling_unconfirmed_samples
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             runner_error = None
@@ -3792,7 +3919,42 @@ class AutoTuner:
                                 tuning_config,
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
+                            unconfirmed = (
+                                self._full_profiling_unconfirmed_samples
+                                - unconfirmed_before
+                            )
+                            group_unconfirmed = bool(unconfirmed)
                             if (
+                                tuning_config.full_profiling
+                                and _tune_process_group is not None
+                            ):
+                                # The timings are group means, so a sample
+                                # without a confirmed clock on any rank went
+                                # into this winner: decide on caching together.
+                                # Every rank gets here once per profile with a
+                                # winner (same all-reduced timings).
+                                status, _ = _tuning_group_agreement(
+                                    ("full_profiling_clock", custom_op, _step),
+                                    (),
+                                    int(group_unconfirmed),
+                                )
+                                group_unconfirmed = status > 0
+                            if group_unconfirmed:
+                                where = (
+                                    f"before {unconfirmed} sample(s) on this rank"
+                                    if unconfirmed
+                                    else "on another rank of the tuning group"
+                                )
+                                logger.warning(
+                                    f"[Autotuner]: Full profiling of {custom_op} "
+                                    f"for {p.get_opt_shapes()}: the SM clock "
+                                    f"could not be confirmed as recovered {where} "
+                                    f"(NVML unavailable, or still limited after "
+                                    f"{self._FULL_PROFILING_CLOCK_TIMEOUT_S} s). "
+                                    f"The winner is used for this call but is "
+                                    f"not cached as a full-profiling result."
+                                )
+                            if group_unconfirmed or (
                                 profiling_candidates is not None
                                 and not comparison_complete
                             ):
@@ -4140,6 +4302,18 @@ class AutoTuner:
                     tuning_config, self._effective_measure_policy
                 )
 
+            # A shortlist would be ranked and its winner cached from timings
+            # whose SM clock was never checked: full profiling goes through
+            # choose_one (k=1) only. Rejected before any measurement; under a
+            # tuning group through the ranking gate below.
+            full_error = (
+                _FULL_PROFILING_RANK_TACTICS_ERROR
+                if tuning_config.full_profiling
+                else None
+            )
+            if full_error is not None and _tune_process_group is None:
+                raise ValueError(full_error)
+
             plan_error = None
             # Read before enumeration, as choose_one() does, so a pool that
             # changes during preparation is ranked again on the next pass.
@@ -4182,7 +4356,7 @@ class AutoTuner:
             _check_tuning_group_phase(
                 ("ranking_profile", custom_op),
                 self._profiling_policy(tuning_config),
-                plan_error,
+                plan_error or full_error,
             )
             cache_key = AutoTuner._get_cache_key(
                 custom_op,
@@ -4554,6 +4728,67 @@ class AutoTuner:
             ]
             return statistics.median(samples) / len(captured_batches)
 
+        def full_profile(stream: torch.cuda.Stream, repeat: int) -> float:
+            """Time every requested cold-L2 sample as one isolated launch.
+
+            Before each sample the host waits until the SM clock has
+            recovered; the wait, the delay kernel that hides the launch and
+            the L2 flush are all ordered before the start event.
+            """
+            profile_replays = (
+                tuning_config.cuda_graph_profile_replays
+                if tuning_config.use_cuda_graph
+                else 1
+            )
+            if profile_replays < 1:
+                raise ValueError("cuda_graph_profile_replays must be at least one")
+            device = next(
+                (
+                    tensor.device
+                    for tensor in inputs
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+                ),
+                None,
+            )
+            if device is None:
+                raise ValueError("Full profiling requires at least one CUDA tensor")
+            l2_flush = make_l2_flush(
+                2 * self._get_l2_cache_size_in_bytes(device.index), device
+            )
+            profile_inputs = input_tensor_batches[-1]
+            graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
+            delay_usec = (
+                self._CUDA_GRAPH_DELAY_MICRO_SECS
+                if graph is not None
+                else self.stream_delay_micro_secs
+            )
+            samples = []
+            with torch.cuda.stream(stream):
+                if graph is not None:
+                    with torch.cuda.graph(graph, pool=profile_graph_pool()):
+                        runner(profile_inputs, tactic=tactic, **kwargs)
+                    graph.replay()
+                stream.synchronize()
+                for _ in range(repeat * profile_replays):
+                    if not _wait_for_sm_clock(
+                        device, self._FULL_PROFILING_CLOCK_TIMEOUT_S
+                    ):
+                        self._full_profiling_unconfirmed_samples += 1
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    if delay_usec > 0:
+                        delay_kernel(delay_usec)
+                    l2_flush()
+                    start.record(stream)
+                    if graph is not None:
+                        graph.replay()
+                    else:
+                        runner(profile_inputs, tactic=tactic, **kwargs)
+                    end.record(stream)
+                    stream.synchronize()
+                    samples.append(start.elapsed_time(end))
+            return statistics.median(samples)
+
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
 
@@ -4705,7 +4940,9 @@ class AutoTuner:
                     )
                 self._cupti_disabled = True
             if not use_cupti:
-                delayed_events = tuning_config.use_cold_l2_cache or not (
+                delayed_events = (
+                    tuning_config.full_profiling or tuning_config.use_cold_l2_cache
+                ) or not (
                     (
                         tuning_config.use_cuda_graph
                         and tuning_config.use_cuda_graph_individual_timing
@@ -4743,7 +4980,9 @@ class AutoTuner:
                     for _ in range(self.warmup):
                         runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-                    if tuning_config.use_cold_l2_cache:
+                    if tuning_config.full_profiling:
+                        avg_time = full_profile(stream, profiling_repeat)
+                    elif tuning_config.use_cold_l2_cache:
                         avg_time = cold_l2_profile(stream, profiling_repeat)
                     elif (
                         tuning_config.use_cuda_graph
@@ -5125,7 +5364,26 @@ class AutoTuner:
             and not tuning_config.use_cold_l2_cache
         ):
             policy += ("cuda_graph_timing_mode", "individual")
+        if tuning_config.full_profiling:
+            policy += ("full_profiling", True)
         return policy
+
+    @classmethod
+    def _accepted_profiling_policies(cls, tuning_config: TuningConfig) -> tuple:
+        """Stored policies a tuning-mode lookup with ``tuning_config`` accepts.
+
+        Reuse is asymmetric: an ordinary request also accepts the winner of a
+        full-profiling run of the same call (same overrides; its L2 policy and
+        sample count differ, so it is a policy of its own), so warmup neither
+        retunes nor overwrites it. A full request accepts only full winners.
+        """
+        policy = cls._profiling_policy(tuning_config)
+        if tuning_config.full_profiling:
+            return (policy,)
+        return (
+            policy,
+            cls._profiling_policy(replace(tuning_config, full_profiling=True)),
+        )
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:
