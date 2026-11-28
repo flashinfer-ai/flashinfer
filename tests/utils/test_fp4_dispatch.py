@@ -361,3 +361,202 @@ def test_wrapper_preserves_supported_launch_device(monkeypatch, name, backend, k
     backend_call.assert_called_once()
     assert capability_query.call_count > 0
     assert all(call.args[0] == target for call in capability_query.call_args_list)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_per_token_cuda_tensor_scale_avoids_host_item_read(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(10, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    item_read = Mock(side_effect=AssertionError("Tensor.item must not run"))
+    monkeypatch.setattr(torch.Tensor, "item", item_read)
+    cuda_copy = Mock(side_effect=AssertionError("Tensor.cuda must not run"))
+    monkeypatch.setattr(torch.Tensor, "cuda", cuda_copy)
+
+    # Use a non-CPU tensor (meta device works without a GPU) to verify device
+    # tensors stay on device without calling .item() or .cuda().
+    a_global_sf = torch.empty(1, dtype=torch.float32, device="meta")
+    x_cuda = SimpleNamespace(device=a_global_sf.device)
+    x = SimpleNamespace(
+        device=a_global_sf.device, is_cuda=True, cuda=Mock(return_value=x_cuda)
+    )
+    sentinel = (object(), object(), object())
+    quant_op = Mock(return_value=sentinel)
+    monkeypatch.setattr(
+        fp4,
+        "get_fp4_quantization_module",
+        Mock(
+            return_value=SimpleNamespace(nvfp4_quant_and_per_token_scale_sm100=quant_op)
+        ),
+    )
+
+    result = fp4.nvfp4_quantize(
+        x,
+        a_global_sf,
+        per_token_activation=True,
+        backend="cuda",
+        nvfp4_4over6=None,
+    )
+
+    assert result == sentinel
+    item_read.assert_not_called()
+    cuda_copy.assert_not_called()
+    quant_op.assert_called_once()
+    assert quant_op.call_args.args[1] is a_global_sf
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_per_token_cpu_tensor_scale_uses_host_scalar_and_validates_recipe(
+    monkeypatch,
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(10, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    monkeypatch.setattr(fp4, "get_compute_capability", capability_query)
+    cuda_copy = Mock(side_effect=AssertionError("CPU scale must not be copied to CUDA"))
+    monkeypatch.setattr(torch.Tensor, "cuda", cuda_copy)
+
+    x_cuda = SimpleNamespace(device=torch.device("cuda:0"))
+    x = SimpleNamespace(
+        device=torch.device("cuda:0"), is_cuda=True, cuda=Mock(return_value=x_cuda)
+    )
+    scale_448 = torch.tensor([1.0 / (448.0 * 6.0)], dtype=torch.float32, device="cpu")
+    sentinel = (object(), object(), object())
+    quant_op = Mock(return_value=sentinel)
+    monkeypatch.setattr(
+        fp4,
+        "get_fp4_quantization_module",
+        Mock(
+            return_value=SimpleNamespace(nvfp4_quant_and_per_token_scale_sm100=quant_op)
+        ),
+    )
+
+    # Matching CPU tensor stays on host as a Python float (no H2D copy).
+    result = fp4.nvfp4_quantize(
+        x,
+        scale_448,
+        per_token_activation=True,
+        backend="cuda",
+        nvfp4_4over6=None,
+    )
+    assert result == sentinel
+    cuda_copy.assert_not_called()
+    quant_op.assert_called_once()
+    assert isinstance(quant_op.call_args.args[1], float)
+    assert quant_op.call_args.args[1] == pytest.approx(1.0 / (448.0 * 6.0))
+
+    # Mismatched CPU tensor with explicit 256 recipe still raises ValueError.
+    with pytest.raises(ValueError, match="does not match the requested NVFP4"):
+        fp4.nvfp4_quantize(
+            x,
+            scale_448,
+            per_token_activation=True,
+            backend="cuda",
+            nvfp4_4over6=fp4.NVFP44Over6Config(e4m3_max=256),
+        )
+    cuda_copy.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_stale_fp4_aot_module_fallback_and_float_compatibility(monkeypatch):
+    from flashinfer.jit.core import JitSpecNvcc
+
+    stale_scalar_fn = Mock()
+    stale_module = SimpleNamespace(nvfp4_quant_and_per_token_scale=stale_scalar_fn)
+    fresh_scalar_fn = Mock()
+    fresh_tensor_fn = Mock()
+    fresh_module = SimpleNamespace(
+        nvfp4_quant_and_per_token_scale=fresh_scalar_fn,
+        nvfp4_quant_and_per_token_scale_tensor=fresh_tensor_fn,
+    )
+
+    spec = JitSpecNvcc(
+        name="fp4_quantization_100",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    monkeypatch.setattr(spec, "build_and_load", Mock(return_value=stale_module))
+    fallback_mock = Mock(return_value=fresh_module)
+    monkeypatch.setattr(spec, "_build_and_load_jit_fallback", fallback_mock)
+    monkeypatch.setattr(fp4, "gen_fp4_quantization_sm100_module", lambda: spec)
+
+    x = torch.empty((2, 32), dtype=torch.bfloat16, device="meta")
+    out = torch.empty((2, 16), dtype=torch.uint8, device="meta")
+    sf = torch.empty((2, 2), dtype=torch.uint8, device="meta")
+    pts = torch.empty((2,), dtype=torch.float32, device="meta")
+
+    fp4.get_fp4_quantization_module.cache_clear()
+    try:
+        # Loading a stale module must not eagerly compile; scalar/CPU-tensor
+        # calls keep using the 8-arg export, and JIT fallback runs lazily once
+        # when a device tensor actually requires the new export.
+        monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+        mod = fp4.get_fp4_quantization_module("100")
+        fallback_mock.assert_not_called()
+
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(x, 1.0, out, sf, pts)
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, torch.tensor([1.0], dtype=torch.float32), out, sf, pts
+        )
+        fallback_mock.assert_not_called()
+        assert stale_scalar_fn.call_count == 2
+        assert all(len(c.args) == 8 for c in stale_scalar_fn.call_args_list)
+
+        dev_scale = torch.empty((1,), dtype=torch.float32, device="meta")
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(x, dev_scale, out, sf, pts)
+        mod.nvfp4_quant_and_per_token_scale_out_sm100(x, dev_scale, out, sf, pts)
+        fallback_mock.assert_called_once()
+        assert fresh_tensor_fn.call_count == 2
+        assert len(fresh_tensor_fn.call_args.args) == 8
+
+        # If lazy JIT fallback fails (e.g. no nvcc), loading and scalar calls
+        # still work while device-tensor calls raise a clear error naming the
+        # missing export.
+        fp4.get_fp4_quantization_module.cache_clear()
+        stale_scalar_fn.reset_mock()
+        compile_err = RuntimeError("nvcc not found")
+        failing_fallback = Mock(side_effect=compile_err)
+        monkeypatch.setattr(spec, "_build_and_load_jit_fallback", failing_fallback)
+        stale_mod_no_nvcc = fp4.get_fp4_quantization_module("100")
+        failing_fallback.assert_not_called()
+
+        stale_mod_no_nvcc.nvfp4_quant_and_per_token_scale_out_sm100(
+            x, 1.0, out, sf, pts
+        )
+        stale_scalar_fn.assert_called_once()
+        failing_fallback.assert_not_called()
+
+        with pytest.raises(
+            RuntimeError, match="nvfp4_quant_and_per_token_scale_tensor"
+        ) as excinfo:
+            stale_mod_no_nvcc.nvfp4_quant_and_per_token_scale_out_sm100(
+                x, dev_scale, out, sf, pts
+            )
+        assert excinfo.value.__cause__ is compile_err
+
+        # With JIT disabled, stale module stays usable for 8-arg float/CPU scale
+        # calls and raises a clear error without invoking fallback on device tensors.
+        fp4.get_fp4_quantization_module.cache_clear()
+        stale_scalar_fn.reset_mock()
+        fallback_mock.reset_mock()
+        monkeypatch.setattr(spec, "_build_and_load_jit_fallback", fallback_mock)
+        monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+        stale_mod = fp4.get_fp4_quantization_module("100")
+        fallback_mock.assert_not_called()
+
+        stale_mod.nvfp4_quant_and_per_token_scale_out_sm100(x, 1.0, out, sf, pts)
+        stale_scalar_fn.assert_called_once()
+
+        with pytest.raises(
+            RuntimeError, match="nvfp4_quant_and_per_token_scale_tensor"
+        ):
+            stale_mod.nvfp4_quant_and_per_token_scale_out_sm100(
+                x, dev_scale, out, sf, pts
+            )
+        fallback_mock.assert_not_called()
+    finally:
+        fp4.get_fp4_quantization_module.cache_clear()

@@ -49,3 +49,13 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv, T
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
                                      int64_t sfLayout, int64_t nvfp44Over6Code);
+
+// Device-tensor variant of nvfp4_quant_and_per_token_scale: scale_inv_tensor is a
+// 1-element float32 CUDA tensor on input's device, read on device so CUDA graph
+// capture requires no host sync.
+void nvfp4_quant_and_per_token_scale_tensor(TensorView const input,
+                                            TensorView const scale_inv_tensor, TensorView output,
+                                            TensorView output_scale,
+                                            TensorView output_per_token_scale,
+                                            Optional<TensorView> expanded_idx_to_permuted_idx,
+                                            int64_t sfLayout, int64_t nvfp44Over6Code);

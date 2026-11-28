@@ -938,7 +938,8 @@ template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool 
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
-    uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
+    uint32_t m, uint32_t n, T const* input, float globalScaleInv, float const* globalScaleInvPtr,
+    int32_t* expandedIdxToPermutedIdx,
     // output
     uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
   constexpr int SF_VEC_SIZE = 16;
@@ -999,7 +1000,8 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   float globalEncodeScale;
   if constexpr (IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value && DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
-      float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
+      float const scaleInv = globalScaleInvPtr != nullptr ? *globalScaleInvPtr : globalScaleInv;
+      float const globalScale = __fdiv_rn(1.0f, scaleInv);
       if (rowAmax != 0.0f) {
         float const rowEncodeScale = fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX);
         if (rowEncodeScale != 0.0f) {
@@ -1025,7 +1027,8 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value &&
                        DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
-      float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
+      float const scaleInv = globalScaleInvPtr != nullptr ? *globalScaleInvPtr : globalScaleInv;
+      float const globalScale = __fdiv_rn(1.0f, scaleInv);
       float const rowEncodeScale =
           rowAmax != 0.0f ? fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX) : FLT_MAX;
       perTokenScaleOutput[rowIdx] = rowEncodeScale != 0.0f ? rowEncodeScale : 1.0f;
@@ -1038,9 +1041,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
   } else {
-    perTokenScale = rowAmax * globalScaleInv;
     if (threadIdx.x == 0) {
-      perTokenScaleOutput[rowIdx] = perTokenScale;
+      float const scaleInv = globalScaleInvPtr != nullptr ? *globalScaleInvPtr : globalScaleInv;
+      perTokenScaleOutput[rowIdx] = rowAmax * scaleInv;
     }
     __syncthreads();
     perTokenScale = perTokenScaleOutput[rowIdx];
@@ -1090,7 +1093,7 @@ template <uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT>
 __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
     // input
     uint32_t m, uint32_t n, float const* input, float globalScaleInv,
-    int32_t* expandedIdxToPermutedIdx,
+    float const* globalScaleInvPtr, int32_t* expandedIdxToPermutedIdx,
     // output
     uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
   static constexpr int ELTS_PER_THREAD = 8;
@@ -1149,12 +1152,12 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
   globalAmax = BlockReduce(tempStorage).Reduce(globalAmax, cuda::maximum<>{});
 
   // save the per-token scale
-  float perTokenScale = globalAmax * globalScaleInv;
   if (threadIdx.x == 0) {
-    perTokenScaleOutput[rowIdx] = perTokenScale;
+    float const scaleInv = globalScaleInvPtr != nullptr ? *globalScaleInvPtr : globalScaleInv;
+    perTokenScaleOutput[rowIdx] = globalAmax * scaleInv;
   }
   __syncthreads();
-  perTokenScale = perTokenScaleOutput[rowIdx];
+  float perTokenScale = perTokenScaleOutput[rowIdx];
 
   // quantize to fp4 with per-token scale
   uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;

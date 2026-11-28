@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -297,7 +298,57 @@ def get_fp4_quantization_module(backend: str = "100"):
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
 
-    module = backend_modules[backend]().build_and_load()
+    spec = backend_modules[backend]()
+    module = spec.build_and_load()
+    tensor_scale_fn: Optional[Callable] = None
+
+    def _get_tensor_scale_fn() -> Callable:
+        nonlocal tensor_scale_fn
+        if tensor_scale_fn is not None:
+            return tensor_scale_fn
+        try:
+            fn = getattr(module, "nvfp4_quant_and_per_token_scale_tensor", None)
+        except Exception as exc:
+            raise RuntimeError(
+                "Loaded fp4_quantization module does not export "
+                "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+                "flashinfer-jit-cache package), and JIT fallback failed. "
+                "Uninstall flashinfer-jit-cache or upgrade it to match "
+                "this flashinfer version."
+            ) from exc
+        if fn is not None:
+            tensor_scale_fn = fn
+            return fn
+        if not os.environ.get("FLASHINFER_DISABLE_JIT"):
+            from ..jit.core import JitSpecNvcc, logger
+
+            if isinstance(spec, JitSpecNvcc):
+                logger.warning(
+                    "Prebuilt %s module is missing "
+                    "nvfp4_quant_and_per_token_scale_tensor "
+                    "(stale flashinfer-jit-cache); falling back to JIT compilation.",
+                    spec.name,
+                )
+                try:
+                    jit_module = spec._build_and_load_jit_fallback()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Loaded fp4_quantization module does not export "
+                        "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+                        "flashinfer-jit-cache package), and JIT fallback failed. "
+                        "Uninstall flashinfer-jit-cache or upgrade it to match "
+                        "this flashinfer version."
+                    ) from exc
+                fn = getattr(jit_module, "nvfp4_quant_and_per_token_scale_tensor", None)
+                if fn is not None:
+                    tensor_scale_fn = fn
+                    return fn
+        raise RuntimeError(
+            "Loaded fp4_quantization module does not export "
+            "nvfp4_quant_and_per_token_scale_tensor (likely a stale "
+            "flashinfer-jit-cache package). Uninstall flashinfer-jit-cache "
+            "or upgrade it to match this flashinfer version."
+        )
 
     @register_custom_op(
         "flashinfer::fp4_quantize_sm100",
@@ -567,7 +618,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
     def nvfp4_quant_and_per_token_scale_out_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         output: torch.Tensor,
         output_scale: torch.Tensor,
         output_per_token_scale: torch.Tensor,
@@ -576,21 +627,62 @@ def get_fp4_quantization_module(backend: str = "100"):
         # Appended last so existing positional construction keeps working.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> None:
-        module.nvfp4_quant_and_per_token_scale(
-            input,
-            scale_inv,
-            output,
-            output_scale,
-            output_per_token_scale,
-            expanded_idx_to_permuted_idx,
-            sf_layout,
-            nvfp4_4over6_code,
-        )
+        if isinstance(scale_inv, torch.Tensor):
+            if scale_inv.numel() != 1:
+                raise ValueError(
+                    f"scale_inv tensor must have exactly 1 element, got {scale_inv.numel()}"
+                )
+            if scale_inv.device.type == "cpu":
+                module.nvfp4_quant_and_per_token_scale(
+                    input,
+                    float(scale_inv.item()),
+                    output,
+                    output_scale,
+                    output_per_token_scale,
+                    expanded_idx_to_permuted_idx,
+                    sf_layout,
+                    nvfp4_4over6_code,
+                )
+                return
+            scale_inv_tensor = scale_inv
+            if (
+                scale_inv_tensor.device != input.device
+                or scale_inv_tensor.dtype != torch.float32
+            ):
+                scale_inv_tensor = scale_inv_tensor.to(
+                    device=input.device, dtype=torch.float32
+                )
+            scale_inv_tensor = scale_inv_tensor.resolve_neg()
+            if scale_inv_tensor.ndim != 1:
+                scale_inv_tensor = scale_inv_tensor.reshape(1)
+            if not scale_inv_tensor.is_contiguous():
+                scale_inv_tensor = scale_inv_tensor.contiguous()
+            _get_tensor_scale_fn()(
+                input,
+                scale_inv_tensor,
+                output,
+                output_scale,
+                output_per_token_scale,
+                expanded_idx_to_permuted_idx,
+                sf_layout,
+                nvfp4_4over6_code,
+            )
+        else:
+            module.nvfp4_quant_and_per_token_scale(
+                input,
+                float(scale_inv),
+                output,
+                output_scale,
+                output_per_token_scale,
+                expanded_idx_to_permuted_idx,
+                sf_layout,
+                nvfp4_4over6_code,
+            )
 
     @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_out_sm100")
     def _fake_nvfp4_quant_and_per_token_scale_out_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         output: torch.Tensor,
         output_scale: torch.Tensor,
         output_per_token_scale: torch.Tensor,
@@ -606,7 +698,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
     def nvfp4_quant_and_per_token_scale_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
         # Appended last so existing positional construction keeps working.
@@ -658,7 +750,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_sm100")
     def _fake_nvfp4_quant_and_per_token_scale_sm100(
         input: torch.Tensor,
-        scale_inv: float,
+        scale_inv: Union[float, torch.Tensor],
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
         # Output shapes do not depend on the recipe; accepted and ignored.
@@ -1844,15 +1936,29 @@ def nvfp4_quantize(
             assert sfLayout == SfLayout.layout_128x4
 
         if backend == "cuda":
-            scale_inv = (
-                float(a_global_sf.item())
-                if isinstance(a_global_sf, torch.Tensor)
-                else float(a_global_sf)
-            )
-            # Free: this path already materialized the scale on the host above.
-            if nvfp4_4over6_is_explicit and isinstance(a_global_sf, torch.Tensor):
-                _check_per_token_global_scale(scale_inv, nvfp4_4over6_config)
             a_cuda = a.cuda()
+            scale_inv: Union[float, torch.Tensor]
+            if isinstance(a_global_sf, torch.Tensor):
+                if a_global_sf.device.type == "cpu":
+                    if a_global_sf.numel() != 1:
+                        raise ValueError(
+                            "a_global_sf tensor must have exactly 1 element, "
+                            f"got {a_global_sf.numel()}"
+                        )
+                    scale_inv = float(a_global_sf.item())
+                    if nvfp4_4over6_is_explicit:
+                        _check_per_token_global_scale(scale_inv, nvfp4_4over6_config)
+                else:
+                    # Device-tensor scales remain unchecked and stay on device:
+                    # reading them on the host would add a stream
+                    # synchronization and be illegal under CUDA graph capture.
+                    scale_inv = (
+                        a_global_sf
+                        if a_global_sf.device == a_cuda.device
+                        else a_global_sf.to(device=a_cuda.device)
+                    )
+            else:
+                scale_inv = float(a_global_sf)
             expanded_idx_to_permuted_idx_cuda = (
                 expanded_idx_to_permuted_idx.cuda()
                 if expanded_idx_to_permuted_idx is not None
