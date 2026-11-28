@@ -466,6 +466,7 @@ kernel_cake_kimi_k3_fp8_projection_67b15ff1704ab0fa86ef(const __grid_constant__ 
     // ---- Role: epilogue ----
     if (warp >= 2 && warp <= 9) {
         { // epilogue_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             int num_cluster_tiles_2 = m_tiles / CTA_GROUP * n_tiles;
             unsigned int work_stage_2 = 0;
             const int epi_warp = warp % 4;

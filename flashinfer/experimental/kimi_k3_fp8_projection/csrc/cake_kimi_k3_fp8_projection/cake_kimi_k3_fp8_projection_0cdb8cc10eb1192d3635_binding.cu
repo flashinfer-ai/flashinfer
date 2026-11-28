@@ -38,6 +38,11 @@
 #ifndef CAKE_PROGRAM_SHIM
 #define CAKE_PROGRAM_SHIM cake_host_shim_f3fcef36b4613743
 #endif
+// A program whose kernel states a co-resident grid builds this file with
+// -DCAKE_COOPERATIVE=1; its launch then carries the cooperative attribute.
+#ifndef CAKE_COOPERATIVE
+#define CAKE_COOPERATIVE 0
+#endif
 // Launch constants.  Programs that share this launcher pass their TMA box dims, dynamic shared
 // memory, block dims and cluster dims as plain integers on the compile line (-DCAKE_BOX_<T>_<i>,
 // -DCAKE_DYN_SMEM, -DCAKE_BLOCK_X, -DCAKE_CLUSTER_X/Y/Z, -DCAKE_NONPORTABLE_CLUSTER); the defaults
@@ -489,7 +494,7 @@ void Run(TensorView arg_W, TensorView arg_X, TensorView arg_SFW, TensorView arg_
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
 #if CAKE_CLUSTER_X * CAKE_CLUSTER_Y * CAKE_CLUSTER_Z != 1
-  cudaLaunchAttribute attrs[3]{};
+  cudaLaunchAttribute attrs[4]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = CAKE_U(CAKE_CLUSTER_X);
@@ -500,12 +505,17 @@ void Run(TensorView arg_W, TensorView arg_X, TensorView arg_SFW, TensorView arg_
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   ++n;
 #else
-  cudaLaunchAttribute attrs[1]{};
+  cudaLaunchAttribute attrs[2]{};
   int n = 0;
 #endif
   attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[n].val.programmaticStreamSerializationAllowed = 1;
   ++n;
+#if CAKE_COOPERATIVE
+  attrs[n].id = cudaLaunchAttributeCooperative;
+  attrs[n].val.cooperative = 1;
+  ++n;
+#endif
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
@@ -628,7 +638,7 @@ inline void IssueReceipt(const LaunchReceipt* header, void** kargs, cudaStream_t
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
 #if CAKE_CLUSTER_X * CAKE_CLUSTER_Y * CAKE_CLUSTER_Z != 1
-  cudaLaunchAttribute attrs[3]{};
+  cudaLaunchAttribute attrs[4]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = CAKE_U(CAKE_CLUSTER_X);
@@ -639,12 +649,17 @@ inline void IssueReceipt(const LaunchReceipt* header, void** kargs, cudaStream_t
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   ++n;
 #else
-  cudaLaunchAttribute attrs[1]{};
+  cudaLaunchAttribute attrs[2]{};
   int n = 0;
 #endif
   attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[n].val.programmaticStreamSerializationAllowed = 1;
   ++n;
+#if CAKE_COOPERATIVE
+  attrs[n].id = cudaLaunchAttributeCooperative;
+  attrs[n].val.cooperative = 1;
+  ++n;
+#endif
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
