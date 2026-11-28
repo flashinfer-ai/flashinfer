@@ -1985,6 +1985,7 @@ kernel_cake_stepfun_moe_7cb3690815e48b750087(const __grid_constant__ CUtensorMap
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
                         :: "r"(taddr + (unsigned int)(tmem_lane_base_1 << 16) + 256 + stage * 16 + 14), "r"(word[0]), "r"(word[1]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");

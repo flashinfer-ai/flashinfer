@@ -421,6 +421,7 @@ kernel_cake_stepfun_moe_c3df92890bea6316d938(const __grid_constant__ CUtensorMap
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
                                 :: "r"(taddr + sfb_lane_base + 176 + stage * 16 + 14), "r"(words[0]));
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             __syncwarp();
