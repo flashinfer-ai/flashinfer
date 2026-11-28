@@ -7674,3 +7674,50 @@ def xqa_batch_decode_with_kv_cache_mla(
         "xqa_batch_decode_mla", [backend], _XQA_MLA_TUNING_CONFIG, inputs
     )
     return runner(inputs, tactic=tactic)
+
+
+@flashinfer_experimental_api(
+    feature="Cake MLA decode over the TensorRT-LLM fp4_mla cache (SM100/SM103)"
+)
+def prepare_fp4_mla_decode(
+    *,
+    batch: int,
+    q_len: int,
+    num_heads: int,
+    page_table_width: int,
+    device: Optional[torch.device] = None,
+    max_splits: int = 16,
+    max_kv: Optional[int] = None,
+    backend: str = "cake",
+):
+    """Plan an MLA decode over TensorRT-LLM's ``fp4_mla`` KV cache.
+
+    Returns a runner for one bucket (``batch`` requests of ``q_len`` query
+    tokens and ``num_heads`` heads, at most 128, over a page table
+    ``page_table_width`` pages wide) on ``device``; calling it with the
+    layer's cache views (the KV pages, their K scales and the MLA V-scale
+    pool), the step's prequantized query and scales, the page table, the KV
+    lengths and the FP32 global scales writes the caller-owned
+    BF16 output ``[batch * q_len * num_heads, 512]`` with no CUDA allocation.
+    The decode reads its V scales from the V-scale pool (TensorRT-LLM's
+    ``v_pool``: 4,096-byte pages at a 4,096-byte stride, addressed by the page
+    ids of the KV pages); a pool in any other layout is refused.
+    ``max_kv``, when given, bounds every KV length of every call of the
+    runner (it selects the decode build, never the split count).
+    Requires compute capability 10.0 or 10.3.  See
+    ``flashinfer/experimental/cake_fp4_mla_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("The fp4_mla cache decode currently supports backend='cake'")
+    from ..experimental.cake_fp4_mla_decode.cake_backend import plan_fp4_mla_decode
+
+    return plan_fp4_mla_decode(
+        batch=batch,
+        q_len=q_len,
+        num_heads=num_heads,
+        page_table_width=page_table_width,
+        device=device,
+        max_splits=max_splits,
+        max_kv=max_kv,
+        backend="cake",
+    )
