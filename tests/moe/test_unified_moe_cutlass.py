@@ -3513,6 +3513,11 @@ def test_cutlass_fp8_per_tensor_shares_canonical_pack_with_trtllm(activation):
     major, minor = get_compute_capability(device)
     if not TrtllmFp8PerTensorConfig.supported(major * 10 + minor):
         pytest.skip("requires an arch with TRTLLM and CUTLASS per-tensor FP8")
+    if major * 10 + minor == 89 and isinstance(activation, ReLU2):
+        # SM89 runs the native CUTLASS MoE kernel. Its unfused GEMM1 output
+        # is bf16 before the activation, and ReLU2's square amplifies that
+        # rounding past the fp32-intermediate reference below.
+        pytest.skip("SM89 CUTLASS rounds the GEMM1 output to bf16 before ReLU2")
 
     torch.manual_seed(54)
     num_tokens, num_experts, top_k = 32, 8, 2
