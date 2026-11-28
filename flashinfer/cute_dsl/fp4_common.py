@@ -159,9 +159,14 @@ _SW_RULES = (
 )  # fmt: skip
 
 
+def target_arch():
+    """``(major, minor)`` of the target being traced."""
+    return cutlass.cutlass_dsl.CuTeDSL._get_dsl().get_arch_enum().value[:2]
+
+
 def target_inline_asm(res, operands, asm: str, constraints: str, **kwargs):
     """``llvm.inline_asm`` with the conversions above lowered for the traced target."""
-    arch = cutlass.cutlass_dsl.CuTeDSL._get_dsl().get_arch_enum().value[:2]
+    arch = target_arch()
     for first, pattern, replace in _SW_RULES:
         if arch < first:
             asm = re.sub(pattern, replace, asm)
@@ -2361,6 +2366,16 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def cvt_e4m3_byte_to(byte, dtype, *, loc=None, ip=None):
+    """``byte.bitcast(Float8E4M3FN).to(dtype)``. The native E4M3 conversion needs
+    SM89; earlier targets decode the byte in software."""
+    if target_arch() >= (8, 9):
+        return byte.bitcast(cutlass.Float8E4M3FN).to(dtype)
+    value = cvt_e4m3_to_f32_via_f16(byte.to(Uint32), loc=loc, ip=ip)
+    return value if dtype is Float32 else value.to(dtype)
 
 
 @dsl_user_op

@@ -4,18 +4,17 @@
 """FMA FC1 with four outputs per warp, fused activation and NVFP4 quantization."""
 
 import cutlass
-from cutlass.cute.typing import Float16
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import vector
 from cutlass import cute, utils
 from flashinfer.cute_dsl.fp4_common import (
     cvt_e2m1x8_f32,
     cvt_f32_to_e4m3,
+    cvt_e4m3_byte_to,
     cvt_e4m3_to_f32_via_f16,
     rcp_approx_ftz,
     fdiv_rn,
 )
 
+from flashinfer.fused_moe.backends.frost_low_latency.fma.nvfp4.fma_fc2 import _fp4_quad
 from flashinfer.fused_moe.backends.frost_low_latency.fma.activations import (
     apply_activation,
 )
@@ -28,22 +27,6 @@ ROWS_PER_WARP = 4
 # Overridden by the generated host specialization before compilation.
 _ACTIVATION = "swiglu"
 _GATED = True
-
-
-@dsl_user_op
-def _fp4_quad(packed, *, loc=None, ip=None):
-    decoded = cute.arch.cvt_f4e2m1x4_to_f16x4(
-        packed.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
-    )
-    return cutlass.Vector.from_elements(
-        (
-            Float16(vector.extract(decoded, [], [0], loc=loc, ip=ip)),
-            Float16(vector.extract(decoded, [], [1], loc=loc, ip=ip)),
-            Float16(vector.extract(decoded, [], [2], loc=loc, ip=ip)),
-            Float16(vector.extract(decoded, [], [3], loc=loc, ip=ip)),
-        ),
-        cutlass.Float16,
-    )
 
 
 @cute.kernel
@@ -117,38 +100,22 @@ def _kernel(
                     xs_bits = x_scale[token, sc]
                 else:
                     xs_bits = x_scale[0, (sc // 4) * 512 + token * 16 + sc % 4]
-                xs = xs_bits.bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                xs = cvt_e4m3_byte_to(xs_bits, cutlass.Float32)
                 sf = row_scale_base + lane_scale_base + lane_group * 4096
                 plane = expert * sf_expert_stride + sf
                 gate_plane = sf_gate_stride + plane
-                su0 = ws8[plane].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                su0 = cvt_e4m3_byte_to(ws8[plane], cutlass.Float32)
                 if cutlass.const_expr(gated):
-                    sg0 = (
-                        ws8[gate_plane]
-                        .bitcast(cutlass.Float8E4M3FN)
-                        .to(cutlass.Float32)
-                    )
-                su1 = ws8[plane + 16].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                    sg0 = cvt_e4m3_byte_to(ws8[gate_plane], cutlass.Float32)
+                su1 = cvt_e4m3_byte_to(ws8[plane + 16], cutlass.Float32)
                 if cutlass.const_expr(gated):
-                    sg1 = (
-                        ws8[gate_plane + 16]
-                        .bitcast(cutlass.Float8E4M3FN)
-                        .to(cutlass.Float32)
-                    )
-                su2 = ws8[plane + 32].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                    sg1 = cvt_e4m3_byte_to(ws8[gate_plane + 16], cutlass.Float32)
+                su2 = cvt_e4m3_byte_to(ws8[plane + 32], cutlass.Float32)
                 if cutlass.const_expr(gated):
-                    sg2 = (
-                        ws8[gate_plane + 32]
-                        .bitcast(cutlass.Float8E4M3FN)
-                        .to(cutlass.Float32)
-                    )
-                su3 = ws8[plane + 48].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32)
+                    sg2 = cvt_e4m3_byte_to(ws8[gate_plane + 32], cutlass.Float32)
+                su3 = cvt_e4m3_byte_to(ws8[plane + 48], cutlass.Float32)
                 if cutlass.const_expr(gated):
-                    sg3 = (
-                        ws8[gate_plane + 48]
-                        .bitcast(cutlass.Float8E4M3FN)
-                        .to(cutlass.Float32)
-                    )
+                    sg3 = cvt_e4m3_byte_to(ws8[gate_plane + 48], cutlass.Float32)
 
                 gu0 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)
                 gg0 = cutlass.vector.full((4,), 0.0, dtype=cutlass.Float16)

@@ -194,7 +194,7 @@ def execute(inputs, config):
                         narrow,
                         finalize,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+                        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
                     )
                     compiled = _load_cross_compiled(compiled)
                     _COMPILED[key] = compiled

@@ -126,16 +126,17 @@ class FrostLowLatencyRunner(MoERunner):
 
         arch = get_compute_capability(self.device)
         self._supports_tc = arch in ((10, 0), (10, 3), (10, 7))
-        if not self._supports_tc and arch not in ((8, 0), (9, 0), (12, 0)):
-            raise NotImplementedError(
-                "frost_low_latency requires SM80, SM90, SM100, SM103, SM107 or SM120"
-            )
-        if arch == (8, 0) and self.config.quant.weight not in (
-            QuantFormat.BF16,
-            QuantFormat.FP16,
+        if not self._supports_tc and arch not in (
+            (8, 0),
+            (8, 6),
+            (8, 7),
+            (8, 9),
+            (9, 0),
+            (12, 0),
         ):
             raise NotImplementedError(
-                "Frost SM80 currently supports BF16/FP16 inputs and weights only"
+                "frost_low_latency requires SM80, SM86, SM87, SM89, SM90, SM100, "
+                "SM103, SM107 or SM120"
             )
         if not self._supports_tc and self.config.routing.top_k > 32:
             raise NotImplementedError("Frost FMA requires top_k <= 32")

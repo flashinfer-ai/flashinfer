@@ -61,7 +61,8 @@ def test_mxint4_packed_decoder_all_codes():
         launch,
         *(from_dlpack(v) for v in (words, scales, out)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} "
+        "--enable-tvm-ffi",
     )
     codes = (words[:, None] >> torch.tensor([0, 4, 8, 12], device="cuda")) & 15
     expected = torch.where(codes < 8, codes, codes - 16).float()

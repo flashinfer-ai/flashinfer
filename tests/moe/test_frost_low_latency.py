@@ -110,7 +110,8 @@ def _require_gpu(*, allow_sm120=False, allow_sm90=False, allow_sm80=False):
             (10, 3),
             (10, 7),
         )
-        + (((12, 0),) if allow_sm120 else ())
+        # SM8x compiles the SM120 FMA kernels.
+        + (((12, 0), (8, 0), (8, 6), (8, 7), (8, 9)) if allow_sm120 else ())
         + (((9, 0),) if allow_sm90 else ())
         + (((8, 0),) if allow_sm80 else ())
     )

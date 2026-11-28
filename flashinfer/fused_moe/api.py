@@ -3292,9 +3292,10 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+    """Low-token routed MoE on SM8x/SM90/SM100/SM103/SM107/SM120.
 
-    SM80 supports BF16/FP16 inputs and weights.
+    SM8x runs every SM120 format through the scalar FMA kernels; SM80 also
+    tunes Ampere MMA tiles for BF16/FP16.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
@@ -3379,7 +3380,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (80, 90, 100, 103, 107, 120)
+        return arch in (80, 86, 87, 89, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
