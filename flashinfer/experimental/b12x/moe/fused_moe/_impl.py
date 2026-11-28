@@ -12797,7 +12797,7 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
     # bounds its intermediate loads by the logical n, so any 32-aligned shard
     # works (e.g. 352 from GLM 2048/TP6, 192 from DS4-Pro 3072/TP16).
     return (
-        1 <= num_tokens <= 4
+        1 <= num_tokens <= 8
         and activation == "silu"
         and k % 256 == 0
         and n % 32 == 0
