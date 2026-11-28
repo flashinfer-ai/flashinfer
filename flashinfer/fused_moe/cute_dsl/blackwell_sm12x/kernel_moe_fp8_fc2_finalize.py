@@ -435,6 +435,14 @@ def mma(
 
     cute.arch.mbarrier_wait(sf_full + read_stage, ab_phase)
     copy_scale_s2r(read_stage, tCsSFA, tCsSFB, tCrSFA, tCrSFB, tscale_mn)
+    if cutlass.const_expr(
+        (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+    ):
+        cute.arch.inline_ptx(
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+        )
+    else:
+        cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.mbarrier_arrive(sf_empty + read_stage)
 
     cute.arch.mbarrier_wait(ab_full + read_stage, ab_phase)
@@ -453,6 +461,14 @@ def mma(
                 tiledmma, tmp, tCrA[None, None, k_block], tCrB[None, None, k_block], tmp
             )
             if k_block == k_blocks - 1:
+                if cutlass.const_expr(
+                    (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+                ):
+                    cute.arch.inline_ptx(
+                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                    )
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(ab_empty + read_stage)
                 read_stage += 1
                 if read_stage == ab_stages:
@@ -466,6 +482,14 @@ def mma(
                 rescale(acc, tmp, tCrSFA, tCrSFB, tscale_mn)
                 cute.arch.mbarrier_wait(sf_full + read_stage, ab_phase)
                 copy_scale_s2r(read_stage, tCsSFA, tCsSFB, tCrSFA, tCrSFB, tscale_mn)
+                if cutlass.const_expr(
+                    (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+                ):
+                    cute.arch.inline_ptx(
+                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                    )
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(sf_empty + read_stage)
 
     for k_block in cutlass.range_constexpr(0, k_blocks):
@@ -474,6 +498,14 @@ def mma(
             cute.copy(s2r_a, tAsA_s[None, None, k_next], tCrA_v[None, None, k_next])
             cute.copy(s2r_b, tBsB_s[None, None, k_next], tCrB_v[None, None, k_next])
         if k_block == k_blocks - 1:
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.mbarrier_arrive(ab_empty + read_stage)
             read_stage += 1
             if read_stage == ab_stages:

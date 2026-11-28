@@ -574,6 +574,14 @@ def mma(
         cute.arch.mbarrier_wait(sf_full + read_stage, ab_phase)
         copy_scale_s2r(read_stage, tCsSFA, tCsSFU, tCrSFA_u, tCrSFU, tscale_mn)
         copy_scale_s2r(read_stage, tCsSFA, tCsSFG, tCrSFA_g, tCrSFG, tscale_mn)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(sf_empty + read_stage)
         cute.arch.mbarrier_wait(ab_full + read_stage, ab_phase)
         tAsA_s = tXsA[None, None, None, read_stage]
@@ -597,6 +605,14 @@ def mma(
                 tCrG[None, None, k_block],
                 tmp_g,
             )
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(ab_empty + read_stage)
         rescale(acc_u, tmp_u, tCrSFA_u, tCrSFU, tscale_mn)
         rescale(acc_g, tmp_g, tCrSFA_g, tCrSFG, tscale_mn)
@@ -852,6 +868,14 @@ def mma_swap(
         cute.arch.mbarrier_wait(sf_full + read_stage, ab_phase)
         copy_scale_s2r(read_stage, tCsSFA_u, tCsSFB, tCrSFA_u, tCrSFB_u, tscale_mn)
         copy_scale_s2r(read_stage, tCsSFA_g, tCsSFB, tCrSFA_g, tCrSFB_g, tscale_mn)
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(sf_empty + read_stage)
         cute.arch.mbarrier_wait(ab_full + read_stage, ab_phase)
         tUsU_s = tXsU[None, None, None, read_stage]
@@ -875,6 +899,14 @@ def mma_swap(
                 tCrB[None, None, k_block],
                 tmp_g,
             )
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.mbarrier_arrive(ab_empty + read_stage)
         rescale(acc_u, tmp_u, tCrSFA_u, tCrSFB_u, tscale_mn)
         rescale(acc_g, tmp_g, tCrSFA_g, tCrSFB_g, tscale_mn)
