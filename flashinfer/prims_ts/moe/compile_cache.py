@@ -30,7 +30,7 @@ import functools
 import hashlib
 import json
 import os
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +65,14 @@ def get_compile_options() -> str:
     return get_prims_ts_compile_options()
 
 
-_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], Any] = {}
+@dataclass
+class _CompiledGemm:
+    kernel: Any
+    # Only code is shared. Descriptors and tensor owners stay with each IO.
+    prepare_descriptors: Any = None
+
+
+_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, bool, int, str], _CompiledGemm] = {}
 
 
 def clear_compiled_gemm_cache() -> None:
@@ -152,9 +159,11 @@ def _disk_kernel_name(cfg_hash: str, fc1_or_fc2: str, io: dict) -> str:
         _cute_compile_options,
     )
 
-    # The stream is the last compile argument and the constexpr config the
-    # one before it; the config is keyed through ``cfg_hash``.
-    launch_args = _compile_arg_tuple(io, None)[:-2]
+    # The trailing arguments are cfg, stream, descriptor storage, prepare_only.
+    # Key the descriptor pointer type, but omit cfg (covered by cfg_hash), the
+    # stream, and prepare_only (always False for a GEMM launch).
+    compile_args = _compile_arg_tuple(io, None)
+    launch_args = compile_args[:-4] + compile_args[-2:-1]
     identity = json.dumps(
         {
             "cfg": cfg_hash,
@@ -190,8 +199,14 @@ def _kernel_source_sha256() -> str | None:
 
 
 def _compile_or_load(
-    cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any, device_index: int
-) -> Any:
+    cfg_hash: str,
+    fc1_or_fc2: str,
+    io: dict,
+    stream: Any,
+    device_index: int,
+    *,
+    reencode_tma: bool,
+) -> _CompiledGemm:
     """Load the GEMM from the persistent module, compiling it on a miss."""
     import torch
 
@@ -200,17 +215,24 @@ def _compile_or_load(
         _compile_in_process,
         cute_dsl_cache_disabled,
     )
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _compile_for_launch,
+        _prepare_tma_descriptors,
+    )
 
     def compile_fn():
-        return _compile_for_launch(io, stream)
+        return _compile_for_launch(io, stream, reencode_tma=reencode_tma)
 
     source_sha256 = _kernel_source_sha256()
     # ``cute.compile``, the spec's module directory and metadata, and the
     # kernel name all resolve the target architecture from the current device.
     with torch.cuda.device(device_index):
+        # Disk hits skip _compile_for_launch, but descriptors still belong to
+        # this workspace. Prepare before naming the kernel so its signature
+        # includes the descriptor pointer rather than an unprepared None.
+        prepare = _prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma)
         if cute_dsl_cache_disabled() or source_sha256 is None:
-            return _compile_in_process(compile_fn)
+            return _CompiledGemm(_compile_in_process(compile_fn), prepare)
         spec = JitSpecCuteDsl(
             _DISK_MODULE_NAME,
             _disk_kernel_name(cfg_hash, fc1_or_fc2, io),
@@ -218,7 +240,7 @@ def _compile_or_load(
             source_sha256,
             enable_tvm_ffi=False,
         )
-        return spec.build_and_load()
+        return _CompiledGemm(spec.build_and_load(), prepare)
 
 
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
@@ -230,16 +252,43 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
     does not depend on their values and they must not be part of the cache key.
     """
 
+    import torch
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _reencode_tma_on_launch,
+    )
+
     device_index, compile_arch = _compile_target_key(io)
+    reencode_tma = _reencode_tma_on_launch(io["cfg"])
     key = (
         cfg_hash,
         fc1_or_fc2,
         get_compile_options(),
+        reencode_tma,
         device_index,
         compile_arch,
     )
     if key in _COMPILED_GEMM_CACHE:
-        return _COMPILED_GEMM_CACHE[key]
-    compiled = _compile_or_load(cfg_hash, fc1_or_fc2, io, stream, device_index)
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            _prepare_tma_descriptors,
+        )
+
+        # Fresh IO dictionaries still need descriptors for their addresses,
+        # but must not retrace/compile the preparation code on every forward.
+        compiled = _COMPILED_GEMM_CACHE[key]
+        if reencode_tma:
+            io["_reencode_tma"] = True
+            return compiled.kernel
+        with torch.cuda.device(device_index):
+            compiled.prepare_descriptors = _prepare_tma_descriptors(
+                io,
+                stream,
+                prepare=compiled.prepare_descriptors,
+                reencode_tma=reencode_tma,
+            )
+        return compiled.kernel
+    compiled = _compile_or_load(
+        cfg_hash, fc1_or_fc2, io, stream, device_index, reencode_tma=reencode_tma
+    )
     _COMPILED_GEMM_CACHE[key] = compiled
-    return compiled
+    return compiled.kernel

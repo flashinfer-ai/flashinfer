@@ -2488,11 +2488,20 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
 
   DLDataType gemm_buffer_dtype() const override { return gemm1_output_storage_dtype; }
 
-  std::vector<int32_t> supported_tile_nums() const override {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act) {
     if (dtype_act == btg::Dtype::Bfloat16) {
       return {8, 16, 32, 64, 128};
     }
+#ifdef TLLM_RUBIN_FEATURES
+    if (dtype_act == btg::Dtype::E2m1) {
+      return {8, 16, 32, 64, 128, 256, 512, 1024};
+    }
+#endif
     return {8, 16, 32, 64, 128, 256};
+  }
+
+  std::vector<int32_t> supported_tile_nums() const override {
+    return getSupportedTileNums(dtype_act);
   }
 
   void configure_routing_dtypes() override {
@@ -2556,7 +2565,19 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
         << "the second dimension of weights must be a multiple of 128.";
   }
 
-  void prepare_external_gemm_buffers() override {
+  void prepare_external_gemm_buffers() override { prepare_external_gemm_buffers(true); }
+
+  void prepare_fused_finalize_routing() {
+    // The router already knows the top-k slot while assigning each routed row.
+    // Retain it so FC2 can read the caller's coefficients without a permutation pass.
+    if (!permuted_idx_to_expanded_idx.has_value()) {
+      permuted_idx_to_expanded_idx =
+          alloc_tensor({workspace.total_max_padded_tokens}, dl_int32, hidden_states.device());
+    }
+    workspace.permuted_idx_to_expanded_idx = static_cast<int*>(permuted_idx_to_expanded_idx_ptr());
+  }
+
+  void prepare_external_gemm_buffers(bool allocate_gemm2_output) {
     auto const max_num_padded_tokens_gemm1 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             workspace.total_max_padded_tokens, args->intermediate_size,
@@ -2575,8 +2596,11 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
           max_num_padded_tokens_gemm1, args->intermediate_size / output_sf_vec_size);
       gemm1_output_scale = alloc_tensor({gemm1_sf_size}, dl_uint8, hidden_states.device());
     }
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
-                                hidden_states.device());
+    // Fused FC2 writes the caller's token output directly. Keep an empty
+    // tensor in the staged return tuple without retaining expanded BF16 storage.
+    gemm2_output =
+        alloc_tensor({allocate_gemm2_output ? max_num_padded_tokens_gemm2 : 0, args->hidden_size},
+                     dl_bfloat16, hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -2589,7 +2613,7 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
   }
 
-  Array<Optional<Tensor>> collect_routing_outputs() const {
+  Array<Optional<Tensor>> collect_routing_outputs(bool fused_finalize = false) const {
     Array<Optional<Tensor>> result;
     result.push_back(expert_weights_tensor());
     result.push_back(expanded_idx_to_permuted_idx);
@@ -2603,6 +2627,9 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
       result.push_back(gemm1_output_scale.value());
     }
     result.push_back(gemm2_output);
+    if (fused_finalize) {
+      result.push_back(permuted_idx_to_expanded_idx);
+    }
     return result;
   }
 
@@ -3653,6 +3680,7 @@ void trtllm_moe_run_deepseek_fp8_activation(
   sync_check_cuda_error(stream);
 }
 
+template <bool FusedFinalize>
 Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
@@ -3683,7 +3711,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  auto const supported_tile_nums =
+      Fp4Nvfp4StagedMoeLauncher::getSupportedTileNums(btg::Dtype::E2m1);
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -3698,11 +3727,14 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
 
   launcher->check_routing();
   launcher->prepare_routing();
+  if constexpr (FusedFinalize) {
+    launcher->prepare_fused_finalize_routing();
+  }
   launcher->run_routing_kernel(enable_pdl);
   launcher->check_moe();
-  launcher->prepare_external_gemm_buffers();
+  launcher->prepare_external_gemm_buffers(!FusedFinalize);
 
-  return launcher->collect_routing_outputs();
+  return launcher->collect_routing_outputs(FusedFinalize);
 }
 
 Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
@@ -3743,7 +3775,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  auto const supported_tile_nums =
+      Fp4Nvfp4StagedMoeLauncher::getSupportedTileNums(btg::Dtype::MxE4m3);
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -3801,7 +3834,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_bf16(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128};
+  auto const supported_tile_nums =
+      Fp4Nvfp4StagedMoeLauncher::getSupportedTileNums(btg::Dtype::Bfloat16);
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -7619,7 +7653,10 @@ namespace trtllm_cubin_loader {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_bf16_moe, trtllm_bf16_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing, trtllm_moe_run_routing);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_nvfp4, trtllm_moe_run_routing_fp4_nvfp4);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_nvfp4,
+                              trtllm_moe_run_routing_fp4_nvfp4<false>);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_nvfp4_fused_finalize,
+                              trtllm_moe_run_routing_fp4_nvfp4<true>);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_mxfp4_mxfp8,
                               trtllm_moe_run_routing_fp4_mxfp4_mxfp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_mxfp4_bf16,

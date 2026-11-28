@@ -177,3 +177,14 @@ def test_partitioned_op_rejects_wrong_shard_count():
             partition_resources=SimpleNamespace(),
             partition_strategy="tp_n_tp_n",
         )
+
+
+@pytest.mark.cpu_only
+def test_prims_ts_fp4_fake_signature_matches_public_api():
+    from flashinfer.fused_moe.backends.prims_ts.fp4_op import (
+        _fake_prims_ts_fp4_block_scale_moe,
+    )
+
+    assert inspect.signature(_fake_prims_ts_fp4_block_scale_moe) == inspect.signature(
+        prims_ts_fp4_block_scale_moe
+    )

@@ -266,6 +266,43 @@ def test_batch_m_output_rows_require_16_byte_alignment(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("output_dtype", ["BF16", "FP16"])
+def test_rubin_tile8_gated_output_alignment(output_dtype):
+    from dataclasses import replace
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        sm_arch=107,
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(getattr(DType, output_dtype)),
+        act_kind=int(ActKind.SWIGLU),
+        tile_n=8,
+        epi_tile_n=8,
+        mma_n=8,
+        mma_k=64,
+        tile_k=256,
+        use_tma_store=0,
+    )
+    # Eight accumulator columns produce one 8-byte direct store per row.
+    validate_config(cfg, problem_mnk=(256, 8, 256))
+    with pytest.raises(ValueError, match="output rows must be 16-byte aligned"):
+        validate_config(replace(cfg, use_tma_store=1), problem_mnk=(256, 8, 256))
+    wider = replace(cfg, tile_n=16, epi_tile_n=16, mma_n=16)
+    assert wider.narrow_gated_store_cols is None
+    validate_config(wider, problem_mnk=(256, 16, 256))
+
+
+@pytest.mark.cpu_only
 def test_batch_n_does_not_require_16_byte_output_rows():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -950,7 +987,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
         num_stages_smem_sfb=5,
         num_stages_tmem_acc=2,
         num_stages_tmem_sfa=4,
-        num_stages_tmem_sfb=10,
+        num_stages_tmem_sfb=7,
         num_stages_c_smem=2,
         num_stages_workid=3,
         use_tma_oob_opt=1,
@@ -964,7 +1001,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match=r"SMEM usage \(334856 B",
+        match=r"SMEM usage \(334888 B",
     ):
         build_batched_gemm_task_manager(
             num_experts=96,
@@ -984,7 +1021,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
     assert (
         manager._smem_allocator.total_smem_bytes
         + manager._smem_allocator.barrier_smem_bytes
-        == 334808
+        == 334840
     )
 
 
@@ -1146,6 +1183,28 @@ def test_validation_accepts_safe_fused_operand_sf_pipeline():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_fused_operand_sf_short_operand_rings(sm_arch):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        _ldgsts_sfb_producer_commit_prefetch_depth,
+        validate_config,
+    )
+
+    cfg = _fused_operand_sf_config(
+        sm_arch=sm_arch, num_stages_a=1, num_stages_b=1, num_stages_smem_sfb=4
+    )
+    if sm_arch != 107:
+        with pytest.raises(ValueError, match="delayed SFB commit depth"):
+            validate_config(cfg)
+        return
+    validate_config(cfg)
+    # Completion barriers replace delayed cp.async group commits, so SFB's
+    # deeper ring does not require spare operand stages for forward progress.
+    assert cfg.uses_ldgsts_sf_relay
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 0
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("operand", ("sfa", "sfb"))
 def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1195,14 +1254,6 @@ def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
         (
             {"num_load_sfb_warps": 2},
             "Fused B/SF loader requires equal warp counts",
-        ),
-        (
-            {
-                "num_stages_a": 1,
-                "num_stages_b": 1,
-                "num_stages_smem_sfb": 4,
-            },
-            "delayed SFB commit depth",
         ),
     ),
 )
@@ -1916,6 +1967,82 @@ def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
     assert cfg.use_bf16_kbox_tma_a
     with pytest.raises(ValueError, match="BF16 k-box TMA A path"):
         validate_config(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("umma_cta_count", [1, 2])
+@pytest.mark.parametrize("route", ["TMA", "LDGSTS"])
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_casta_gather_readiness_matches_architecture(sm_arch, umma_cta_count, route):
+    from cutlass.experimental.task_scheduling.enums import ScheduleStage
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        DType,
+        RouteImpl,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _build_schedule_validate,
+        _make_pipeline_configs,
+    )
+
+    cfg = make_config(
+        sm_arch=sm_arch,
+        batch_mode=int(BatchMode.BATCH_N),
+        dtype_a=int(DType.MXE2M1),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_m=128 * umma_cta_count,
+        mma_n=16,
+        mma_k=16,
+        tile_n=16,
+        tile_k=256,
+        epi_tile_n=16,
+        umma_cta_count=umma_cta_count,
+        route_act=int(getattr(RouteImpl, route)),
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        num_stages_a=3,
+        num_stages_b=3,
+        num_stages_smem_sfa=3,
+        num_stages_tmem_acc=2,
+        use_tma_store=1,
+        epilogue_regs=128,
+        cast_a_regs=160,
+    )
+    validate_config(cfg)
+    tasks, dependencies, _, _ = _build_schedule_validate(cfg, num_k_tiles=4)
+    occupied = set()
+    for task in tasks:
+        warps = set(range(task.warp_idx, task.warp_idx + task.num_warps))
+        assert not occupied & warps, task.name
+        occupied.update(warps)
+    relay = [task for task in tasks if task.name == "SyncTask"]
+    two_cta_gather = umma_cta_count == 2 and route == "LDGSTS"
+    expected = int(sm_arch == 107 and two_cta_gather)
+    if sm_arch in (100, 103) and two_cta_gather:
+        from cutlass import pipeline
+
+        gather = _make_pipeline_configs(cfg)["smem_gather"]
+        assert gather.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+        assert gather.producer_group.size == 2 * 32 * cfg.warp_layout.num_load_b_warps
+        assert cfg.warp_layout.mma_warp_idx == 14
+    assert len(relay) == cfg.warp_layout.num_sync_warps == expected
+    if relay:
+        proxy = relay[0].dst_resources[0]
+        ready = [r for r in dependencies[proxy] if r.name != "WorkQueue"]
+        assert [resource.name for resource in ready] == ["SmemGather"]
+        cast = next(task for task in tasks if task.name == "CastATask")
+        # A/SFA can be recycled by CastA without waiting for the relay.
+        assert not set(ready) & set(cast.src_resources)
+        mma = next(task for task in tasks if task.name == "MmaTask0")
+        # The relay owns B's wait; MMA only consumes and releases it.
+        b_stages = [entry[1] for entry in mma.loop_schedule_list if entry[0] in ready]
+        assert ScheduleStage.ConsumerRelease in b_stages
+        assert ScheduleStage.ConsumerTryWait not in b_stages
+        assert ScheduleStage.ConsumerWait not in b_stages
 
 
 @pytest.mark.cpu_only

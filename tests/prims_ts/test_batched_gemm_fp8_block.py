@@ -424,6 +424,7 @@ def test_deepseek_fp8_moe_default_config_realistic_shape(
         problem_n=problem_n,
         problem_k=512,
         token_capacity=token_capacity,
+        repeat_launches=3,
         **config_spec.kwargs,
     )
 

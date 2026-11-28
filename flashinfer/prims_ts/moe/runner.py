@@ -50,6 +50,11 @@ from flashinfer.tllm_enums import (
 from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
+from .epilogue_policy import (
+    fused_finalize_config as _fused_finalize_config,
+    fused_finalize_requested,
+    supports_fused_finalize,
+)
 from .config_mapper import (
     apply_fused_finalize,
     apply_weight_l2_policy,
@@ -81,6 +86,7 @@ from .tensor_adapter import (
     _block_scaled_sf_required_span,
     _fc1_out_hidden,
     _is_gated_activation,
+    _validate_finalize_output,
     _validate_swap_ab_cluster_span,
     build_bf16_launch_io,
     build_fp8_block_scale_launch_io,
@@ -581,6 +587,19 @@ class _PrimsTsMoERunnerMixin:
         enable_pdl = bool(kwargs.get("enable_pdl", False))
         self._cache_key_static_extras = (
             ("enable_pdl", enable_pdl),
+            ("do_finalize", bool(kwargs.get("do_finalize", True))),
+            (
+                "zero_rows_without_local_expert",
+                bool(kwargs.get("zero_rows_without_local_expert", True)),
+            ),
+            (
+                "use_fused_finalize",
+                bool(
+                    kwargs.get(
+                        "use_fused_finalize", getattr(self, "use_fused_finalize", False)
+                    )
+                ),
+            ),
             ("gemm1_bias", kwargs.get("gemm1_bias") is not None),
             ("gemm2_bias", kwargs.get("gemm2_bias") is not None),
             ("gemm1_alpha", kwargs.get("gemm1_alpha") is not None),
@@ -602,8 +621,26 @@ class _PrimsTsMoERunnerMixin:
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
+        is_rubin = _sm_arch_for_tensor(moe_inputs.hidden_states) == 107
+        mode_extras = ()
+        static_extras = self._cache_key_static_extras
+        # Preserve persisted Blackwell tactics. Only the Rubin catalog uses
+        # deterministic execution and finalize options to select its epilogue.
+        if is_rubin:
+            mode_extras = (
+                ("deterministic", torch.are_deterministic_algorithms_enabled()),
+            )
+        else:
+            finalize_keys = {
+                "do_finalize",
+                "zero_rows_without_local_expert",
+                "use_fused_finalize",
+            }
+            static_extras = tuple(
+                item for item in static_extras if item[0] not in finalize_keys
+            )
         return (
-            ("prims_ts_moe_config_version", 11),
+            ("prims_ts_moe_config_version", 14 if is_rubin else 11),
             ("top_k", int(self.top_k)),
             ("num_local_experts", int(self.num_local_experts)),
             ("num_experts", int(self.num_experts)),
@@ -615,6 +652,7 @@ class _PrimsTsMoERunnerMixin:
             ("activation_type", int(self.activation_type)),
             ("weight_layout", int(self.weight_layout)),
             ("use_per_token_scaling", bool(self.use_per_token_scaling)),
+            *mode_extras,
             ("partition_strategy", self._partition_strategy or ""),
             ("partition_topology", self._partition_topology),
             ("partition_fc1_layout", self._partition_fc1_layout),
@@ -629,7 +667,7 @@ class _PrimsTsMoERunnerMixin:
                 "expert_weights",
                 moe_inputs.expert_weights is not None,
             ),
-            *getattr(self, "_cache_key_static_extras", ()),
+            *static_extras,
         )
 
     @property
@@ -1234,6 +1272,8 @@ class _PrimsTsMoERunnerMixin:
         return local_fc1_width
 
     def _check_cga_tactic(self, fc1_cfg, fc2_cfg) -> None:
+        from ..batched_gemm.batched_gemm_run import _runtime_config
+
         local_intermediate = (
             self.intermediate_size // 2
             if self._is_partitioned
@@ -1245,8 +1285,21 @@ class _PrimsTsMoERunnerMixin:
             if self._partition_strategy == "tp_n_tp_n"
             else self.hidden_size
         )
-        _validate_swap_ab_cluster_span(fc1_cfg, fc1_width)
-        _validate_swap_ab_cluster_span(fc2_cfg, fc2_width)
+        for cfg, in_hidden, out_hidden in (
+            (fc1_cfg, self.hidden_size, fc1_width),
+            (fc2_cfg, local_intermediate, fc2_width),
+        ):
+            if cfg.is_swap_ab:
+                _validate_swap_ab_cluster_span(cfg, out_hidden)
+            elif cfg.is_rubin_nvfp4_batch_m:
+                _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
+
+    def _check_tactic_geometry(self, tactic, moe_inputs, kwargs=None):
+        pair = self._map_tactic(tactic, moe_inputs, kwargs)
+        fc1_cfg, fc2_cfg = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+        self._check_cga_tactic(fc1_cfg, fc2_cfg)
+        if self._is_partitioned:
+            self._check_partition_tactic(fc1_cfg, fc2_cfg)
 
     def _filter_partition_geometry_tactics(
         self, tactics: List[Any], inputs: List[torch.Tensor], cache_key: tuple
@@ -1267,12 +1320,7 @@ class _PrimsTsMoERunnerMixin:
         dropped = 0
         for tactic in tactics:
             try:
-                pair = self._map_tactic(tactic, moe_inputs)
-                fc1_cfg = pair.fc1.cfg.build()
-                fc2_cfg = pair.fc2.cfg.build()
-                self._check_cga_tactic(fc1_cfg, fc2_cfg)
-                if self._is_partitioned:
-                    self._check_partition_tactic(fc1_cfg, fc2_cfg)
+                self._check_tactic_geometry(tactic, moe_inputs)
             except ValueError as exc:
                 dropped += 1
                 logger.debug(
@@ -1646,7 +1694,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         weight_layout: int = WeightLayout.MajorK,
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
+        use_fused_finalize: bool = True,
     ):
+        self.use_fused_finalize = use_fused_finalize
         self.moe_op = moe_op
         self.top_k = top_k
         self.num_local_experts = num_local_experts
@@ -1675,6 +1725,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     if uses_per_token_scaling
                     else int(extras.get("per_token_sf_dtype", 1))
                 ),
+                use_fused_finalize=common["sm_arch"] == 107
+                and fused_finalize_requested(self, kwargs),
             )
         )
 
@@ -1713,6 +1765,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             else 1
         )
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
+        use_fused_finalize = sm_arch == 107 and fused_finalize_requested(self)
         instance_key = (
             self.dtype_act,
             self.dtype_weights,
@@ -1732,6 +1785,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             uses_per_token_scaling,
             per_token_sf_dtype,
             _gemm_config_flags_cache_key(gemm_config_flags),
+            use_fused_finalize,
         )
         if instance_key not in PrimsTsNvfp4MoERunner.valid_tactics_dict:
             try:
@@ -1745,6 +1799,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     weight_layout=int(self.weight_layout),
                     use_per_token_sf_b=uses_per_token_scaling,
                     per_token_sf_dtype=per_token_sf_dtype,
+                    use_fused_finalize=use_fused_finalize,
                     **gemm_config_flags,
                 )
             except Exception as exc:
@@ -1788,10 +1843,47 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 f"Config not supported by Prims-TS NVFP4 kernel ({reason})"
             )
 
+        fc1_cfg = pair.fc1.cfg.build()
+        fc2_cfg = pair.fc2.cfg.build()
+        # Routing and finalization use the PDL mode resolved for both GEMMs.
+        kwargs["enable_pdl"] = bool(fc1_cfg.use_pdl)
+        fuse_finalize = False
+        if fused_finalize_requested(self, kwargs) and supports_fused_finalize(fc2_cfg):
+            fc2_cfg = _fused_finalize_config(fc2_cfg)
+            fuse_finalize = bool(fc2_cfg.fuse_moe_finalize)
+
+        # Reject unsupported views before routing or zeroing can modify output.
+        if fuse_finalize:
+            from .finalize import _overlapping_bytes
+
+            _validate_finalize_output(
+                output,
+                num_tokens=num_tokens,
+                hidden_size=self.hidden_size,
+                device=hidden_states.device,
+                output2_scale_scalar=kwargs.get("output2_scale_scalar"),
+            )
+            # FC2 needs aligned coefficients that survive output zeroing.
+            # Disjoint aligned caller buffers retain the zero-copy path.
+            if (
+                moe_inputs.expert_weights is not None
+                and moe_inputs.expert_weights.dtype == torch.bfloat16
+                and (
+                    moe_inputs.expert_weights.data_ptr() % 16
+                    or _overlapping_bytes(output, moe_inputs.expert_weights)
+                )
+            ):
+                moe_inputs.expert_weights = moe_inputs.expert_weights.clone()
+
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
         topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
+        run_routing = (
+            self.moe_op.trtllm_moe_run_routing_fp4_nvfp4_fused_finalize
+            if fuse_finalize
+            else self.moe_op.trtllm_moe_run_routing_fp4_nvfp4
+        )
+        routing_out = run_routing(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
             topk_ids,
@@ -1821,6 +1913,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
         )
+        routing_tensors = _torch_views_of_ffi_tensors(routing_out)
+        permuted_idx_to_expanded_idx = routing_tensors.pop() if fuse_finalize else None
 
         (
             expert_weights,
@@ -1833,7 +1927,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm1_output_scale,
             gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        ) = routing_tensors
         expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         if (
             moe_inputs.routing_logits is not None
@@ -1854,8 +1948,6 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             kwargs,
         )
-        fc1_cfg = pair.fc1.cfg.build()
-        fc2_cfg = pair.fc2.cfg.build()
         if uses_per_token_scaling and not fc1_cfg.has_output_block_scaling:
             gemm1_output = torch.empty(
                 (int(gemm1_output.shape[0]), self.intermediate_size),
@@ -1918,7 +2010,17 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         )
         fc1_hash = stable_config_hash(fc1_io["cfg"])
         fc1_fn = get_compiled_gemm(fc1_hash, "nvfp4_fc1", fc1_io, stream)
-        fc1_fn(*self._launch_args(fc1_io, stream))
+        if fuse_finalize:
+            from .finalize import zero_output_during_fc1
+
+            with zero_output_during_fc1(
+                output,
+                read_input=hidden_states,
+                read_input_scale=moe_inputs.hidden_states_scale,
+            ):
+                fc1_fn(*self._launch_args(fc1_io, stream))
+        else:
+            fc1_fn(*self._launch_args(fc1_io, stream))
 
         fc2_io_kwargs = common_io_kwargs
         if uses_per_token_scaling and fc2_cfg.has_per_token_sf_b:
@@ -1942,11 +2044,20 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 "per_token_sf_b": per_token_scale_fc2,
             }
 
-        fc2_io = build_nvfp4_launch_io(fc="fc2", cfg=fc2_cfg, **fc2_io_kwargs)
+        fc2_io = build_nvfp4_launch_io(
+            fc="fc2",
+            cfg=fc2_cfg,
+            finalize_output=output if fuse_finalize else None,
+            finalize_scales=expert_weights if fuse_finalize else None,
+            finalize_route_map=permuted_idx_to_expanded_idx,
+            **fc2_io_kwargs,
+        )
         fc2_hash = stable_config_hash(fc2_io["cfg"])
         fc2_fn = get_compiled_gemm(fc2_hash, "nvfp4_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))
 
+        if fuse_finalize:
+            return []
         if kwargs["do_finalize"]:
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,

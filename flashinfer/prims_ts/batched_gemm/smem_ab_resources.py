@@ -34,19 +34,24 @@ from cutlass.experimental.task_scheduling.resources import (
 from .batched_gemm_config import BatchedGemmConfig, DType
 from .batched_gemm_cga import (
     CgaPolicy,
-    cga_tma_masks,
+    input_tma_payload_mask,
+    input_tma_barrier_address,
+    input_tma_instruction_kind,
+    complete_input_tma_bytes,
+    load_input_tma,
     has_multiple_umma_atoms,
-    needs_extended_tma_multicast,
+    tma_y_partition_offset,
+    active_cga_coords,
+    _retained_a_cache_policy,
 )
 from .mixed_cga_ts import (
-    override_tma_umma_pipeline,
+    create_input_tma_pipeline,
     override_umma_atom_pipeline,
 )
 from .cache_policy import make_weight_l2_cache_hint
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from .smem_descriptor import build_tcgen05_smem_desc
 from cutlass.experimental import primitives as prims
-from cutlass.pipeline.sm100 import PipelineTmaUmma
 
 Constexpr = cutlass.Constexpr
 
@@ -115,13 +120,7 @@ class SmemAResource(MemoryResource):
     mixed_cga_kind: Constexpr[str] = "a"
 
     def create_pipeline(self, pipeline_config):
-        result = super().create_pipeline(pipeline_config)
-        # Every physical 2-CTA UMMA atom needs rank-relative full/empty
-        # barrier routing, even when A's TMA payload remains CTA-local.  The
-        # operand-specific multicast decision is applied separately in load().
-        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
-            return override_tma_umma_pipeline(self.cfg, result, "a")
-        return result
+        return create_input_tma_pipeline(self, pipeline_config)
 
     def __post_init__(self):
         if self._alloc_a is None:
@@ -194,7 +193,9 @@ class SmemAResource(MemoryResource):
         """
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_a_per_stage * stage_info.stage_idx
+            + tma_y_partition_offset(self.cfg, self.cfg.num_bytes_a_per_stage)
         )
+        partition_mn = coord_a_mn + tma_y_partition_offset(self.cfg, self.cfg.tile_m)
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_a):
                 a_box_k = self.cfg.tile_k
@@ -218,7 +219,7 @@ class SmemAResource(MemoryResource):
                         self.tma_a_desc,
                         self._coords_for_load(
                             coord_a_k + Int32(bi * a_box_k),
-                            coord_a_mn,
+                            partition_mn,
                             coord_a_l,
                             mn_limit,
                         ),
@@ -228,7 +229,7 @@ class SmemAResource(MemoryResource):
                 self._tma_load(
                     stage_base,
                     self.tma_a_desc,
-                    self._coords_for_load(coord_a_k, coord_a_mn, coord_a_l, mn_limit),
+                    self._coords_for_load(coord_a_k, partition_mn, coord_a_l, mn_limit),
                     stage_info.barrier,
                 )
 
@@ -263,7 +264,7 @@ class SmemAResource(MemoryResource):
         """Single-CTA or cluster TMA load.
 
         For 2-CTA cluster (2×1): each CTA loads its own data.
-        multicast_mask = (1 << cta_rank) targets only the local CTA.
+        Local payloads use unicast; wider CGAs multicast to sharing CTAs.
         Both CTAs issue TMA independently with cta_group_2.
         """
         if cutlass.const_expr(self.cfg.has_cast_a):
@@ -278,47 +279,15 @@ class SmemAResource(MemoryResource):
 
     @cute.jit
     def _emit_tma_load(self, smem_dst, tma_desc, coords, barrier):
-        if cutlass.const_expr(self.cfg.has_cast_a):
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-            )
-        elif cutlass.const_expr(self.cfg.uses_two_cta_mma):
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "a")):
-                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "a")
-                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-            else:
-                mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = nonnegative_div(
-                    cta_rank, self.cfg.umma_cta_count
-                ) * Int32(self.cfg.umma_cta_count)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                # TODO-NVVM: remove cvta_to once mbarrier intrinsics accept AS7.
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-                multicast_mask=mcast_mask,
-                group=self.cfg.cta_group,
-                l2_cache_hint=self.weight_l2_cache_hint,
-            )
-        else:
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                l2_cache_hint=self.weight_l2_cache_hint,
-            )
+        load_input_tma(
+            self.cfg,
+            "a",
+            smem_dst,
+            tma_desc,
+            coords,
+            barrier,
+            l2_cache_hint=self.weight_l2_cache_hint,
+        )
 
     @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
     @cute.jit
@@ -389,12 +358,7 @@ class SmemBResource(MemoryResource):
     mixed_cga_kind: Constexpr[str] = "b"
 
     def create_pipeline(self, pipeline_config):
-        result = super().create_pipeline(pipeline_config)
-        # Barrier routing follows physical UMMA atoms independently of whether
-        # B uses extended TMA payload multicast.
-        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
-            return override_tma_umma_pipeline(self.cfg, result, "b")
-        return result
+        return create_input_tma_pipeline(self, pipeline_config)
 
     def __post_init__(self):
         if self._alloc_b is None:
@@ -525,34 +489,7 @@ class SmemBResource(MemoryResource):
 
     @cute.jit
     def _tma_load(self, smem_dst, tma_desc, coords, barrier):
-        """Single-CTA or cluster TMA load. Per-CTA mask for 2×1 cluster."""
-        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "b")):
-                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "b")
-            else:
-                mcast_mask = Int32(1) << cta_rank
-            if cutlass.const_expr(self.cfg.split_b_across_ctas):
-                lead_cta_rank = nonnegative_div(cta_rank, 2) * Int32(2)
-                barrier = prims.mapa(barrier, lead_cta_rank)
-                # TODO-NVVM: remove cvta_to once mbarrier intrinsics accept AS7.
-                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
-            prims.cp_async_bulk_tensor_shared_cluster_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-                [],
-                multicast_mask=mcast_mask,
-                group=self.cfg.cta_group,
-            )
-        else:
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                smem_dst,
-                tma_desc,
-                coords,
-                barrier,
-            )
+        load_input_tma(self.cfg, "b", smem_dst, tma_desc, coords, barrier)
 
     @consumer_work(returns=(desc_b_mma_base, smem_b_stage_ptr))
     @cute.jit
@@ -953,13 +890,28 @@ class SmemGatherResource(MemoryResource):
                     ) + col_chunk * Int32(copy_bytes)
                     gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
-                    prims.inline_ptx_hl(
-                        "cp.async.cg.shared.global.L2::128B [{$r0}], [{$r1}], 16;",
-                        read_only_args=[smem_ptr.data_ptr(), gmem_ptr],
-                    )
+                    if cutlass.const_expr(
+                        self.cfg.dense_retain_a and not self.cfg.is_swap_ab
+                    ):
+                        prims.inline_ptx_hl(
+                            "cp.async.cg.shared.global.L2::cache_hint.L2::128B [{$r0}], [{$r1}], 16, {$r2};",
+                            read_only_args=[
+                                smem_ptr.data_ptr(),
+                                gmem_ptr,
+                                _retained_a_cache_policy(),
+                            ],
+                        )
+                    else:
+                        prims.inline_ptx_hl(
+                            "cp.async.cg.shared.global.L2::128B [{$r0}], [{$r1}], 16;",
+                            read_only_args=[smem_ptr.data_ptr(), gmem_ptr],
+                        )
 
-        # The following producer_commit uses cp.async.mbarrier.arrive for all
-        # LDGSTS activation gathers.
+        if cutlass.const_expr(self.cfg.casta_gather_joins_ctas):
+            # Each CTA loads half of B. Complete this thread's local copies
+            # before producer_commit signals the MMA leader's full barrier.
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
 
     @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
     @cute.jit
@@ -1069,24 +1021,37 @@ def _tma_gather4_cta(smem_dst, tma_desc, k_coord, row0, row1, row2, row3, barrie
 
 @cute.jit
 def _tma_gather4_cluster(
-    smem_dst, tma_desc, k_coord, row0, row1, row2, row3, barrier, multicast_mask
+    smem_dst,
+    tma_desc,
+    k_coord,
+    row0,
+    row1,
+    row2,
+    row3,
+    barrier,
+    multicast_mask,
+    cfg: Constexpr[object],
+    operand: Constexpr[str],
+    retain_a: Constexpr[bool] = False,
 ):
     """Emit cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."""
     smem_ptr = smem_dst.data_ptr()
     tma_ptr = tma_desc.data_ptr() if hasattr(tma_desc, "data_ptr") else tma_desc
     # Route completion to this 2-CTA UMMA atom's leader.  Rank zero is correct
     # only for the first atom of a wider physical CGA.
-    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    atom_leader = cta_rank & Int32(~1)
-    lead_barrier = prims.cvta_to(
-        prims.mapa(barrier, atom_leader), prims.CvtaSpace.SHARED
-    )
+    lead_barrier = input_tma_barrier_address(cfg, operand, barrier, gather=True)
     bar_ptr = lead_barrier.data_ptr()
     mcast_mask_u16 = Uint16(multicast_mask)
+    cache_args = [_retained_a_cache_policy()] if cutlass.const_expr(retain_a) else []
+    cache_suffix = ".L2::cache_hint" if cutlass.const_expr(retain_a) else ""
+    cache_operand = ", {$r9}" if cutlass.const_expr(retain_a) else ""
     prims.inline_ptx_hl(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
         ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
-        " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}], {$r8};",
+        + cache_suffix
+        + " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}], {$r8}"
+        + cache_operand
+        + ";",
         read_only_args=[
             smem_ptr,
             tma_ptr,
@@ -1097,7 +1062,8 @@ def _tma_gather4_cluster(
             row3,
             bar_ptr,
             mcast_mask_u16,
-        ],
+        ]
+        + cache_args,
     )
 
 
@@ -1127,6 +1093,9 @@ def _tma_gather4_cluster_x4(
     row33,
     barrier,
     multicast_mask,
+    cfg: Constexpr[object],
+    operand: Constexpr[str],
+    retain_a: Constexpr[bool] = False,
 ):
     """Emit four cluster gather4 operations from one inline PTX block.
 
@@ -1139,26 +1108,25 @@ def _tma_gather4_cluster_x4(
     smem_ptr2 = smem_dst2.data_ptr()
     smem_ptr3 = smem_dst3.data_ptr()
     tma_ptr = tma_desc.data_ptr() if hasattr(tma_desc, "data_ptr") else tma_desc
-    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    atom_leader = cta_rank & Int32(~1)
-    lead_barrier = prims.cvta_to(
-        prims.mapa(barrier, atom_leader), prims.CvtaSpace.SHARED
-    )
+    lead_barrier = input_tma_barrier_address(cfg, operand, barrier, gather=True)
     bar_ptr = lead_barrier.data_ptr()
     mcast_mask_u16 = Uint16(multicast_mask)
+    cache_args = [_retained_a_cache_policy()] if cutlass.const_expr(retain_a) else []
+    cache_suffix = ".L2::cache_hint" if cutlass.const_expr(retain_a) else ""
+    cache_operand = ", {$r24}" if cutlass.const_expr(retain_a) else ""
     suffix = (
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+        ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2" + cache_suffix
     )
     prims.inline_ptx_hl(
         f"{suffix} [{{$r0}}], [{{$r4}}, "
-        f"{{{{$r5}}, {{$r6}}, {{$r7}}, {{$r8}}, {{$r9}}}}], [{{$r22}}], {{$r23}};\n"
+        f"{{{{$r5}}, {{$r6}}, {{$r7}}, {{$r8}}, {{$r9}}}}], [{{$r22}}], {{$r23}}{cache_operand};\n"
         f"{suffix} [{{$r1}}], [{{$r4}}, "
-        f"{{{{$r5}}, {{$r10}}, {{$r11}}, {{$r12}}, {{$r13}}}}], [{{$r22}}], {{$r23}};\n"
+        f"{{{{$r5}}, {{$r10}}, {{$r11}}, {{$r12}}, {{$r13}}}}], [{{$r22}}], {{$r23}}{cache_operand};\n"
         f"{suffix} [{{$r2}}], [{{$r4}}, "
-        f"{{{{$r5}}, {{$r14}}, {{$r15}}, {{$r16}}, {{$r17}}}}], [{{$r22}}], {{$r23}};\n"
+        f"{{{{$r5}}, {{$r14}}, {{$r15}}, {{$r16}}, {{$r17}}}}], [{{$r22}}], {{$r23}}{cache_operand};\n"
         f"{suffix} [{{$r3}}], [{{$r4}}, "
-        f"{{{{$r5}}, {{$r18}}, {{$r19}}, {{$r20}}, {{$r21}}}}], [{{$r22}}], {{$r23}};",
+        f"{{{{$r5}}, {{$r18}}, {{$r19}}, {{$r20}}, {{$r21}}}}], [{{$r22}}], {{$r23}}{cache_operand};",
         read_only_args=[
             smem_ptr0,
             smem_ptr1,
@@ -1184,7 +1152,8 @@ def _tma_gather4_cluster_x4(
             row33,
             bar_ptr,
             mcast_mask_u16,
-        ],
+        ]
+        + cache_args,
     )
 
 
@@ -1200,6 +1169,11 @@ class SmemTmaGatherResource(MemoryResource):
     ``N / 4`` gather4 calls per K-box, and ``tile_k / box_k`` K-boxes.
 
     Replaces SmemA (non-swapAB) or SmemB (swapAB) for the TMA-routed path.
+
+    Native Rubin routed A automatically omits all-padding gather4 groups.
+    Its padded rows are unobserved downstream and quantization is per row,
+    so their SMEM contents may remain undefined. Partial groups still use
+    TMA zero-fill. Other gather paths retain their zero-fill behavior.
     """
 
     cfg: Constexpr[BatchedGemmConfig]
@@ -1217,13 +1191,12 @@ class SmemTmaGatherResource(MemoryResource):
     mixed_cga_policy: Constexpr[int] = int(CgaPolicy.ALL)
     mixed_cga_kind: Constexpr[str] = ""
 
+    @property
+    def skips_padding_gathers(self):
+        return bool(self.cfg.routed_native_sfa and self._operand == "a")
+
     def create_pipeline(self, pipeline_config):
-        result = super().create_pipeline(pipeline_config)
-        # A TMA-gather pipeline still synchronizes with the current physical
-        # UMMA atom when its payload mask is local.
-        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
-            return override_tma_umma_pipeline(self.cfg, result, self._operand)
-        return result
+        return create_input_tma_pipeline(self, pipeline_config)
 
     def __post_init__(self):
         self.mixed_cga_kind = self._operand
@@ -1274,7 +1247,7 @@ class SmemTmaGatherResource(MemoryResource):
         tile_rows = (self.cfg.tile_n if is_b else self.cfg.tile_m) // (
             self.cfg.umma_cta_count if self.cfg.uses_two_cta_mma and is_b else 1
         )
-        num_gather4_per_kbox = tile_rows // 4
+        num_gather4_per_kbox = tile_rows // self.cfg.routed_a_y_partitions // 4
         num_load_warps = (
             self.cfg.warp_layout.num_load_b_warps
             if is_b
@@ -1285,7 +1258,7 @@ class SmemTmaGatherResource(MemoryResource):
         )
         self.routed_rows = cutlass.Array(
             cutlass.Int32,
-            route_cache_groups * 4,
+            route_cache_groups * 4 + int(self.skips_padding_gathers),
             space=cutlass.AddressSpace.rmem,
         )
 
@@ -1354,7 +1327,7 @@ class SmemTmaGatherResource(MemoryResource):
                 tile_rows,
             )
 
-        num_gather4_per_kbox = tile_rows_per_cta // 4
+        num_gather4_per_kbox = tile_rows_per_cta // self.cfg.routed_a_y_partitions // 4
         route_cache_groups = max(
             1, (num_gather4_per_kbox + num_load_warps - 1) // num_load_warps
         )
@@ -1364,8 +1337,19 @@ class SmemTmaGatherResource(MemoryResource):
         warp_in_task = warp_idx - Int32(load_warp_idx)
         warp_in_task = cute.arch.make_warp_uniform(warp_in_task)
 
+        if cutlass.const_expr(self.skips_padding_gathers):
+            # Native geometries divide evenly over the producer warps. Cache
+            # the active prefix once per work tile, outside the K loop. Use
+            # row limits, not route values: an OOB route in a valid row still
+            # needs the usual zero-fill semantics.
+            assert all_gathers_valid
+            active_groups = Int32(0)
+
         for wi in cutlass.range_constexpr(route_cache_groups):
             gi = warp_in_task + Int32(wi * num_load_warps)
+            if cutlass.const_expr(self.cfg.partitions_routed_tma_a):
+                _, _, _, _, _, y = active_cga_coords(self.cfg)
+                gi += y * Int32(num_gather4_per_kbox)
             # The task dispatcher has already restricted execution to the
             # LoadB/LoadA warpgroup.  When the gather groups divide evenly over
             # the load warps, every participating warp owns a valid gather
@@ -1374,6 +1358,9 @@ class SmemTmaGatherResource(MemoryResource):
             if cutlass.const_expr(all_gathers_valid):
                 base_row = coord_mn + cta_row_offset + gi * Int32(4)
                 row_base = cta_row_offset + gi * Int32(4)
+                if cutlass.const_expr(self.skips_padding_gathers):
+                    if row_base < tile_limit:
+                        active_groups += Int32(1)
                 self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                     base_row, row_base, tile_limit
                 )
@@ -1403,6 +1390,9 @@ class SmemTmaGatherResource(MemoryResource):
                     self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                         base_row + Int32(3), row_base + Int32(3), tile_limit
                     )
+
+        if cutlass.const_expr(self.skips_padding_gathers):
+            self.routed_rows[route_cache_groups * 4] = active_groups
 
     @producer_work
     @cute.jit
@@ -1435,6 +1425,77 @@ class SmemTmaGatherResource(MemoryResource):
     def _load_tma_gather_tile_impl(
         self, stage_info: StageInfo, coord_k, coord_mn
     ) -> None:
+        if cutlass.const_expr(self.skips_padding_gathers):
+            groups = (
+                self.cfg.tile_m
+                // self.cfg.routed_a_y_partitions
+                // 4
+                // self.cfg.warp_layout.num_load_a_warps
+            )
+            active_groups = self.routed_rows[groups * 4]
+            if active_groups == Int32(groups):
+                self._load_tma_gather_full_tile(stage_info, coord_k, coord_mn)
+            else:
+                self._load_tma_gather_partial_tile(stage_info, coord_k, active_groups)
+        else:
+            self._load_tma_gather_full_tile(stage_info, coord_k, coord_mn)
+
+    @cute.jit
+    def _load_tma_gather_partial_tile(
+        self, stage_info: StageInfo, coord_k, active_groups
+    ):
+        tile_rows = self.cfg.tile_m
+        bits = self.cfg.dtype_a_smem_bits
+        box_k = _smem_k_box_elems(self.cfg.tile_k, bits)
+        row_bytes = box_k * bits // 8
+        num_k_boxes = self.cfg.tile_k // box_k
+        gathers_per_box = tile_rows // self.cfg.routed_a_y_partitions // 4
+        warps = self.cfg.warp_layout.num_load_a_warps
+        groups = gathers_per_box // warps
+        stage_bytes = tile_rows * self.cfg.tile_k * bits // 8
+        stage_base = self.smem_buf.subview(stage_bytes * stage_info.stage_idx)
+        warp_in_task = cute.arch.make_warp_uniform(
+            cute.arch.warp_idx() - Int32(self.cfg.warp_layout.load_a_warp_idx)
+        )
+        if prims.elect_sync():
+            if cutlass.const_expr(self.cfg.partitions_routed_tma_a):
+                _, _, _, _, _, y = active_cga_coords(self.cfg)
+                warp_in_task += y * Int32(gathers_per_box)
+            for ki in cutlass.range_constexpr(num_k_boxes):
+                for wi in cutlass.range_constexpr(groups):
+                    if Int32(wi) < active_groups:
+                        gi = warp_in_task + Int32(wi * warps)
+                        offset = Int32(ki * tile_rows * row_bytes) + gi * Int32(
+                            4 * row_bytes
+                        )
+                        _tma_gather4_cluster(
+                            stage_base.subview(offset),
+                            self.tma_desc,
+                            coord_k + Int32(ki * box_k),
+                            self.routed_rows[wi * 4],
+                            self.routed_rows[wi * 4 + 1],
+                            self.routed_rows[wi * 4 + 2],
+                            self.routed_rows[wi * 4 + 3],
+                            stage_info.barrier,
+                            input_tma_payload_mask(self.cfg, self._operand),
+                            self.cfg,
+                            self._operand,
+                            retain_a=bool(self.cfg.dense_retain_a),
+                        )
+            # Aggregate every omitted gather in this warp/stage. Ownership
+            # comes from the same policy as real TMA completion, including
+            # multicast recipients and preferred/fallback CGAs.
+            complete_input_tma_bytes(
+                self.cfg,
+                self._operand,
+                stage_info.barrier,
+                (Int32(groups) - active_groups) * Int32(4 * row_bytes * num_k_boxes),
+            )
+
+    @cute.jit
+    def _load_tma_gather_full_tile(
+        self, stage_info: StageInfo, coord_k, coord_mn
+    ) -> None:
         """TMA gather4 load: fetch non-contiguous rows from GMEM.
 
         For non-swapAB the gather replaces SmemA (the activation operand)
@@ -1444,8 +1505,6 @@ class SmemTmaGatherResource(MemoryResource):
         # Rows to gather = tile dimension of the operand this resource replaces
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         dtype_bits = self.cfg.dtype_b_smem_bits if is_b else self.cfg.dtype_a_smem_bits
-        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if cutlass.const_expr(self.cfg.uses_two_cta_mma and is_b):
             tile_rows_per_cta = tile_rows // self.cfg.umma_cta_count
         else:
@@ -1458,7 +1517,7 @@ class SmemTmaGatherResource(MemoryResource):
         box_k = _smem_k_box_elems(self.cfg.tile_k, dtype_bits)
         row_box_bytes = box_k * dtype_bits // 8
         num_k_boxes = self.cfg.tile_k // box_k
-        num_gather4_per_kbox = tile_rows_per_cta // 4
+        num_gather4_per_kbox = tile_rows_per_cta // self.cfg.routed_a_y_partitions // 4
         num_load_warps = (
             self.cfg.warp_layout.num_load_b_warps
             if is_b
@@ -1477,10 +1536,14 @@ class SmemTmaGatherResource(MemoryResource):
         warp_in_task = cute.arch.make_warp_uniform(warp_in_task)
 
         if prims.elect_sync():
+            if cutlass.const_expr(self.cfg.partitions_routed_tma_a):
+                _, _, _, _, _, y = active_cga_coords(self.cfg)
+                warp_in_task += y * Int32(num_gather4_per_kbox)
             for ki in cutlass.range_constexpr(num_k_boxes):
                 k_offset = coord_k + Int32(ki * box_k)
                 if cutlass.const_expr(
-                    self.cfg.uses_two_cta_mma
+                    input_tma_instruction_kind(self.cfg, self._operand, gather=True)
+                    == "umma"
                     and all_gathers_valid
                     and warp_batches == 4
                 ):
@@ -1492,12 +1555,7 @@ class SmemTmaGatherResource(MemoryResource):
                     smem_dst1 = stage_base.subview(smem_offset0 + smem_delta)
                     smem_dst2 = stage_base.subview(smem_offset0 + smem_delta * Int32(2))
                     smem_dst3 = stage_base.subview(smem_offset0 + smem_delta * Int32(3))
-                    if cutlass.const_expr(
-                        needs_extended_tma_multicast(self.cfg, self._operand)
-                    ):
-                        mcast_mask, _, _, _ = cga_tma_masks(self.cfg, self._operand)
-                    else:
-                        mcast_mask = Int32(1) << cta_rank
+                    mcast_mask = input_tma_payload_mask(self.cfg, self._operand)
                     _tma_gather4_cluster_x4(
                         smem_dst0,
                         smem_dst1,
@@ -1523,6 +1581,9 @@ class SmemTmaGatherResource(MemoryResource):
                         self.routed_rows[15],
                         stage_info.barrier,
                         mcast_mask,
+                        self.cfg,
+                        self._operand,
+                        retain_a=bool(self.cfg.dense_retain_a and self._operand == "a"),
                     )
                 else:
                     for wi in cutlass.range_constexpr(warp_batches):
@@ -1541,17 +1602,15 @@ class SmemTmaGatherResource(MemoryResource):
                             ) + gi * Int32(4 * row_box_bytes)
                             smem_dst = stage_base.subview(smem_offset)
 
-                            if cutlass.const_expr(self.cfg.uses_two_cta_mma):
-                                if cutlass.const_expr(
-                                    needs_extended_tma_multicast(
-                                        self.cfg, self._operand
-                                    )
-                                ):
-                                    mcast_mask, _, _, _ = cga_tma_masks(
-                                        self.cfg, self._operand
-                                    )
-                                else:
-                                    mcast_mask = Int32(1) << cta_rank
+                            if cutlass.const_expr(
+                                input_tma_instruction_kind(
+                                    self.cfg, self._operand, gather=True
+                                )
+                                == "umma"
+                            ):
+                                mcast_mask = input_tma_payload_mask(
+                                    self.cfg, self._operand
+                                )
                                 _tma_gather4_cluster(
                                     smem_dst,
                                     self.tma_desc,
@@ -1562,6 +1621,11 @@ class SmemTmaGatherResource(MemoryResource):
                                     r3,
                                     stage_info.barrier,
                                     mcast_mask,
+                                    self.cfg,
+                                    self._operand,
+                                    retain_a=bool(
+                                        self.cfg.dense_retain_a and self._operand == "a"
+                                    ),
                                 )
                             else:
                                 _tma_gather4_cta(
@@ -1590,17 +1654,15 @@ class SmemTmaGatherResource(MemoryResource):
                                 ) + gi * Int32(4 * row_box_bytes)
                                 smem_dst = stage_base.subview(smem_offset)
 
-                                if cutlass.const_expr(self.cfg.uses_two_cta_mma):
-                                    if cutlass.const_expr(
-                                        needs_extended_tma_multicast(
-                                            self.cfg, self._operand
-                                        )
-                                    ):
-                                        mcast_mask, _, _, _ = cga_tma_masks(
-                                            self.cfg, self._operand
-                                        )
-                                    else:
-                                        mcast_mask = Int32(1) << cta_rank
+                                if cutlass.const_expr(
+                                    input_tma_instruction_kind(
+                                        self.cfg, self._operand, gather=True
+                                    )
+                                    == "umma"
+                                ):
+                                    mcast_mask = input_tma_payload_mask(
+                                        self.cfg, self._operand
+                                    )
                                     _tma_gather4_cluster(
                                         smem_dst,
                                         self.tma_desc,
@@ -1611,6 +1673,12 @@ class SmemTmaGatherResource(MemoryResource):
                                         r3,
                                         stage_info.barrier,
                                         mcast_mask,
+                                        self.cfg,
+                                        self._operand,
+                                        retain_a=bool(
+                                            self.cfg.dense_retain_a
+                                            and self._operand == "a"
+                                        ),
                                     )
                                 else:
                                     _tma_gather4_cta(

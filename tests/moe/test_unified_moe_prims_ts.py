@@ -173,13 +173,13 @@ class TestPrimsTsBackendOptions:
         }
         assert not PrimsTsRunner.supports_fused_shared_experts
 
-    def test_sm100_family_only(self):
+    def test_supported_architectures(self):
         opts = BackendOptions((PrimsTsConfig(),))
         assert eval(repr(opts)) == opts
         assert opts.valid_for(90) == []
         assert opts.valid_for(100) == list(opts)
         assert opts.valid_for(103) == list(opts)
-        assert opts.valid_for(107) == []
+        assert opts.valid_for(107) == list(opts)
         assert opts.valid_for(120) == []
 
     def test_repr_round_trip(self):
@@ -195,6 +195,114 @@ class TestPrimsTsBackendOptions:
 
 
 class TestPrimsTsPrepare:
+    @pytest.mark.parametrize(
+        "quant,hidden,layout,error",
+        [
+            (_BF16, 256, "BlockMajorK", "applies only to NVFP4"),
+            (_NVFP4, 128, "BlockMajorK", "divisible by 256"),
+            (_NVFP4, 256, "unknown", "nvfp4_weight_layout"),
+        ],
+    )
+    def test_rejects_invalid_weight_preparation(self, quant, hidden, layout, error):
+        with pytest.raises(ValueError, match=error):
+            PrimsTsConfig.prepare_weights(
+                torch.empty(0),
+                torch.empty(0),
+                quant=quant,
+                num_local_experts=1,
+                hidden_size=hidden,
+                intermediate_size=256,
+                nvfp4_weight_layout=layout,
+            )
+
+    @pytest.mark.parametrize(
+        "fc1_shape,fc2_shape,error",
+        [
+            ((32, 1024, 512), (32, 2, 1024, 128), "same layout"),
+            ((32, 4, 1024, 128), (32, 1024, 256), "same layout"),
+            ((32, 8, 1024, 64), (32, 2, 1024, 128), "gemm1_weights.*128-byte"),
+            ((32, 4, 1024, 128), (32, 4, 1024, 64), "gemm2_weights.*128-byte"),
+        ],
+    )
+    def test_rubin_rejects_invalid_nvfp4_storage(
+        self, monkeypatch, fc1_shape, fc2_shape, error
+    ):
+        monkeypatch.setattr(
+            "flashinfer.fused_moe.runners.get_compute_capability", lambda _: (10, 7)
+        )
+        runner = PrimsTsRunner(
+            _config(execution=ExecutionConfig(enable_pdl=False)),
+            torch.device("cpu"),
+        )
+        with pytest.raises(ValueError, match=error):
+            runner._validate_fp4_tensors(
+                None,
+                {
+                    "gemm1_weights": torch.empty(
+                        fc1_shape, device="meta", dtype=torch.uint8
+                    ),
+                    "gemm2_weights": torch.empty(
+                        fc2_shape, device="meta", dtype=torch.uint8
+                    ),
+                },
+                1024,
+            )
+
+    @pytest.mark.parametrize("minor", (0, 3, 7))
+    @pytest.mark.parametrize(
+        "block", (None, 64, 128), ids=("MajorK", "block64", "block128")
+    )
+    def test_infers_nvfp4_layout(self, monkeypatch, minor, block):
+        monkeypatch.setattr(
+            "flashinfer.fused_moe.runners.get_compute_capability", lambda _: (10, minor)
+        )
+        runner = PrimsTsRunner(
+            _config(execution=ExecutionConfig(enable_pdl=False)), torch.device("cpu")
+        )
+
+        def weight(rows, k):
+            shape = (
+                (32, rows, k // 2)
+                if block is None
+                else (32, k // (2 * block), rows, block)
+            )
+            return torch.empty(shape, device="meta", dtype=torch.uint8)
+
+        act = MoEActivationPack(
+            topk_ids=torch.empty((4, 2), device="meta", dtype=torch.int32),
+            topk_weights=torch.empty((4, 2), device="meta", dtype=torch.float32),
+            hidden_states_q=torch.empty((4, 512), device="meta", dtype=torch.uint8),
+            hidden_states_scale=torch.empty(
+                (4, 64), device="meta", dtype=torch.float8_e4m3fn
+            ),
+        )
+        view = dict(
+            gemm1_weights=weight(1024, 1024),
+            gemm2_weights=weight(1024, 512),
+            gemm1_weights_scale=torch.empty(
+                (32, 1024, 64), device="meta", dtype=torch.float8_e4m3fn
+            ),
+            gemm2_weights_scale=torch.empty(
+                (32, 1024, 32), device="meta", dtype=torch.float8_e4m3fn
+            ),
+        )
+        if minor == 7 and block == 64:
+            with pytest.raises(ValueError, match="128-byte K blocks"):
+                runner._validate_fp4_tensors(act, view, 1024)
+            return
+        assert runner._validate_fp4_tensors(act, view, 1024) is act.hidden_states_scale
+        assert runner._weight_layout(view) == (
+            WeightLayout.MajorK if block is None else WeightLayout.BlockMajorK
+        )
+        if minor != 7:
+            assert not runner._effective_fused_finalize()
+        elif block == 128:
+            view["gemm2_weights"] = (
+                view["gemm2_weights"].transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            with pytest.raises(ValueError, match="gemm2_weights.*contiguous"):
+                runner._validate_fp4_tensors(act, view, 1024)
+
     def test_prepare_weights_rejects_unsupported_pairs(self):
         with pytest.raises(ValueError, match="does not support"):
             PrimsTsConfig.prepare_weights(
@@ -252,6 +360,9 @@ class TestPrimsTsUnifiedValidation:
             "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
         )
         monkeypatch.setattr(
+            "flashinfer.prims_ts.utils.is_prims_ts_arch_available", lambda *args: True
+        )
+        monkeypatch.setattr(
             "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
         )
 
@@ -265,10 +376,24 @@ class TestPrimsTsUnifiedValidation:
 
     def test_unsupported_arch_rejected(self, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 7)
+            "flashinfer.utils.get_compute_capability", lambda _: (12, 0)
         )
         runner = self._runner(_config())
         with pytest.raises(NotImplementedError, match="SM100/SM103"):
+            runner.check_support()
+
+    def test_rubin_requires_native_dsl(self, monkeypatch):
+        monkeypatch.setattr(
+            "flashinfer.utils.get_compute_capability", lambda _: (10, 7)
+        )
+        runner = self._runner(_config())
+        runner.check_support()
+        with pytest.raises(NotImplementedError, match="NVFP4×NVFP4 only"):
+            self._runner(_config(variant=_BF16)).check_support()
+        monkeypatch.setattr(
+            "flashinfer.prims_ts.utils.is_prims_ts_arch_available", lambda *args: False
+        )
+        with pytest.raises(RuntimeError, match="natively targets SM107"):
             runner.check_support()
 
     def test_bf16_rejects_per_token_scale_config(self):
@@ -1159,3 +1284,118 @@ class TestPrimsTsUnifiedGpu:
                 dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
             )(act, major_k_weights)
             assert torch.equal(major_k_out, prims_out)
+
+
+def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout(monkeypatch):
+    from flashinfer.fused_moe.runners import _TrtllmLaunchState, _TrtllmPackedInputs
+
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
+    )
+    keys = set()
+    for fused in (False, True):
+        cfg = _config(
+            finalize=MoEFinalizeConfig(use_fused_finalize=fused),
+            execution=ExecutionConfig(enable_pdl=False),
+        )
+        runner = PrimsTsRunner(cfg, torch.device("cpu"))
+        original_hash = hash(runner)
+        for layout, shape in (
+            (WeightLayout.MajorK, (32, 1024, 512)),
+            (WeightLayout.BlockMajorK, (32, 4, 1024, 128)),
+        ):
+            inferred = runner._weight_layout(
+                {"gemm1_weights": torch.empty(shape, device="meta", dtype=torch.uint8)}
+            )
+            assert inferred == layout
+            inputs = _TrtllmPackedInputs(
+                [],
+                tuning_config=None,
+                launch_state=_TrtllmLaunchState(dict(weight_layout=inferred)),
+            )
+            key = runner.get_cache_key_extras(inputs)
+            assert key != runner.get_cache_key_extras([])
+            keys.add(key)
+            assert hash(runner) == original_hash
+    assert len(keys) == 4
+
+
+def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypatch):
+    from types import SimpleNamespace
+    from flashinfer.fused_moe.runners import _TrtllmLaunchState, _TrtllmPackedInputs
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+    from flashinfer.prims_ts.moe import runner as module
+
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
+    )
+    monkeypatch.setattr(module, "_sm_arch_for_tensor", lambda tensor: 107)
+    deterministic = False
+    monkeypatch.setattr(
+        torch, "are_deterministic_algorithms_enabled", lambda: deterministic
+    )
+    runner = PrimsTsRunner(
+        _config(execution=ExecutionConfig(enable_pdl=False)), torch.device("cpu")
+    )
+    inner = module.PrimsTsNvfp4MoERunner(
+        None, top_k=2, num_local_experts=32, hidden_size=1024, intermediate_size=512
+    )
+    runner._inner = inner
+    monkeypatch.setattr(runner, "_require_built", lambda: None)
+    tensors = MoeRunnerInputs(
+        torch.empty(8192, 1024, device="meta", dtype=torch.bfloat16),
+        torch.empty(8192, 32, device="meta"),
+        None,
+        None,
+        torch.empty(8192, 512, device="meta", dtype=torch.uint8),
+        torch.empty(8192, 64, device="meta", dtype=torch.uint8),
+        None,
+        None,
+    ).to_list()
+    packed = _TrtllmPackedInputs(
+        tensors,
+        tuning_config=None,
+        launch_state=_TrtllmLaunchState(
+            dict(weight_layout=int(WeightLayout.MajorK), do_finalize=True)
+        ),
+    )
+    original_hash = hash(runner)
+    fused_key = runner.get_cache_key_extras(packed)
+    assert (
+        len(
+            [
+                t
+                for t in runner.get_valid_tactics(packed, None)
+                if t != -1 and t[0] == 512
+            ]
+        )
+        == 16
+    )
+    bare_key = runner.get_cache_key_extras(list(packed))
+    assert "weight_layout" not in bare_key
+    for overrides in (
+        {"use_fused_finalize": False},
+        {"do_finalize": False},
+        {"zero_rows_without_local_expert": False},
+    ):
+        unfused = packed.with_launch_overrides(**overrides)
+        assert runner.get_cache_key_extras(unfused) != fused_key
+        assert [
+            t
+            for t in runner.get_valid_tactics(unfused, None)
+            if t != -1 and t[0] == 512
+        ] == [[512, 0], [512, 1]]
+        # Bare lists carry no call options and must not inherit mutable inner
+        # state. Profiling retains the packed input's launch metadata instead.
+        assert runner.get_cache_key_extras(list(unfused)) == bare_key
+        # A previously packed call must not inherit another call's options.
+        assert runner.get_cache_key_extras(packed) == fused_key
+    deterministic = True
+    assert runner.get_cache_key_extras(packed) != fused_key
+    assert [
+        t for t in runner.get_valid_tactics(packed, None) if t != -1 and t[0] == 512
+    ] == [[512, 0], [512, 1]]
+    assert hash(runner) == original_hash
+    deterministic = False
+    runner._inner = SimpleNamespace(_is_partitioned=True)
+    assert runner.get_cache_key_extras(packed) != fused_key

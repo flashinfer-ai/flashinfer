@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from copy import copy
 from dataclasses import replace
 from typing import Any
 
@@ -34,6 +35,8 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass import Int32
+from cutlass.cutlass_dsl import dsl_user_op, if_generate
+from cutlass._mlir.dialects import cuda as cuda_ir, llvm
 
 if not hasattr(cuda, "create_tensor_map_tiled_from_tensor") and hasattr(
     cuda, "create_tensor_map_tiled_from_view"
@@ -41,12 +44,13 @@ if not hasattr(cuda, "create_tensor_map_tiled_from_tensor") and hasattr(
     cuda.create_tensor_map_tiled_from_tensor = cuda.create_tensor_map_tiled_from_view
 
 from cutlass.experimental.task_scheduling.enums import (
+    PipelineGroupMode,
+    ScheduleStage,
     SignalingThreads,
     TileSchedulerType,
 )
 from cutlass.experimental.task_scheduling.memory import (
     SmemAllocation,
-    SmemAllocator,
     TmemAllocator,
 )
 from cutlass.experimental.task_scheduling.resources import (
@@ -74,7 +78,11 @@ from .batched_gemm_config import (
     validate_config,
 )
 from .batched_gemm_cga import (
+    CgaPolicy,
+    HostCgaTopology,
     verifier_clc_consumer_threads,
+    host_clc_consumer_threads,
+    static_queue_consumer_threads,
     has_multiple_umma_atoms,
     runtime_cga_coords,
 )
@@ -89,6 +97,7 @@ from .batched_gemm_resources import (
     SmemTmaGatherResource,
     ProxyClusterBarrierResource,
     BatchedGemmWorkQueue,
+    StaticBatchedGemmWorkQueue,
     WorkThrottleBarrierResource,
     SmemSfAResource,
     SmemSfBResource,
@@ -107,10 +116,13 @@ from .batched_gemm_resources import (
     SmemDeepSeekSfAbResource,
 )
 from .batched_gemm_tasks import (
+    create_non_swap_pair_task,
     create_load_a_task,
     create_load_b_task,
     create_gather_task,
     create_fused_load_a_sfa_task,
+    create_dense_tma_load_task,
+    create_dense_pair_tma_load_tasks,
     create_fused_gather_sfb_task,
     create_sync_task,
     create_load_sfa_task,
@@ -129,6 +141,9 @@ from .batched_gemm_tasks import (
 from .mixed_cga_ts import CgaTask
 from .pdl_resources import PdlLaunchBarrier, PdlWaitBarrier
 from cutlass.experimental import primitives as prims
+
+from .mixed_cga_ts import DenseTmaPipelineGroup, LdgstsPipelineGroup
+from .routed_smem import make_smem_allocator
 
 TMA_DIM_MAX = 1 << 31
 TMA_XLARGE_N = 1 << 35
@@ -152,6 +167,44 @@ def _task_manager_verify_enabled() -> bool:
 
 def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
     return bool(cfg.use_pdl and cfg.use_early_exit and not cfg.skip_early_exit_pdl)
+
+
+def _group_dense_tma(cfg, *members):
+    """Share full/empty barriers while retaining operand-specific TMA owners."""
+
+    # FusedMerge sums the complete operand bytes received by a two-CTA MMA
+    # atom, as DKG does with sum(per-CTA stage sizes) * atom_thr_size. Do not
+    # divide these credits by the number of issuers when partitioning loads:
+    # each receiver still gets every slice. In tile256 NVFP4 this is
+    # 2 * (16384 A + 16384 B + 2048 SFA + 4096 SFB) = 77824 bytes.
+    # Both multicast directions are enabled so the shared empty barrier
+    # counts the union of consumer atoms: Y + X/2 - 1, rather than their sum.
+    def make_group(group_members, name, split_operand=""):
+        for member in group_members:
+            member.pipeline_config = replace(
+                member.pipeline_config, mcast_mode_mn=(1, 1)
+            )
+            if cfg.uses_routed_weight_pipeline:
+                # One warp owns both members and advances only B. No separate
+                # TaskWarpLeader election is needed; SFB has no own commit.
+                member.pipeline_config = replace(
+                    member.pipeline_config,
+                    producer_signaling_threads=SignalingThreads.CtaLeader,
+                )
+        return DenseTmaPipelineGroup(
+            name=name,
+            members=list(group_members),
+            mode=PipelineGroupMode.FusedMerge,
+            gemm_cfg=cfg,
+            split_operand=split_operand,
+        )
+
+    if cfg.dense_split_tma_pipeline:
+        a, b, sa, sb = members
+        if not cfg.uses_routed_weight_pipeline:
+            make_group((a, sa), "TmaActivations", "a")
+        return make_group((b, sb), "TmaWeights", "b")
+    return make_group(members, "TmaOperands")
 
 
 def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
@@ -206,6 +259,56 @@ def _add_single_cta_smem_floor(smem_allocator, cfg) -> int:
     return pad_bytes
 
 
+def _group_ldgsts_a_sfa(cfg, smem_a, smem_sfa):
+    """Sum lane arrivals, keeping A and SFA loader tasks independent."""
+    return LdgstsPipelineGroup(
+        name="LdgstsActivations",
+        members=[smem_a, smem_sfa],
+        mode=PipelineGroupMode.FusedMerge,
+        gemm_cfg=cfg,
+    )
+
+
+def _relay_sources(cfg, smem_a, smem_b, smem_sfa, smem_sfb):
+    if cfg.has_cast_a:
+        # CastA owns A/SFA readiness and releases those stages independently.
+        # Its TMEM pipeline publishes cast readiness; only gathered B needs relay.
+        return [smem_b]
+    sources = []
+    if cfg.has_gather:
+        sources = (
+            [smem_b, smem_a]
+            if cfg.is_swap_ab
+            else [smem_a.pipeline_group or smem_a, smem_b]
+        )
+        if cfg.uses_routed_weight_pipeline:
+            # The MMA independently waits/releases the weight ring. The relay
+            # publishes only activation readiness, so A and B may differ in depth.
+            sources = sources[:1]
+    if cfg.uses_ldgsts_sf_relay and not cfg.shares_ldgsts_a_sfa_pipeline:
+        sources.append(smem_sfb if cfg.is_swap_ab else smem_sfa)
+    return sources
+
+
+def _add_relay_dependencies(cfg, graph, proxy, a, b, sa, sb, c, tsa, tsb, tsab):
+    if not cfg.uses_ldgsts_relay:
+        return
+    graph[proxy] = [
+        member
+        for resource in _relay_sources(cfg, a, b, sa, sb)
+        for member in getattr(resource, "members", [resource])
+    ]
+    if proxy not in graph[c]:
+        graph[c].append(proxy)
+    if not cfg.has_gather:
+        graph[c] += [r for r in (a, b) if r not in graph[c]]
+    if cfg.uses_routed_weight_pipeline:
+        graph[c] += [r for r in (b, sb) if r not in graph[c]]
+    if cfg.uses_ldgsts_sf_relay and not cfg.fuse_sf_copy_to_mma:
+        target = tsab if cfg.use_combined_sfab_copy else tsb if cfg.is_swap_ab else tsa
+        graph[target].append(proxy)
+
+
 def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
     """Create the typed TMEM-pointer slot with explicit barrier alignment.
 
@@ -240,7 +343,240 @@ def _verify_rank_gated_register_donation(tasks) -> None:
         )
 
 
-class _ProductionTaskManager(TaskManager):
+class _BatchedGemmTaskManager(TaskManager):
+    def _print_task_schedules(self) -> None:
+        # The wheel's linear printer counts committing tasks, whereas its
+        # exhaustive checker counts FusedMerge members. A dense pair loader
+        # commits both members from one task: only the last commit completes
+        # that task's round. Normalize copies for the printer only; retain the
+        # original member commits for code generation and exhaustive checking.
+        tasks = self.tasks
+        display_tasks = []
+        for task in tasks:
+            display = copy(task)
+            for attr in (
+                "head_schedule_list",
+                "loop_schedule_list",
+                "tail_schedule_list",
+            ):
+                entries = list(getattr(task, attr))
+                groups = {}
+                for entry in entries:
+                    resource, stage = entry[:2]
+                    group = getattr(resource, "pipeline_group", None)
+                    if (
+                        stage == ScheduleStage.ProducerCommit
+                        and isinstance(group, DenseTmaPipelineGroup)
+                        and group.mode == PipelineGroupMode.FusedMerge
+                    ):
+                        groups.setdefault(id(group), (group, set()))[1].add(
+                            id(resource)
+                        )
+                for group, members in groups.values():
+                    if len(members) < 2:
+                        continue
+                    if members != {id(member) for member in group.members}:
+                        raise ValueError(
+                            f"Incomplete fused producer round in {task.name}"
+                        )
+                    pending = {}
+                    for index, entry in enumerate(entries):
+                        resource, stage = entry[:2]
+                        if (
+                            stage != ScheduleStage.ProducerCommit
+                            or getattr(resource, "pipeline_group", None) is not group
+                        ):
+                            continue
+                        if id(resource) in pending:
+                            raise ValueError(
+                                f"Duplicate fused member commit in {task.name}"
+                            )
+                        pending[id(resource)] = index
+                        if len(pending) == len(members):
+                            # Loop guards must agree before these events can
+                            # be treated as one round in the display model.
+                            if attr == "loop_schedule_list" and any(
+                                entries[i][3] != entry[3] for i in pending.values()
+                            ):
+                                raise ValueError(
+                                    f"Mismatched fused commit guards in {task.name}"
+                                )
+                            for i in pending.values():
+                                if i != index:
+                                    old = entries[i]
+                                    entries[i] = (
+                                        old[0],
+                                        ScheduleStage.ProducerAuxWork,
+                                        *old[2:],
+                                    )
+                            pending.clear()
+                    if pending:
+                        raise ValueError(
+                            f"Incomplete fused producer round in {task.name}"
+                        )
+                setattr(display, attr, entries)
+            display_tasks.append(display)
+        try:
+            self.tasks = display_tasks
+            super()._print_task_schedules()
+        finally:
+            self.tasks = tasks
+
+    def _verify_pipeline_thread_counts(self) -> None:
+        queues = [r for r in self.resources if isinstance(r, BatchedGemmWorkQueue)]
+        if not queues:
+            return super()._verify_pipeline_thread_counts()
+        producers, consumers = self._collect_pipeline_arrival_tasks()
+        for queue in queues:
+            cfg = queue.pipeline_config
+            if not isinstance(queue, StaticBatchedGemmWorkQueue):
+                # The wheel sees only run_only_on_cta_id, not CgaPolicy.
+                # Check every real physical shape from actual consumer tasks;
+                # the resource's stock-layout count is only a verifier proxy
+                # for multi-atom launches and is replaced during setup.
+                shapes = (queue.cfg.preferred_cluster_shape,)
+                if queue.cfg.fallback_cluster_shape is not None:
+                    shapes += (queue.cfg.fallback_cluster_shape,)
+                for dim_x, dim_y, _ in shapes:
+                    topology = HostCgaTopology(dim_x, dim_y)
+                    arrivals = 32 * sum(
+                        t.num_warps
+                        for t in consumers[id(queue)]
+                        for rank in range(dim_x * dim_y)
+                        if t.run_only_on_cta_id in (None, rank)
+                        and topology.selected(
+                            getattr(t, "cga_policy", CgaPolicy.ALL),
+                            rank % dim_x,
+                            rank // dim_x,
+                        )
+                    )
+                    assert arrivals == host_clc_consumer_threads(
+                        queue.cfg, dim_x, dim_y
+                    )
+                assert cfg.consumer_group.size == verifier_clc_consumer_threads(
+                    queue.cfg
+                )
+                assert cfg.producer_group.size == 1
+                assert sum(t.num_warps for t in producers[id(queue)]) == 1
+                continue
+            assert (
+                cfg.producer_group.size
+                == sum(t.num_warps * 32 for t in producers[id(queue)])
+                == 32
+            )
+            dim_x, dim_y, _ = queue.cfg.preferred_cluster_shape
+            topology = HostCgaTopology(dim_x, dim_y)
+            for rank in range(dim_x * dim_y):
+                arrivals = sum(
+                    t.num_warps * 32
+                    for t in consumers[id(queue)]
+                    if (t.run_only_on_cta_id is None or t.run_only_on_cta_id == rank)
+                    and topology.selected(
+                        getattr(t, "cga_policy", CgaPolicy.ALL),
+                        rank % dim_x,
+                        rank // dim_x,
+                    )
+                )
+                assert arrivals == static_queue_consumer_threads(queue.cfg, rank)
+                if rank == 0:
+                    assert cfg.consumer_group.size == arrivals
+            assert cfg.producer_signaling_threads == SignalingThreads.All
+            assert cfg.consumer_signaling_threads == SignalingThreads.All
+        # Both queue protocols have their own verified census above. Retain
+        # the stock producer/consumer checks for every other resource.
+        resources = self.resources
+        try:
+            self.resources = [
+                r for r in resources if not isinstance(r, BatchedGemmWorkQueue)
+            ]
+            super()._verify_pipeline_thread_counts()
+        finally:
+            self.resources = resources
+
+    def _verify_work_queue_schedule(self) -> None:
+        queues = {
+            id(resource): resource
+            for task in self.tasks
+            for resource in task.src_resources + task.dst_resources
+            if isinstance(resource, WorkQueue)
+        }
+        if not any(isinstance(q, StaticBatchedGemmWorkQueue) for q in queues.values()):
+            return super()._verify_work_queue_schedule()
+        # The wheel's static scheduler is task-local. Our queued static
+        # scheduler instead has one publishing warp and local CTA consumers.
+        assert len(queues) == 1, "Queued static tasks must share one WorkQueue"
+        queue = next(iter(queues.values()))
+        assert all(task.is_persistent for task in self.tasks)
+        producers = [task for task in self.tasks if queue in task.dst_resources]
+        assert len(producers) == 1, "Queued static requires one scheduler task"
+        producer = producers[0]
+        assert producer.num_warps == 1 and producer.run_only_on_cta_id is None
+        auxiliary = {ScheduleStage.ConsumerAuxWork, ScheduleStage.ProducerAuxWork}
+        for task in self.tasks:
+            assert queue in task.src_resources
+            assert not any(
+                resource is queue and stage not in auxiliary
+                for resource, stage, *_ in task.head_schedule_list
+                + task.loop_schedule_list
+            ), "WorkQueue operations must be in the tail"
+            stages = [
+                entry[1] for entry in task.tail_schedule_list if entry[0] is queue
+            ]
+            expected = (
+                [
+                    ScheduleStage.ProducerAcquire,
+                    ScheduleStage.ProducerWork,
+                    ScheduleStage.ProducerCommit,
+                    ScheduleStage.ConsumerAuxWork,
+                ]
+                if task is producer
+                else [
+                    ScheduleStage.ConsumerWait,
+                    ScheduleStage.ConsumerWork,
+                    ScheduleStage.ConsumerRelease,
+                ]
+            )
+            assert stages == expected, (task.name, stages, expected)
+
+    def _find_split_consumer_resources(self):
+        result = set()
+        for task in self.tasks:
+            waits, releases = set(), set()
+            for entry in (
+                task.head_schedule_list
+                + task.loop_schedule_list
+                + task.tail_schedule_list
+            ):
+                resource, stage = entry[:2]
+                affected = {resource, *getattr(resource, "members", ())}
+                if stage == ScheduleStage.ConsumerWait:
+                    waits.update(affected)
+                elif stage == ScheduleStage.ConsumerRelease:
+                    releases.update(affected)
+            result.update(waits - releases)
+        return result
+
+    def _verify_schedule_uses_all_resources(self) -> None:
+        # A relay observes all FusedMerge members with one group wait. The
+        # wheel's check only recognizes literal member schedule entries.
+        for task in self.tasks:
+            scheduled = set()
+            for entry in (
+                task.head_schedule_list
+                + task.loop_schedule_list
+                + task.tail_schedule_list
+            ):
+                resource = entry[0]
+                scheduled.add(id(resource))
+                scheduled.update(id(m) for m in getattr(resource, "members", ()))
+            for resource in task.src_resources + task.dst_resources:
+                if id(resource) not in scheduled:
+                    raise ValueError(
+                        f"Task '{task.name}': resource '{resource.name}' has no schedule entries"
+                    )
+
+
+class _ProductionTaskManager(_BatchedGemmTaskManager):
     """Task manager that retains launch-safety checks without debug analysis.
 
     Schedule simulation and allocator reports are intentionally debug-only,
@@ -614,10 +950,12 @@ def _make_pipeline_configs(cfg):
         ) * 32
         gather_producer_op = pipeline.PipelineOp.AsyncLoad
         gather_advance_on_acquire = False
-        if cfg.fuse_operand_sf_loads:
+        if (
+            not cfg.is_rubin and cfg.fuse_operand_sf_loads
+        ) or cfg.casta_gather_joins_ctas:
             gather_producer_threads *= cfg.umma_cta_count
             gather_producer_op = pipeline.PipelineOp.AsyncThread
-            gather_advance_on_acquire = True
+            gather_advance_on_acquire = bool(cfg.fuse_operand_sf_loads)
         gather_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.num_stages_b if cfg.is_swap_ab else cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
@@ -634,10 +972,16 @@ def _make_pipeline_configs(cfg):
         result["smem_gather"] = gather_cfg
 
     # 2-CTA + gather: proxy barrier for cross-CTA sync
-    if cfg.has_gather and cfg.uses_two_cta_mma:
+    if cfg.uses_ldgsts_relay:
         proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             # validate_config() requires equal A/B depths for this path.
-            num_stages=cfg.num_stages_a,
+            num_stages=(
+                cfg.num_stages_a
+                if cfg.has_gather
+                else cfg.num_stages_smem_sfb
+                if cfg.is_swap_ab
+                else cfg.num_stages_smem_sfa
+            ),
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * cfg.umma_cta_count,  # SyncTask warp × CTAs
@@ -653,11 +997,9 @@ def _make_pipeline_configs(cfg):
         result["smem_sfa"] = smem_sfa_cfg
     if cfg.has_input_block_scaling:
         result["smem_sfb"] = smem_sfb_cfg
-        # LDGSTS SF uses cp.async producer work.  A clustered routed operand
-        # consumed by 2-CTA UMMA drains cp.async groups, then uses an
-        # AsyncThread producer_commit to join both CTAs at the leading CTA's
-        # full barrier.  Compact low-N SFB keeps generic Async because CopySfB
-        # performs LDS+STTM directly.
+        # LDGSTS completion is CTA-local. The relay waits on both CTAs'
+        # local barriers before publishing readiness at the atom leader.
+        # Compact LDS+STTM consumers also keep their own local waits.
         if cfg.has_routed_sfs and cfg.uses_ldgsts_routed_sfs:
             ldgsts_consumer_signaling = (
                 SignalingThreads.CtaLeader
@@ -668,15 +1010,9 @@ def _make_pipeline_configs(cfg):
             ldgsts_sfb_producer_warps = max(1, cfg.warp_layout.num_load_sfb_warps)
             ldgsts_sfa_producer_threads = ldgsts_sfa_producer_warps * 32
             ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncLoad
-            if cfg.uses_two_cta_mma and not cfg.is_swap_ab:
-                # The routed A scale-factor tile is split across both CTAs of
-                # the UMMA atom, while the fused S2T consumer runs only in the
-                # leading CTA.  A local cp.async mbarrier would let that
-                # consumer proceed as soon as CTA 0 finishes, racing CTA 1's
-                # half of SMEM.  Drain cp.async on each producer thread, then
-                # route all umma_cta_count * num_load_sfa_warps * 32 software
-                # arrivals to the atom leader.  The current 2-CTA/four-warp
-                # shape therefore matches TRTLLM-gen's 256-arrival barrier.
+            if not cfg.is_rubin and cfg.uses_two_cta_mma and not cfg.is_swap_ab:
+                # Blackwell drains copies in the loader, then joins both CTAs
+                # at the atom leader without a separate SF relay warp.
                 ldgsts_sfa_producer_threads *= cfg.umma_cta_count
                 ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncThread
             ldgsts_sfa_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
@@ -688,6 +1024,9 @@ def _make_pipeline_configs(cfg):
                 consumer_group=one_thread,
                 cta_layout_vmnk=cluster_vmnk,
                 consumer_signaling_threads=ldgsts_consumer_signaling,
+                consumer_wait_signaling_threads=(
+                    SignalingThreads.All if cfg.uses_ldgsts_sf_relay else None
+                ),
                 producer_op=ldgsts_sfa_producer_op,
             )
             if cfg.is_swap_ab and cfg.sfb_smem_to_tmem_copy == int(
@@ -706,7 +1045,12 @@ def _make_pipeline_configs(cfg):
                         ldgsts_sfb_producer_warps * 32,
                     ),
                     consumer_group=pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread, cfg.warp_layout.num_copy_sfb_warps * 32
+                        pipeline.Agent.Thread,
+                        32
+                        * (
+                            cfg.warp_layout.num_copy_sfb_warps
+                            + int(cfg.uses_ldgsts_sf_relay)
+                        ),
                     ),
                     cta_layout_vmnk=cluster_vmnk,
                     producer_op=pipeline.PipelineOp.AsyncLoad,
@@ -715,7 +1059,12 @@ def _make_pipeline_configs(cfg):
                 sfb_producer_threads = ldgsts_sfb_producer_warps * 32
                 sfb_producer_op = pipeline.PipelineOp.AsyncLoad
                 sfb_advance_on_acquire = False
-                if cfg.uses_two_cta_mma and cfg.is_swap_ab and cfg.tile_n >= 128:
+                if (
+                    not cfg.is_rubin
+                    and cfg.uses_two_cta_mma
+                    and cfg.is_swap_ab
+                    and cfg.tile_n >= 128
+                ):
                     sfb_producer_threads *= cfg.umma_cta_count
                     sfb_producer_op = pipeline.PipelineOp.AsyncThread
                     sfb_advance_on_acquire = True
@@ -728,6 +1077,9 @@ def _make_pipeline_configs(cfg):
                     consumer_group=one_thread,
                     cta_layout_vmnk=cluster_vmnk,
                     consumer_signaling_threads=ldgsts_consumer_signaling,
+                    consumer_wait_signaling_threads=(
+                        SignalingThreads.All if cfg.uses_ldgsts_sf_relay else None
+                    ),
                     producer_op=sfb_producer_op,
                     advance_on_wait=cfg.uses_two_cta_mma and cfg.use_combined_sfab_copy,
                     advance_on_acquire=sfb_advance_on_acquire,
@@ -829,17 +1181,29 @@ def _make_pipeline_configs(cfg):
     # CLC dynamic persistent WorkQueue pipeline
     if cfg.is_persistent:
         num_clc_consumer_threads = verifier_clc_consumer_threads(cfg)
-        workid_cfg = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
-            num_stages=cfg.num_stages_workid,
-            num_bytes=16,  # CLC response is 16 bytes
-            producer_group=one_thread,
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, num_clc_consumer_threads
-            ),
-            cta_layout_vmnk=cluster_vmnk,
-            producer_signaling_threads=SignalingThreads.CtaLeader,
-            consumer_signaling_threads=SignalingThreads.All,
-        )
+        if cfg.is_static_persistent:
+            workid_cfg = PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=cfg.num_stages_workid,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, static_queue_consumer_threads(cfg, 0)
+                ),
+                cta_layout_vmnk=None,
+                producer_signaling_threads=SignalingThreads.All,
+                consumer_signaling_threads=SignalingThreads.All,
+            )
+        else:
+            workid_cfg = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
+                num_stages=cfg.num_stages_workid,
+                num_bytes=16,  # CLC response is 16 bytes
+                producer_group=one_thread,
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, num_clc_consumer_threads
+                ),
+                cta_layout_vmnk=cluster_vmnk,
+                producer_signaling_threads=SignalingThreads.CtaLeader,
+                consumer_signaling_threads=SignalingThreads.All,
+            )
         result["workid"] = workid_cfg
         if cfg.use_work_throttle_barrier:
             result["work_throttle"] = PipelineConfig.create_async_async_pipeline_cfg(
@@ -880,10 +1244,19 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     # WorkQueue — CLC persistent or static (non-persistent)
     if cfg.is_persistent:
         tile_sched_cfg = TileSchedulerConfig(
-            tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
+            tile_scheduler_type=(
+                TileSchedulerType.StaticPersistent
+                if cfg.is_static_persistent
+                else TileSchedulerType.ClcDynamicPersistent
+            ),
             tile_scheduler_params=None,
         )
-        work_queue = BatchedGemmWorkQueue(
+        queue_type = (
+            StaticBatchedGemmWorkQueue
+            if cfg.is_static_persistent
+            else BatchedGemmWorkQueue
+        )
+        work_queue = queue_type(
             tile_scheduler_config=tile_sched_cfg,
             cfg=cfg,
             pipeline_config=pcfgs.get("workid"),
@@ -911,7 +1284,13 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     pdl_launch_resource = PdlLaunchBarrier(name="PdlLaunch") if cfg.use_pdl else None
 
     # Tasks: LoadA/LoadB (or Gather replacing one of them), MMA, Epilogue
-    proxy_cluster = None
+    proxy_cluster = (
+        ProxyClusterBarrierResource(
+            cfg=cfg, pipeline_config=pcfgs["proxy"], name="ProxyCluster"
+        )
+        if cfg.uses_ldgsts_relay
+        else None
+    )
     if cfg.has_gather:
         smem_gather = SmemGatherResource(
             cfg=cfg,
@@ -937,7 +1316,6 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 pdl_wait_resource=pdl_wait_resource,
                 pdl_launch_resource=pdl_launch_resource,
             )
-            tma_smem, gather_smem = smem_a, smem_gather
             smem_b = smem_gather
             task_list = [load_a, gather]
         else:
@@ -958,26 +1336,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 num_k_tiles,
                 work_throttle=work_throttle,
             )
-            gather_smem, tma_smem = smem_gather, smem_b
             smem_a = smem_gather
             task_list = [gather, load_b]
 
-        if cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0:
-            proxy_cluster = ProxyClusterBarrierResource(
-                cfg=cfg,
-                pipeline_config=pcfgs.get("proxy"),
-                name="ProxyCluster",
-            )
-            sync = create_sync_task(
-                cfg,
-                proxy_cluster,
-                gather_smem,
-                tma_smem,
-                work_queue,
-                num_k_tiles,
-                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
-            )
-            task_list.append(sync)
     elif cfg.has_tma_route:
         # TMA gather4: SmemTmaGatherResource replaces the activation SMEM
         smem_tma_gather = SmemTmaGatherResource(
@@ -1158,7 +1519,60 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tmem_sfa = TmemSfAResource(cfg=cfg, pipeline_config=None, name="TmemSfA")
             tmem_sfb = TmemSfBResource(cfg=cfg, pipeline_config=None, name="TmemSfB")
 
-        if cfg.fuse_operand_sf_loads:
+        if cfg.shares_ldgsts_a_sfa_pipeline:
+            _group_ldgsts_a_sfa(cfg, smem_a, smem_sfa)
+            task_list[0] = create_gather_task(
+                cfg,
+                gmem_a,
+                smem_a,
+                work_queue,
+                num_k_tiles,
+                pdl_wait_resource=pdl_wait_resource,
+                pdl_launch_resource=pdl_launch_resource,
+            )
+
+        if cfg.dense_fuse_tma_pipeline:
+            _group_dense_tma(cfg, smem_a, smem_b, smem_sfa, smem_sfb)
+            task_list = [
+                create_load_a_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    work_queue,
+                    num_k_tiles,
+                    work_throttle=work_throttle,
+                ),
+                create_load_b_task(cfg, gmem_b, smem_b, work_queue, num_k_tiles),
+            ]
+        elif cfg.uses_routed_weight_pipeline:
+            _group_dense_tma(cfg, smem_a, smem_b, smem_sfa, smem_sfb)
+        if cfg.fuse_operand_sf_loads and not cfg.is_swap_ab:
+            task_list = [
+                create_non_swap_pair_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_sfa,
+                    smem_sfa,
+                    work_queue,
+                    num_k_tiles,
+                    operand="a",
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                ),
+                create_non_swap_pair_task(
+                    cfg,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                    operand="b",
+                    work_throttle=work_throttle,
+                ),
+            ]
+        elif cfg.fuse_operand_sf_loads:
             task_list = [
                 create_fused_load_a_sfa_task(
                     cfg,
@@ -1203,20 +1617,102 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             )
             task_list += [load_sfa, load_sfb]
 
+        if cfg.dense_fuse_tma_loads:
+            if cfg.uses_routed_weight_pipeline:
+                task_list = [
+                    t for t in task_list if t.name not in ("LoadBTask", "LoadSfBTask")
+                ]
+                task_list += create_dense_pair_tma_load_tasks(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfa,
+                    smem_sfa,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                )
+            elif cfg.dense_split_tma_pipeline:
+                task_list = create_dense_pair_tma_load_tasks(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfa,
+                    smem_sfa,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                )
+            else:
+                task_list = [
+                    create_dense_tma_load_task(
+                        cfg,
+                        gmem_a,
+                        smem_a,
+                        gmem_b,
+                        smem_b,
+                        gmem_sfa,
+                        smem_sfa,
+                        gmem_sfb,
+                        smem_sfb,
+                        work_queue,
+                        num_k_tiles,
+                        work_throttle=work_throttle,
+                    )
+                ]
+
         if cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma:
             if cfg.use_combined_sfab_copy:
                 copy_sfab = create_copy_sfab_task(
-                    cfg, smem_sfa, smem_sfb, tmem_sfab, work_queue, num_k_tiles
+                    cfg,
+                    smem_sfa,
+                    smem_sfb,
+                    tmem_sfab,
+                    work_queue,
+                    num_k_tiles,
+                    relay_proxy=proxy_cluster if cfg.uses_ldgsts_sf_relay else None,
                 )
                 task_list.append(copy_sfab)
             else:
                 copy_sfa = create_copy_sfa_task(
-                    cfg, smem_sfa, tmem_sfa, work_queue, num_k_tiles
+                    cfg,
+                    smem_sfa,
+                    tmem_sfa,
+                    work_queue,
+                    num_k_tiles,
+                    relay_proxy=proxy_cluster
+                    if cfg.uses_ldgsts_sf_relay and not cfg.is_swap_ab
+                    else None,
                 )
                 copy_sfb = create_copy_sfb_task(
-                    cfg, smem_sfb, tmem_sfb, work_queue, num_k_tiles
+                    cfg,
+                    smem_sfb,
+                    tmem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                    relay_proxy=proxy_cluster
+                    if cfg.uses_ldgsts_sf_relay and cfg.is_swap_ab
+                    else None,
                 )
                 task_list += [copy_sfa, copy_sfb]
+
+    if cfg.uses_ldgsts_relay:
+        task_list.append(
+            create_sync_task(
+                cfg,
+                proxy_cluster,
+                _relay_sources(cfg, smem_a, smem_b, smem_sfa, smem_sfb),
+                work_queue,
+                num_k_tiles,
+                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
+            )
+        )
 
     # MMA task
     if cfg.has_cast_a:
@@ -1372,6 +1868,20 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         else:
             resource_dependency_graph[tmem_c] = [smem_a, smem_b]
 
+    _add_relay_dependencies(
+        cfg,
+        resource_dependency_graph,
+        proxy_cluster,
+        smem_a,
+        smem_b,
+        smem_sfa,
+        smem_sfb,
+        tmem_c,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+    )
+
     if cfg.use_deepseek_fp8 and smem_dsfp8_sfab is not None:
         # SmemDeepSeekSfAb's GMEM source is raw kernel-param pointers
         # (params.ptrSfA/ptrSfB), not an TS Gmem resource. PDL still orders
@@ -1403,7 +1913,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
 
     # SMEM allocator
-    smem_allocator = SmemAllocator()
+    smem_allocator = make_smem_allocator(cfg)
     smem_resources = (smem_a, smem_b)
     if cfg.has_cast_a:
         smem_resources = smem_resources + (smem_sfa,)
@@ -1416,6 +1926,14 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    if cutlass.const_expr(cfg.shares_ldgsts_a_sfa_pipeline):
+        smem_allocator.add_pipeline_group(smem_a.pipeline_group)
+    if cfg.uses_routed_weight_pipeline:
+        smem_allocator.add_pipeline_group(smem_b.pipeline_group)
+    if cfg.dense_fuse_tma_pipeline:
+        smem_allocator.add_pipeline_group(smem_a.pipeline_group)
+        if cfg.dense_split_tma_pipeline:
+            smem_allocator.add_pipeline_group(smem_b.pipeline_group)
     _register_pipeline_smem_resources(
         smem_allocator,
         tmem_c,
@@ -1523,7 +2041,7 @@ def _build_batched_gemm_task_manager(
         num_k_tiles=num_k_tiles,
     )
     _verify_rank_gated_register_donation(task_list)
-    return TaskManager(
+    return _BatchedGemmTaskManager(
         tasks=task_list,
         resource_dependency_graph=dep_graph,
         smem_allocator=smem_alloc,
@@ -1541,6 +2059,29 @@ def _build_batched_gemm_task_manager(
 # ---------------------------------------------------------------------------
 
 
+@dsl_user_op
+def _partitioned_tma_pointer(cfg, full, partition, *, loc=None, ip=None):
+    if (
+        cfg.dense_partition_tma_loads
+        and not cfg.has_routed_act
+        and cfg.preferred_cluster_shape[1] > 1
+    ):
+        if cfg._active_cga_shape is not None:
+            return (
+                partition.get_ptr() if cfg._active_cga_shape[1] > 1 else full.get_ptr()
+            )
+        _, dim_y, _ = cute.arch.block_in_cluster_dim()
+        selected = llvm.select(
+            (dim_y > Int32(1)).ir_value(),
+            partition.get_ptr().llvm_ptr,
+            full.get_ptr().llvm_ptr,
+            loc=loc,
+            ip=ip,
+        )
+        return cutlass.Pointer._from_raw_ptr(selected)
+    return full.get_ptr()
+
+
 @cute.jit
 def _batched_gemm_kernel_bf16_body(
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -1556,6 +2097,8 @@ def _batched_gemm_kernel_bf16_body(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -1580,6 +2123,211 @@ def _batched_gemm_kernel_bf16_body(
     tile_sched_params: object,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     early_exit_max_token_ctas: cutlass.Int32,
+    tma_a_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
+    tma_sfa_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
+) -> None:
+    # One runtime cluster-wide dispatch; all layout/mask arithmetic below is static.
+    if cutlass.const_expr(cfg.dense_specialize_tma_cga):
+        shared_smem = cutlass.Array(
+            cutlass.Uint8,
+            cfg.smem_capacity_bytes,
+            space=cutlass.AddressSpace.smem,
+            alignment=1024,
+        )
+        active_x, active_y, _ = cute.arch.block_in_cluster_dim()
+        is_preferred = active_y == Int32(cfg.preferred_cluster_shape[1])
+        if cutlass.const_expr(
+            cfg.preferred_cluster_shape[0] != cfg.fallback_cluster_shape[0]
+        ):
+            # 4x1 preferred and 2x1 fallback share Y; both dimensions identify
+            # which static barrier and multicast topology is active.
+            is_preferred = is_preferred & (
+                active_x == Int32(cfg.preferred_cluster_shape[0])
+            )
+        # Each branch constructs its own trace-time task/allocator objects.
+        # Emit the region directly so runtime AST container guards do not treat
+        # that branch-local Python bookkeeping as device-side list mutation.
+        if_generate(
+            is_preferred,
+            lambda: _batched_gemm_kernel_bf16_body_impl(
+                tma_a_desc,
+                tma_b_desc,
+                tma_c_desc,
+                tma_sfa_desc,
+                tma_sfb_desc,
+                c_tensor,
+                sf_c_tensor,
+                bias_tensor,
+                scale_c_tensor,
+                scale_gate_tensor,
+                gemm1_alpha_tensor,
+                gemm1_beta_tensor,
+                gemm1_clamp_limit_tensor,
+                finalize_scale_tensor,
+                finalize_route_tensor,
+                per_token_sf_a_tensor,
+                per_token_sf_b_tensor,
+                tile_idx_tensor,
+                route_map_tensor,
+                mn_limit_tensor,
+                num_non_exiting_ctas_tensor,
+                total_num_padded_tokens_tensor,
+                act_tensor,
+                sfa_gmem_tensor,
+                sfb_gmem_tensor,
+                finalize_out_tensor,
+                c_rows_tensor,
+                expanded_idx_tensor,
+                expert_weights_tensor,
+                problem_m,
+                c_row_stride,
+                sf_c_m_offset,
+                problem_n,
+                problem_k,
+                num_tokens,
+                num_experts,
+                tile_sched_params,
+                replace(cfg, _active_cga_shape=cfg.preferred_cluster_shape),
+                early_exit_max_token_ctas,
+                tma_a_partition_desc,
+                tma_sfa_partition_desc,
+                shared_smem=shared_smem,
+            ),
+            lambda: _batched_gemm_kernel_bf16_body_impl(
+                tma_a_desc,
+                tma_b_desc,
+                tma_c_desc,
+                tma_sfa_desc,
+                tma_sfb_desc,
+                c_tensor,
+                sf_c_tensor,
+                bias_tensor,
+                scale_c_tensor,
+                scale_gate_tensor,
+                gemm1_alpha_tensor,
+                gemm1_beta_tensor,
+                gemm1_clamp_limit_tensor,
+                finalize_scale_tensor,
+                finalize_route_tensor,
+                per_token_sf_a_tensor,
+                per_token_sf_b_tensor,
+                tile_idx_tensor,
+                route_map_tensor,
+                mn_limit_tensor,
+                num_non_exiting_ctas_tensor,
+                total_num_padded_tokens_tensor,
+                act_tensor,
+                sfa_gmem_tensor,
+                sfb_gmem_tensor,
+                finalize_out_tensor,
+                c_rows_tensor,
+                expanded_idx_tensor,
+                expert_weights_tensor,
+                problem_m,
+                c_row_stride,
+                sf_c_m_offset,
+                problem_n,
+                problem_k,
+                num_tokens,
+                num_experts,
+                tile_sched_params,
+                replace(cfg, _active_cga_shape=cfg.fallback_cluster_shape),
+                early_exit_max_token_ctas,
+                tma_a_partition_desc,
+                tma_sfa_partition_desc,
+                shared_smem=shared_smem,
+            ),
+        )
+    else:
+        _batched_gemm_kernel_bf16_body_impl(
+            tma_a_desc,
+            tma_b_desc,
+            tma_c_desc,
+            tma_sfa_desc,
+            tma_sfb_desc,
+            c_tensor,
+            sf_c_tensor,
+            bias_tensor,
+            scale_c_tensor,
+            scale_gate_tensor,
+            gemm1_alpha_tensor,
+            gemm1_beta_tensor,
+            gemm1_clamp_limit_tensor,
+            finalize_scale_tensor,
+            finalize_route_tensor,
+            per_token_sf_a_tensor,
+            per_token_sf_b_tensor,
+            tile_idx_tensor,
+            route_map_tensor,
+            mn_limit_tensor,
+            num_non_exiting_ctas_tensor,
+            total_num_padded_tokens_tensor,
+            act_tensor,
+            sfa_gmem_tensor,
+            sfb_gmem_tensor,
+            finalize_out_tensor,
+            c_rows_tensor,
+            expanded_idx_tensor,
+            expert_weights_tensor,
+            problem_m,
+            c_row_stride,
+            sf_c_m_offset,
+            problem_n,
+            problem_k,
+            num_tokens,
+            num_experts,
+            tile_sched_params,
+            cfg,
+            early_exit_max_token_ctas,
+            tma_a_partition_desc,
+            tma_sfa_partition_desc,
+        )
+
+
+@cute.jit
+def _batched_gemm_kernel_bf16_body_impl(
+    tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    c_tensor: cute.Tensor,
+    sf_c_tensor: cute.Tensor,
+    bias_tensor: cute.Tensor,
+    scale_c_tensor: cute.Tensor,
+    scale_gate_tensor: cute.Tensor,
+    gemm1_alpha_tensor: cute.Tensor,
+    gemm1_beta_tensor: cute.Tensor,
+    gemm1_clamp_limit_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
+    per_token_sf_a_tensor: cute.Tensor,
+    per_token_sf_b_tensor: cute.Tensor,
+    tile_idx_tensor: cute.Tensor,
+    route_map_tensor: cute.Tensor,
+    mn_limit_tensor: cute.Tensor,
+    num_non_exiting_ctas_tensor: cute.Tensor,
+    total_num_padded_tokens_tensor: cute.Tensor,
+    act_tensor: cute.Tensor,
+    sfa_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
+    sfb_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
+    finalize_out_tensor: cute.Tensor,
+    c_rows_tensor: cute.Tensor,
+    expanded_idx_tensor: cute.Tensor,
+    expert_weights_tensor: cute.Tensor,
+    problem_m: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
+    sf_c_m_offset: cutlass.Int32,
+    problem_n: cutlass.Int32,
+    problem_k: cutlass.Int32,
+    num_tokens: cutlass.Int32,
+    num_experts: cutlass.Int32,
+    tile_sched_params: object,
+    cfg: cutlass.Constexpr[BatchedGemmConfig],
+    early_exit_max_token_ctas: cutlass.Int32,
+    tma_a_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
+    tma_sfa_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
+    shared_smem=None,
 ) -> None:
     """GPU kernel for BF16/FP4 BatchedGemm.
 
@@ -1626,14 +2374,20 @@ def _batched_gemm_kernel_bf16_body(
             idx=Int32(0), vector_size=1
         )[0]
 
-    tma_a_ptr = tma_a_desc.get_ptr()
+    tma_a_ptr = _partitioned_tma_pointer(cfg, tma_a_desc, tma_a_partition_desc)
+    tma_sfa_ptr = None
+    if cutlass.const_expr(uses_sfa_tma_desc(cfg)):
+        assert tma_sfa_desc is not None
+        tma_sfa_ptr = _partitioned_tma_pointer(
+            cfg, tma_sfa_desc, tma_sfa_partition_desc
+        )
     tma_b_ptr = tma_b_desc.get_ptr()
     tma_c_ptr = tma_c_desc.get_ptr()
     prims.prefetch_tensormap(tma_a_ptr)
     prims.prefetch_tensormap(tma_b_ptr)
     if cutlass.const_expr(uses_sfa_tma_desc(cfg)):
         assert tma_sfa_desc is not None
-        prims.prefetch_tensormap(tma_sfa_desc.get_ptr())
+        prims.prefetch_tensormap(tma_sfa_ptr)
     if cutlass.const_expr(uses_sfb_tma_desc(cfg)):
         assert tma_sfb_desc is not None
         prims.prefetch_tensormap(tma_sfb_desc.get_ptr())
@@ -1764,6 +2518,8 @@ def _batched_gemm_kernel_bf16_body(
             name="SmemB",
         )
 
+    smem_sfa = None
+    smem_sfb = None
     tmem_c = TmemCResource(cfg=cfg, pipeline_config=pcfgs["tmem_c"], name="TmemC")
     tmem_sfa = None
     tmem_sfb = None
@@ -1772,7 +2528,6 @@ def _batched_gemm_kernel_bf16_body(
 
     if cutlass.const_expr(cfg.has_cast_a):
         assert tma_sfa_desc is not None
-        tma_sfa_ptr = tma_sfa_desc.get_ptr()
         gmem_sfa = GmemSfAResource(
             cfg=cfg,
             tile_idx_view=tile_idx_view,
@@ -1795,11 +2550,7 @@ def _batched_gemm_kernel_bf16_body(
 
     # Scale factor resources (FP4/FP8 only)
     if cutlass.const_expr(cfg.has_input_block_scaling):
-        tma_sfa_ptr = None
         tma_sfb_ptr = None
-        if cutlass.const_expr(uses_sfa_tma_desc(cfg)):
-            assert tma_sfa_desc is not None
-            tma_sfa_ptr = tma_sfa_desc.get_ptr()
         if cutlass.const_expr(uses_sfb_tma_desc(cfg)):
             assert tma_sfb_desc is not None
             tma_sfb_ptr = tma_sfb_desc.get_ptr()
@@ -2011,6 +2762,9 @@ def _batched_gemm_kernel_bf16_body(
         gemm1_alpha_tensor=gemm1_alpha_tensor,
         gemm1_beta_tensor=gemm1_beta_tensor,
         gemm1_clamp_limit_tensor=gemm1_clamp_limit_tensor,
+        finalize_scale_tensor=finalize_scale_tensor,
+        finalize_route_tensor=finalize_route_tensor,
+        num_tokens=num_tokens,
         per_token_sf_a_tensor=per_token_sf_a_tensor,
         per_token_sf_b_tensor=per_token_sf_b_tensor,
         route_map_view=cutlass.make_array_view(route_map_tensor),
@@ -2043,17 +2797,23 @@ def _batched_gemm_kernel_bf16_body(
     )
 
     proxy_cluster = None
-    if cutlass.const_expr(
-        cfg.has_gather and cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
-    ):
+    if cutlass.const_expr(cfg.uses_ldgsts_relay):
         proxy_cluster = ProxyClusterBarrierResource(
             cfg=cfg,
             pipeline_config=pcfgs.get("proxy"),
             name="ProxyCluster",
         )
 
+    if cutlass.const_expr(cfg.shares_ldgsts_a_sfa_pipeline):
+        _group_ldgsts_a_sfa(cfg, smem_a, smem_sfa)
+
+    if cutlass.const_expr(
+        cfg.dense_fuse_tma_pipeline or cfg.uses_routed_weight_pipeline
+    ):
+        _group_dense_tma(cfg, smem_a, smem_b, smem_sfa, smem_sfb)
+
     # SMEM allocator
-    smem_allocator = SmemAllocator()
+    smem_allocator = make_smem_allocator(cfg)
     smem_resources: tuple[Any, ...] = (smem_a, smem_b)
     if cutlass.const_expr(cfg.has_cast_a):
         smem_resources = smem_resources + (smem_sfa,)
@@ -2064,6 +2824,14 @@ def _batched_gemm_kernel_bf16_body(
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    if cutlass.const_expr(cfg.shares_ldgsts_a_sfa_pipeline):
+        smem_allocator.add_pipeline_group(smem_a.pipeline_group)
+    if cutlass.const_expr(cfg.uses_routed_weight_pipeline):
+        smem_allocator.add_pipeline_group(smem_b.pipeline_group)
+    if cutlass.const_expr(cfg.dense_fuse_tma_pipeline):
+        smem_allocator.add_pipeline_group(smem_a.pipeline_group)
+        if cfg.dense_split_tma_pipeline:
+            smem_allocator.add_pipeline_group(smem_b.pipeline_group)
     _register_pipeline_smem_resources(
         smem_allocator,
         tmem_c,
@@ -2145,6 +2913,8 @@ def _batched_gemm_kernel_bf16_body(
     # forbids a second one (see BatchedGemmConfig.smem_single_cta_floor_bytes).
     _add_single_cta_smem_floor(smem_allocator, cfg)
     smem_allocator.compute_layout()
+    if cutlass.const_expr(shared_smem is not None):
+        smem_allocator._smem_base = shared_smem
 
     clc_response_ptr = None
     fast_drain_response_ptr = None
@@ -2224,13 +2994,37 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
-        tile_sched_cfg = (
-            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
-                tile_scheduler_params=tile_sched_params,
+        active_sched_params = tile_sched_params
+        # N rasterization packs the shared launch grid using the preferred
+        # cluster shape. Its decoder must retain those parameters even in the
+        # specialized fallback branch; physical CTA offsets and pipeline
+        # participation still use the active shape independently.
+        if cutlass.const_expr(cfg._active_cga_shape is not None and cfg.raster_along_m):
+            active_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+                tile_sched_params.problem_shape_ntile_mnl,
+                cfg._active_cga_shape,
+                1,
+                cfg.raster_along_m,
+            )
+        if cutlass.const_expr(cfg.is_static_persistent):
+            tile_sched_cfg = TileSchedulerConfig(
+                tile_scheduler_type=TileSchedulerType.StaticPersistent,
+                tile_scheduler_params=active_sched_params,
                 response_ptr=clc_response_ptr,
             )
+        else:
+            tile_sched_cfg = (
+                TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                    tile_scheduler_params=active_sched_params,
+                    response_ptr=clc_response_ptr,
+                )
+            )
+        queue_type = (
+            StaticBatchedGemmWorkQueue
+            if cfg.is_static_persistent
+            else BatchedGemmWorkQueue
         )
-        work_queue = BatchedGemmWorkQueue(
+        work_queue = queue_type(
             tile_scheduler_config=tile_sched_cfg,
             cfg=cfg,
             num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
@@ -2306,9 +3100,32 @@ def _batched_gemm_kernel_bf16_body(
                     pdl_wait_resource=pdl_wait_resource,
                     pdl_launch_resource=pdl_launch_resource,
                 )
-            tma_smem = smem_a  # TMA resource for SyncTask
-            gather_smem = smem_b  # Gather resource for SyncTask
             task_list = [load_a, gather]
+        elif cutlass.const_expr(cfg.fuse_operand_sf_loads):
+            gather = create_non_swap_pair_task(
+                cfg,
+                gmem_a,
+                smem_a,
+                gmem_sfa,
+                smem_sfa,
+                work_queue,
+                k_tile_cnt,
+                operand="a",
+                pdl_wait_resource=pdl_wait_resource,
+                pdl_launch_resource=pdl_launch_resource,
+            )
+            load_b = create_non_swap_pair_task(
+                cfg,
+                gmem_b,
+                smem_b,
+                gmem_sfb,
+                smem_sfb,
+                work_queue,
+                k_tile_cnt,
+                operand="b",
+                work_throttle=work_throttle,
+            )
+            task_list = [gather, load_b]
         else:
             gather = create_gather_task(
                 cfg,
@@ -2327,24 +3144,8 @@ def _batched_gemm_kernel_bf16_body(
                 k_tile_cnt,
                 work_throttle=work_throttle,
             )
-            gather_smem = smem_a
-            tma_smem = smem_b
             task_list = [gather, load_b]
 
-        # 2-CTA + gather: add proxy barrier + sync task
-        if cutlass.const_expr(
-            cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
-        ):
-            sync = create_sync_task(
-                cfg,
-                proxy_cluster,
-                gather_smem,
-                tma_smem,
-                work_queue,
-                k_tile_cnt,
-                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
-            )
-            task_list.append(sync)
     else:
         load_a = create_load_a_task(
             cfg,
@@ -2435,17 +3236,87 @@ def _batched_gemm_kernel_bf16_body(
             # Separate CopySf tasks for SMEM→TMEM when SF is routed.
             if cutlass.const_expr(cfg.use_combined_sfab_copy):
                 copy_sfab = create_copy_sfab_task(
-                    cfg, smem_sfa, smem_sfb, tmem_sfab, work_queue, k_tile_cnt
+                    cfg,
+                    smem_sfa,
+                    smem_sfb,
+                    tmem_sfab,
+                    work_queue,
+                    k_tile_cnt,
+                    relay_proxy=proxy_cluster if cfg.uses_ldgsts_sf_relay else None,
                 )
                 task_list.append(copy_sfab)
             else:
                 copy_sfa = create_copy_sfa_task(
-                    cfg, smem_sfa, tmem_sfa, work_queue, k_tile_cnt
+                    cfg,
+                    smem_sfa,
+                    tmem_sfa,
+                    work_queue,
+                    k_tile_cnt,
+                    relay_proxy=proxy_cluster
+                    if cfg.uses_ldgsts_sf_relay and not cfg.is_swap_ab
+                    else None,
                 )
                 copy_sfb = create_copy_sfb_task(
-                    cfg, smem_sfb, tmem_sfb, work_queue, k_tile_cnt
+                    cfg,
+                    smem_sfb,
+                    tmem_sfb,
+                    work_queue,
+                    k_tile_cnt,
+                    relay_proxy=proxy_cluster
+                    if cfg.uses_ldgsts_sf_relay and cfg.is_swap_ab
+                    else None,
                 )
                 task_list += [copy_sfa, copy_sfb]
+
+    if cutlass.const_expr(cfg.dense_fuse_tma_loads):
+        if cutlass.const_expr(cfg.uses_routed_weight_pipeline):
+            task_list = [
+                t for t in task_list if t.name not in ("LoadBTask", "LoadSfBTask")
+            ]
+            task_list += create_dense_pair_tma_load_tasks(
+                cfg,
+                gmem_a,
+                smem_a,
+                gmem_b,
+                smem_b,
+                gmem_sfa,
+                smem_sfa,
+                gmem_sfb,
+                smem_sfb,
+                work_queue,
+                k_tile_cnt,
+            )
+        elif cfg.dense_split_tma_pipeline:
+            task_list = create_dense_pair_tma_load_tasks(
+                cfg,
+                gmem_a,
+                smem_a,
+                gmem_b,
+                smem_b,
+                gmem_sfa,
+                smem_sfa,
+                gmem_sfb,
+                smem_sfb,
+                work_queue,
+                k_tile_cnt,
+            )
+        else:
+            task_list = [
+                create_dense_tma_load_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfa,
+                    smem_sfa,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    k_tile_cnt,
+                    work_throttle=work_throttle,
+                )
+            ]
 
     # With separate CopySf: MMA consumes TmemSf, not SmemSf.
     # Otherwise MMA consumes SmemSf and does fused S2T in producer_work.
@@ -2490,6 +3361,18 @@ def _batched_gemm_kernel_bf16_body(
         else None
     )
     tmem_cast_a_for_mma = tmem_cast_a if cutlass.const_expr(cfg.has_cast_a) else None
+
+    if cutlass.const_expr(cfg.uses_ldgsts_relay):
+        task_list.append(
+            create_sync_task(
+                cfg,
+                proxy_cluster,
+                _relay_sources(cfg, smem_a, smem_b, smem_sfa, smem_sfb),
+                work_queue,
+                k_tile_cnt,
+                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
+            )
+        )
 
     mma = create_mma_task(
         cfg,
@@ -2593,14 +3476,26 @@ def _batched_gemm_kernel_bf16_body(
             resource_dependency_graph[tmem_c] = [tmem_cast_a, proxy_cluster]
         else:
             resource_dependency_graph[tmem_c] = [tmem_cast_a, smem_b]
-    elif cutlass.const_expr(
-        cfg.has_gather and cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
-    ):
+    elif cutlass.const_expr(cfg.uses_ldgsts_relay):
         # 2-CTA+gather: MMA depends on proxy (which depends on gather+TMA)
         resource_dependency_graph[proxy_cluster] = [smem_a, smem_b]
         resource_dependency_graph[tmem_c] = [proxy_cluster]
     else:
         resource_dependency_graph[tmem_c] = [smem_a, smem_b]
+
+    _add_relay_dependencies(
+        cfg,
+        resource_dependency_graph,
+        proxy_cluster,
+        smem_a,
+        smem_b,
+        smem_sfa,
+        smem_sfb,
+        tmem_c,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+    )
 
     if cutlass.const_expr(cfg.use_deepseek_fp8):
         resource_dependency_graph[smem_dsfp8_sfab] = (
@@ -2635,7 +3530,9 @@ def _batched_gemm_kernel_bf16_body(
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
     _verify_rank_gated_register_donation(task_list)
     task_manager_cls = (
-        TaskManager if _task_manager_verify_enabled() else _ProductionTaskManager
+        _BatchedGemmTaskManager
+        if _task_manager_verify_enabled()
+        else _ProductionTaskManager
     )
     task_manager = task_manager_cls(
         tasks=task_list,
@@ -2798,6 +3695,8 @@ def batched_gemm_kernel_bf16(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -2822,6 +3721,8 @@ def batched_gemm_kernel_bf16(
     tile_sched_params: object,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     early_exit_max_token_ctas: cutlass.Int32,
+    tma_a_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
+    tma_sfa_partition_desc: cutlass.GridConstant[cuda.TensorMap] = None,
 ) -> None:
     if cutlass.const_expr(_pdl_wait_completed_before_tasks(cfg)):
         cute.arch.griddepcontrol_wait()
@@ -2840,6 +3741,8 @@ def batched_gemm_kernel_bf16(
         gemm1_alpha_tensor,
         gemm1_beta_tensor,
         gemm1_clamp_limit_tensor,
+        finalize_scale_tensor,
+        finalize_route_tensor,
         per_token_sf_a_tensor,
         per_token_sf_b_tensor,
         tile_idx_tensor,
@@ -2864,12 +3767,81 @@ def batched_gemm_kernel_bf16(
         tile_sched_params,
         cfg,
         early_exit_max_token_ctas,
+        tma_a_partition_desc,
+        tma_sfa_partition_desc,
     )
 
 
 # ---------------------------------------------------------------------------
 # Host-side launcher
 # ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def _prepared_tensor_map(
+    storage, slot, prepare_only, *, tensor=None, loc=None, ip=None, **kwargs
+):
+    """Encode once into owned host storage, or pass that descriptor by value.
+
+    CUDA copies grid-constant descriptors into launch parameters, so the host
+    storage needs no device allocation or synchronization on the launch path.
+    """
+    if storage is not None and not prepare_only:
+        return cuda.TensorMap(
+            cuda_ir.cast(
+                cuda.TensorMap._get_mlir_type(),
+                (storage + slot * 128).llvm_ptr,
+                loc=loc,
+                ip=ip,
+            )
+        )
+    if tensor is None:
+        desc = cuda.create_tensor_map_tiled(**kwargs, loc=loc, ip=ip)
+    else:
+        desc = cuda.create_tensor_map_tiled_from_tensor(
+            tensor=tensor, **kwargs, loc=loc, ip=ip
+        )
+    if storage is not None:
+        llvm.intr_memcpy(
+            (storage + slot * 128).llvm_ptr,
+            desc.get_ptr().llvm_ptr,
+            cutlass.Int64(128).ir_value(),
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    return desc
+
+
+@dsl_user_op
+def _prepared_a_tensor_map(
+    cfg, storage, slot, prepare_only, *, loc=None, ip=None, **kwargs
+):
+    """Apply the same activation promotion to full and partitioned maps.
+
+    256-byte promotion improves the measured short-K dense workload when
+    paired with A/SFA retention. Keep weights and scale maps independent.
+    """
+    promotion = {
+        0: cuda.TensorMapL2Promotion.none,
+        128: cuda.TensorMapL2Promotion.l2_128b,
+        256: cuda.TensorMapL2Promotion.l2_256b,
+    }[cfg.dense_a_l2_promotion]
+    return _prepared_tensor_map(
+        storage,
+        slot,
+        prepare_only,
+        l2_promotion=promotion,
+        loc=loc,
+        ip=ip,
+        **kwargs,
+    )
+
+
+@cute.jit
+def prepare_gemm_descriptors(args: tuple, cfg: cutlass.Constexpr):
+    """Separate host entry so preparation and launch have distinct IR dumps."""
+    gemm(*args[:-2], cfg, args[-2], args[-1], True)
 
 
 @cute.jit
@@ -2897,14 +3869,18 @@ def gemm(
     finalize_out_raw_ptr: cute.Pointer,  # MoE output (fused finalize only)
     expanded_idx_raw_ptr: cute.Pointer,  # Int32 expanded-to-permuted map (fused finalize)
     expert_weights_raw_ptr: cute.Pointer,  # routing weights (fused finalize only)
+    finalize_scale_raw_ptr,
+    finalize_route_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     c_row_stride: cutlass.Int32,
     sf_c_m_offset: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     stream,
+    tma_desc_storage=None,
+    prepare_only: cutlass.Constexpr = False,
 ):
-    """Host-side: create TMA descs and launch kernel."""
+    """Prepare workspace descriptors or launch with already prepared descriptors."""
     m, n, k, num_experts_dim, num_tokens = problem_size
     compute_warp_layout(cfg)
     validate_config(cfg, problem_mnk=(m, n, k))
@@ -2916,6 +3892,12 @@ def gemm(
     sfb_ptr = sfb_raw_ptr
     per_token_sf_a_ptr = per_token_sf_a_raw_ptr
     per_token_sf_b_ptr = per_token_sf_b_raw_ptr
+
+    # TensorMap encoding converts element strides to bits before bytes. Keep
+    # matrix strides in 64 bits: even a 13312x65536 FP4 matrix overflows the
+    # intermediate signed 32-bit bit stride (including when L == 1).
+    matrix_stride_a = cute.assume(cutlass.Int64(m) * k, 32)
+    matrix_stride_b = cute.assume(cutlass.Int64(n) * k, 32)
 
     # TMA route (gather4) reads compact (K, num_tokens) input storage.
     # GEMM M/N include routing padding and must not define its source bounds.
@@ -2937,8 +3919,8 @@ def gemm(
             stride=(
                 1,
                 a_block_k,
-                cute.assume(m * a_block_k, 32),
-                cute.assume(m * k, 32),
+                cute.assume(cutlass.Int64(m) * a_block_k, 32),
+                matrix_stride_a,
             ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
@@ -2950,7 +3932,7 @@ def gemm(
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
         a_layout = cute.make_layout(
             (64, m, cute.assume(k // 64, 1), num_experts_dim),
-            stride=(1, cute.assume(k, 32), 64, cute.assume(m * k, 32)),
+            stride=(1, cute.assume(k, 32), 64, matrix_stride_a),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
@@ -2962,7 +3944,7 @@ def gemm(
     else:
         a_layout = cute.make_layout(
             (cute.assume(k, 32), m, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(m * k, 32)),
+            stride=(1, cute.assume(k, 32), matrix_stride_a),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
 
@@ -2973,8 +3955,8 @@ def gemm(
             stride=(
                 1,
                 b_block_k,
-                cute.assume(n * b_block_k, 32),
-                cute.assume(n * k, 32),
+                cute.assume(cutlass.Int64(n) * b_block_k, 32),
+                matrix_stride_b,
             ),
         )
     elif cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
@@ -2989,7 +3971,7 @@ def gemm(
     else:
         b_layout = cute.make_layout(
             (cute.assume(k, 32), n, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(n * k, 32)),
+            stride=(1, cute.assume(k, 32), matrix_stride_b),
         )
     b_tensor = cute.make_tensor(b_ptr, b_layout)
 
@@ -3009,7 +3991,11 @@ def gemm(
 
     if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
         a_tile_block_k = cfg.block_major_k_tile_block_elems
-        tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_a_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            0,
+            prepare_only,
             tensor=a_tensor,
             box_dims=(
                 a_tile_block_k,
@@ -3022,7 +4008,11 @@ def gemm(
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(routed_act_is_compact and not cfg.is_swap_ab):
-        tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_a_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            0,
+            prepare_only,
             tensor=a_tensor,
             box_dims=(a_box_k, 1),
             stride_order=(0, 1),
@@ -3030,7 +4020,11 @@ def gemm(
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
-        tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_a_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            0,
+            prepare_only,
             tensor=a_tensor,
             box_dims=(64, cfg.tile_m, cfg.tile_k // 64, 1),
             stride_order=(0, 1, 2, 3),
@@ -3038,7 +4032,11 @@ def gemm(
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
-        tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_a_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            0,
+            prepare_only,
             tensor=a_tensor,
             box_dims=(a_box_k, cfg.tile_m, 1, 1),
             stride_order=(0, 1, 2, 3),
@@ -3046,7 +4044,11 @@ def gemm(
             tma_format=tma_format_a,
         )
     else:
-        tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_a_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            0,
+            prepare_only,
             tensor=a_tensor,
             box_dims=(a_box_k, cfg.tile_m, 1),
             stride_order=(0, 1, 2),
@@ -3055,7 +4057,10 @@ def gemm(
         )
 
     if cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
-        tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
+        tma_b_desc = _prepared_tensor_map(
+            tma_desc_storage,
+            1,
+            prepare_only,
             tensor=b_tensor,
             box_dims=(b_box_k, 1),
             stride_order=(0, 1),
@@ -3068,7 +4073,10 @@ def gemm(
             b_box_rows = cfg.tile_n // cfg.umma_cta_count
         if cutlass.const_expr(cfg.uses_block_major_k_weight_b):
             b_tile_block_k = cfg.block_major_k_tile_block_elems
-            tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_b_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                1,
+                prepare_only,
                 tensor=b_tensor,
                 box_dims=(
                     b_tile_block_k,
@@ -3081,7 +4089,10 @@ def gemm(
                 tma_format=tma_format_b,
             )
         elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
-            tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_b_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                1,
+                prepare_only,
                 tensor=b_tensor,
                 box_dims=(b_box_k, b_box_rows, 1, 1),
                 stride_order=(0, 1, 2, 3),
@@ -3089,7 +4100,10 @@ def gemm(
                 tma_format=tma_format_b,
             )
         else:
-            tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_b_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                1,
+                prepare_only,
                 tensor=b_tensor,
                 box_dims=(b_box_k, b_box_rows, 1),
                 stride_order=(0, 1, 2),
@@ -3136,7 +4150,10 @@ def gemm(
             sfa_tensor = cute.make_tensor(
                 cute.recast_ptr(sfa_ptr, dtype=sf_tma_ptr_dtype), sfa_2d_layout
             )
-            tma_sfa_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_sfa_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                3,
+                prepare_only,
                 tensor=sfa_tensor,
                 box_dims=(sf_k_per_tile, 1),
                 stride_order=(0, 1),
@@ -3158,7 +4175,10 @@ def gemm(
                 # The split keeps the 512B scale-factor block TMA-legal and is
                 # used for NVFP4 as well as MX/CastA paths.
                 sfa_outer_tiles = (sfa_outer_rows + 127) // 128
-                tma_sfa_desc = cuda.create_tensor_map_tiled(
+                tma_sfa_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    3,
+                    prepare_only,
                     global_address=sfa_ptr.toint(),
                     dtype=cutlass.Uint8,
                     tma_format=cuda.TensorMapDataFormat.BYTE,
@@ -3194,7 +4214,10 @@ def gemm(
                     ),
                 )
                 sfa_tensor_fp16 = cute.make_tensor(sfa_ptr_fp16, sfa_layout)
-                tma_sfa_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_sfa_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    3,
+                    prepare_only,
                     tensor=sfa_tensor_fp16,
                     box_dims=(sfa_dim0, rest_k_per_tile, 1),
                     stride_order=(0, 1, 2),
@@ -3215,7 +4238,10 @@ def gemm(
             sfb_tensor = cute.make_tensor(
                 cute.recast_ptr(sfb_ptr, dtype=sf_tma_ptr_dtype), sfb_2d_layout
             )
-            tma_sfb_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_sfb_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                4,
+                prepare_only,
                 tensor=sfb_tensor,
                 box_dims=(sf_k_per_tile, 1),
                 stride_order=(0, 1),
@@ -3228,6 +4254,8 @@ def gemm(
             if cutlass.const_expr(cfg.uses_split_r128c4_sfb_tma_desc):
                 sfb_outer_tiles = (sfb_outer_rows + 127) // 128
                 sfb_tile_outer = (cfg.tile_n + 127) // 128
+                if cutlass.const_expr(cfg.dense_partition_tma_loads):
+                    sfb_tile_outer //= 2
                 sfb_layout = cute.make_layout(
                     (256, 2, cute.assume(rest_k_blocks, 4), sfb_outer_tiles),
                     stride=(
@@ -3241,7 +4269,10 @@ def gemm(
                     cute.recast_ptr(sfb_ptr, dtype=sf_tma_ptr_dtype),
                     sfb_layout,
                 )
-                tma_sfb_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_sfb_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    4,
+                    prepare_only,
                     tensor=sfb_tensor,
                     box_dims=(256, 2, rest_k_per_tile, sfb_tile_outer),
                     stride_order=(0, 1, 2, 3),
@@ -3267,7 +4298,10 @@ def gemm(
                     cute.recast_ptr(sfb_ptr, dtype=sf_tma_ptr_dtype),
                     sfb_layout,
                 )
-                tma_sfb_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_sfb_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    4,
+                    prepare_only,
                     tensor=sfb_tensor,
                     box_dims=(32, rest_k_per_tile, sfb_outer_per_tile),
                     stride_order=(0, 1, 2),
@@ -3291,13 +4325,50 @@ def gemm(
                     ),
                 )
                 sfb_tensor_fp16 = cute.make_tensor(sfb_ptr_fp16, sfb_layout)
-                tma_sfb_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_sfb_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    4,
+                    prepare_only,
                     tensor=sfb_tensor_fp16,
                     box_dims=(sfb_dim0, rest_k_per_tile, 1),
                     stride_order=(0, 1, 2),
                     swizzle=cuda.TensorMapSwizzle.none,
                     tma_format=cuda.TensorMapDataFormat.DEFAULT,
                 )
+
+    # Preferred Y issuers multicast disjoint A rows / SFA K blocks. The
+    # 2x1 fallback keeps the full descriptors; both share the same SMEM tile.
+    tma_a_partition_desc = None
+    tma_sfa_partition_desc = None
+    if cutlass.const_expr(
+        cfg.dense_partition_tma_loads
+        and not cfg.has_routed_act
+        and cfg.preferred_cluster_shape[1] > 1
+    ):
+        partitions = cfg.preferred_cluster_shape[1]
+        tma_a_partition_desc = _prepared_a_tensor_map(
+            cfg,
+            tma_desc_storage,
+            5,
+            prepare_only,
+            tensor=a_tensor,
+            box_dims=(a_box_k, cfg.tile_m // partitions, 1),
+            stride_order=(0, 1, 2),
+            swizzle=a_tma_swizzle,
+            tma_format=tma_format_a,
+        )
+        tma_sfa_partition_desc = _prepared_tensor_map(
+            tma_desc_storage,
+            6,
+            prepare_only,
+            global_address=sfa_ptr.toint(),
+            dtype=cutlass.Uint8,
+            tma_format=cuda.TensorMapDataFormat.BYTE,
+            global_dims=(256, 2, cute.assume(rest_k_blocks, 4), sfa_outer_tiles),
+            global_strides=(16, 32, cute.assume(32 * rest_k_blocks, 128)),
+            box_dims=(256, 2, rest_k_per_tile // partitions, 1),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
 
     # Grid and tile scheduler
     num_tiles_m = (m + cfg.tile_m - 1) // cfg.tile_m
@@ -3313,7 +4384,17 @@ def gemm(
     cluster_shape = cfg.preferred_cluster_shape
     fallback_cluster_shape = cfg.fallback_cluster_shape
 
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(cfg.is_static_persistent):
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            (launch_num_tiles_m, launch_num_tiles_n, 1),
+            cluster_shape,
+            raster_along_m=cfg.raster_along_m,
+            fallback_cluster_shape_mnk=fallback_cluster_shape,
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, Int32(cfg.static_persistent_clusters)
+        )
+    elif cutlass.const_expr(cfg.is_persistent):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
@@ -3384,9 +4465,16 @@ def gemm(
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
+        row_multiple = 16
+        if cutlass.const_expr(cfg.narrow_gated_store_cols is not None):
+            row_multiple = cfg.narrow_gated_store_cols
+        row_width = cute.assume(output_n_for_c, row_multiple)
         c_layout = cute.make_layout(
-            (cute.assume(m, 32), cute.assume(output_n_for_c, 16)),
-            stride=(cute.assume(output_n_for_c, 16), 1),
+            (
+                num_tokens if cfg.fuse_moe_finalize else cute.assume(m, 32),
+                row_width,
+            ),
+            stride=(row_width, 1),
         )
     if cutlass.const_expr(cfg.has_output_block_scaling or cfg.uses_fp8_output):
         c_quant_dtype = (
@@ -3409,15 +4497,21 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.B4X16
             tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
             if cutlass.const_expr(not cfg.is_swap_ab):
-                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_c_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    2,
+                    prepare_only,
                     tensor=c_tensor,
-                    box_dims=(cfg.tile_m, tma_store_cols),
+                    box_dims=(128, tma_store_cols),
                     stride_order=(1, 0),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
                 )
             elif cutlass.const_expr(cfg.use_tma_oob_opt):
-                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_c_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    2,
+                    prepare_only,
                     tensor=c_tensor,
                     box_dims=(cfg.swap_tma_store_rows, tma_store_cols, 1, 1),
                     stride_order=(0, 1, 2, 3),
@@ -3425,7 +4519,10 @@ def gemm(
                     tma_format=tma_c_format,
                 )
             else:
-                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_c_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    2,
+                    prepare_only,
                     tensor=c_tensor,
                     box_dims=(cfg.swap_tma_store_rows, tma_store_cols),
                     stride_order=(0, 1),
@@ -3437,7 +4534,7 @@ def gemm(
             # descriptor so the common kernel signature stays stable.
             tma_c_desc = tma_a_desc
     else:
-        if cutlass.const_expr(not cfg.use_tma_store):
+        if cutlass.const_expr(not cfg.use_tma_store or cfg.fuse_moe_finalize):
             # Direct STG paths never consume a C TensorMap. Reuse an existing
             # valid descriptor as the placeholder required by the common
             # kernel signature. Besides avoiding unnecessary setup, this is
@@ -3451,7 +4548,10 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
             tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
             if cutlass.const_expr(cfg.use_tma_oob_opt):
-                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_c_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    2,
+                    prepare_only,
                     tensor=c_tensor,
                     box_dims=(cfg.swap_tma_store_rows, tma_store_cols, 1, 1),
                     stride_order=(0, 1, 2, 3),
@@ -3459,7 +4559,10 @@ def gemm(
                     tma_format=tma_c_format,
                 )
             else:
-                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                tma_c_desc = _prepared_tensor_map(
+                    tma_desc_storage,
+                    2,
+                    prepare_only,
                     tensor=c_tensor,
                     box_dims=(cfg.swap_tma_store_rows, tma_store_cols),
                     stride_order=(0, 1),
@@ -3472,9 +4575,12 @@ def gemm(
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
             tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
-            tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tma_c_desc = _prepared_tensor_map(
+                tma_desc_storage,
+                2,
+                prepare_only,
                 tensor=c_tensor,
-                box_dims=(cfg.tile_m, tma_store_cols),
+                box_dims=(128, tma_store_cols),
                 stride_order=(1, 0),
                 swizzle=tma_c_swizzle,
                 tma_format=tma_c_format,
@@ -3543,6 +4649,19 @@ def gemm(
         global_scale_layout,
     )
 
+    # Coefficients are scalar-indexed through the expanded route ID. Their
+    # token/top-k extent is validated by the host adapter.
+    finalize_route_tensor = None
+    finalize_scale_tensor = None
+    if cutlass.const_expr(cfg.is_rubin):
+        finalize_route_tensor = cute.make_tensor(
+            finalize_route_raw_ptr,
+            cute.make_layout((m if cfg.fuse_moe_finalize else 1,)),
+        )
+        finalize_scale_tensor = cute.make_tensor(
+            finalize_scale_raw_ptr, cute.make_layout((1,))
+        )
+
     if cutlass.const_expr(cfg.per_token_sf_dtype == int(DType.BF16)):
         per_token_sf_dtype = cutlass.BFloat16
     elif cutlass.const_expr(cfg.per_token_sf_dtype == int(DType.FP16)):
@@ -3572,8 +4691,10 @@ def gemm(
     tile_idx_layout = cute.make_layout((num_token_cgas,), stride=(1,))
     tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
 
-    # Route map (gather and fused finalize only; dummy 1-element when off)
-    if cutlass.const_expr(cfg.has_routed_act or cfg.fused_finalize_top_k):
+    # Route map serves input gather and both FC2 finalize epilogues.
+    if cutlass.const_expr(
+        cfg.has_routed_act or cfg.fused_finalize_top_k or cfg.fuse_moe_finalize
+    ):
         num_total_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
         route_map_layout = cute.make_layout((num_total_tokens,), stride=(1,))
     else:
@@ -3673,6 +4794,9 @@ def gemm(
     expanded_idx_tensor = cute.make_tensor(expanded_idx_raw_ptr, expanded_layout)
     expert_weights_tensor = cute.make_tensor(expert_weights_raw_ptr, expanded_layout)
 
+    if cutlass.const_expr(prepare_only):
+        return
+
     kernel = batched_gemm_kernel_bf16(
         tma_a_desc,
         tma_b_desc,
@@ -3687,6 +4811,8 @@ def gemm(
         gemm1_alpha_tensor,
         gemm1_beta_tensor,
         gemm1_clamp_limit_tensor,
+        finalize_scale_tensor,
+        finalize_route_tensor,
         per_token_sf_a_tensor,
         per_token_sf_b_tensor,
         tile_idx_tensor,
@@ -3711,6 +4837,8 @@ def gemm(
         tile_sched_params,
         cfg,
         early_exit_max_token_ctas,
+        tma_a_partition_desc,
+        tma_sfa_partition_desc,
     )
     if cutlass.const_expr(cfg.fallback_cluster_shape is not None):
         # Flexible launch: CUDA may select either complete physical shape.

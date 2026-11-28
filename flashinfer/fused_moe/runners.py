@@ -7752,8 +7752,9 @@ CakeStepFunRunner.supported_activation_classes_by_quant = {
 class PrimsTsRunner(_TrtllmRunnerBase):
     """Unified adapter over the inner ``PrimsTs*MoERunner`` classes.
 
-    Routing and finalize stay on the TRT-LLM Gen module loaded by
-    ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
+    Routing uses the TRT-LLM Gen module. Rubin non-swap-AB 512/1024 tactics
+    can fuse finalize into FC2.
+    Other tactics retain the separate finalizer. GEMMs use the Prims-TS CuTe-DSL
     batched path. Weight and activation layouts match the corresponding
     TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
     shuffled with epilogue tile 64, and the BlockMajorK MXFP4×MXFP8 weights
@@ -7814,7 +7815,10 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
-        from flashinfer.prims_ts.utils import is_prims_ts_available
+        from flashinfer.prims_ts.utils import (
+            is_prims_ts_arch_available,
+            is_prims_ts_available,
+        )
         from flashinfer.tllm_enums import RoutingMethodType
         from flashinfer.utils import get_compute_capability
 
@@ -7827,8 +7831,19 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         arch = compute_capability[0] * 10 + compute_capability[1]
         if arch not in _PRIMS_TS_ARCHS:
             raise NotImplementedError(
-                f"{type(self).__name__} is enabled only on SM100/SM103, "
+                f"{type(self).__name__} is enabled only on SM100/SM103/SM107, "
                 f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+        if arch == 107 and not is_prims_ts_arch_available(*compute_capability):
+            raise RuntimeError(
+                f"PrimsTsRunner requires a CuTe DSL that natively targets SM{arch}."
+            )
+        if arch == 107 and self.config.quant.pair != (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+        ):
+            raise NotImplementedError(
+                "PrimsTsRunner on SM107 is qualified for NVFP4×NVFP4 only."
             )
         if self.config.experts.intermediate_size % 128 != 0:
             raise NotImplementedError(
@@ -7918,19 +7933,115 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
-    def _weight_layout(self, view: Optional[dict] = None) -> int:
+    def _cache_key_extras(self) -> tuple:
+        extras = super()._cache_key_extras()
+        if self._is_rubin_nvfp4():
+            extras += (self.config.finalize.use_fused_finalize,)
+        return (*extras, get_compute_capability(self.device))
+
+    def legacy_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Older Blackwell entries used the base MoE key without architecture or layout."""
+        if get_compute_capability(self.device) in ((10, 0), (10, 3)):
+            return (super()._cache_key_extras(),)
+        return ()
+
+    def validate_cached_tactic(self, inputs, tactic) -> bool:
+        """Check launch compatibility, including tactics outside today's tuning shortlist."""
+        from .shared.inputs import MoeRunnerInputs
+
+        state = self.launch_state_for(inputs)
+        if not isinstance(state, _TrtllmLaunchState) or self._inner is None:
+            return False
+        try:
+            self._inner._check_tactic_geometry(
+                tactic, MoeRunnerInputs.from_list(inputs), state.static_kwargs
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+        return True
+
+    def validate_tactic(self, inputs, tactic) -> bool:
+        state = self.launch_state_for(inputs)
+        if isinstance(state, _TrtllmLaunchState) and self._expert_bias_key(
+            state.static_kwargs
+        ):
+            return self.validate_cached_tactic(inputs, tactic)
+        return True
+
+    def _expert_bias_key(self, options: Mapping[str, Any]) -> tuple:
+        fc1 = options.get("gemm1_bias") is not None
+        fc2 = options.get("gemm2_bias") is not None
+        if (fc1 or fc2) and self._is_rubin_nvfp4():
+            return ("expert_bias", fc1, fc2)
+        return ()
+
+    def _effective_fused_finalize(self, **overrides) -> bool:
+        """Resolve the call mode before packing with the execution predicate."""
+        if not self._is_rubin_nvfp4():
+            return False
+        from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_requested
+
+        options = dict(
+            use_fused_finalize=self.config.finalize.use_fused_finalize,
+            do_finalize=self.config.finalize.do_finalize,
+        )
+        options.update(overrides)
+        return fused_finalize_requested(self._inner or self, options)
+
+    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        if self._pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return ()
+        state = self.launch_state_for(inputs)
+        options = state.static_kwargs if isinstance(state, _TrtllmLaunchState) else {}
+        extras: tuple = ("weight_layout", options["weight_layout"]) if options else ()
+        if self._is_rubin_nvfp4():
+            extras += (
+                "effective_fused_finalize",
+                self._effective_fused_finalize(**options),
+            ) + self._expert_bias_key(options)
+        return extras
+
+    def _is_rubin_nvfp4(self) -> bool:
+        return self._pair == (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+        ) and get_compute_capability(self.device) == (10, 7)
+
+    def _weight_layout(self, view: dict) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
             return int(WeightLayout.BlockMajorK)
         # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
         # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
-        is_fp4 = self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
-        if is_fp4 and view is not None and view["gemm1_weights"].dim() == 4:
+        if (
+            self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+            and view["gemm1_weights"].dim() == 4
+        ):
             return int(WeightLayout.BlockMajorK)
         return int(WeightLayout.MajorK)
 
-    def _ensure_inner(self, hidden_size: int) -> None:
+    def _validate_fp4_tensors(self, act, view, hidden_size):
+        if self._is_rubin_nvfp4():
+            if view["gemm1_weights"].dim() != view["gemm2_weights"].dim():
+                raise ValueError(
+                    "gemm1_weights and gemm2_weights must use the same layout."
+                )
+            for name, k in (
+                ("gemm1_weights", hidden_size),
+                ("gemm2_weights", self._intermediate_size),
+            ):
+                weight = view[name]
+                if weight.dim() == 4 and (
+                    k % 256 or weight.size(-1) != 128 or not weight.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must have contiguous BlockMajorK storage with "
+                        "128-byte K blocks and K divisible by 256."
+                    )
+        return super()._validate_fp4_tensors(act, view, hidden_size)
+
+    def _ensure_inner(self, hidden_size: int, weight_layout: int) -> None:
         self._require_built()
         if self._inner is not None:
             return
@@ -7955,7 +8066,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             intermediate_size=self._intermediate_size,
             activation_type=self._activation_type,
             use_shuffled_weight=True,
-            weight_layout=self._weight_layout(),
+            weight_layout=weight_layout,
             num_experts=self.config.routing.num_experts,
         )
         pair = self._pair
@@ -7965,6 +8076,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._inner = PrimsTsNvfp4MoERunner(
                 **common,
                 use_per_token_scaling=self._per_token,
+                use_fused_finalize=self.config.finalize.use_fused_finalize,
             )
         elif pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             self._inner = PrimsTsMxfp4Mxfp8MoERunner(**common)
@@ -7992,8 +8104,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
-        # Under autotune the pack's ``inputs_pre_hook`` has already synced the
-        # inner extras; a direct call with the packed list syncs here.
+        # Profiling inputs retain the candidate's immutable launch state, even
+        # if another forward has updated the inner runner since preparation.
         self._sync_inner_static_extras(getattr(inputs, "launch_state", None))
         return self._inner.get_valid_tactics(inputs, profile)
 
@@ -8011,6 +8123,23 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._inner.weight_layout = WeightLayout(
                 launch_state.static_kwargs["weight_layout"]
             )
+
+    def _bind_tuning_config(
+        self, tuning_config: TuningConfig, launch_state: _TrtllmLaunchState
+    ) -> TuningConfig:
+        # The autotuner calls get_valid_tactics(tensors, profile) with no
+        # launch kwargs, but runs inputs_pre_hook first; retain this pack's
+        # static extras on the synthesized inputs through the cache write.
+        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
+
+        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            tensors = inner_hook(tensors) if inner_hook is not None else tensors
+            return _TrtllmPackedInputs(
+                tensors, tuning_config=tuning_config, launch_state=launch_state
+            )
+
+        return dataclasses.replace(tuning_config, inputs_pre_hook=_bind_static_extras)
 
     def precompile_tactics(
         self,
@@ -8309,7 +8438,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 ),
             )
 
-        self._ensure_inner(hidden_size)
+        self._ensure_inner(hidden_size, static_kwargs["weight_layout"])
         if is_nvfp4:
             support_fn = is_prims_ts_nvfp4_supported
         elif pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
@@ -8338,18 +8467,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             tuning_kwargs["act_sf_layout"] = SfLayout.layout_linear
         tuning_config = self._inner._make_tuning_config(moe_inputs, **tuning_kwargs)
         launch_state = _TrtllmLaunchState(static_kwargs)
-        # The autotuner calls get_valid_tactics(tensors, profile) with no
-        # launch kwargs, but runs inputs_pre_hook first; bind this pack's
-        # static extras there so tuning never reads another pack's state.
-        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
-
-        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
-            return inner_hook(tensors) if inner_hook is not None else tensors
-
-        tuning_config = dataclasses.replace(
-            tuning_config, inputs_pre_hook=_bind_static_extras
-        )
+        tuning_config = self._bind_tuning_config(tuning_config, launch_state)
         return _TrtllmPackedInputs(
             moe_inputs.to_list(),
             tuning_config=tuning_config,

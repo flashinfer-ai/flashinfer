@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import contextlib
+import gc
 from types import SimpleNamespace
 from unittest import mock
+import weakref
 
 import pytest
 import torch
@@ -25,20 +27,27 @@ from flashinfer.prims_ts.moe import compile_cache
 
 @pytest.mark.cpu_only
 def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, request):
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
     compiled = []
     target = [(0, "sm100a")]
 
-    def fake_compile(cfg_hash, fc1_or_fc2, io, stream, device_index):
+    def fake_compile(cfg_hash, fc1_or_fc2, io, stream, device_index, *, reencode_tma):
         result = object()
         compiled.append((io, stream, result))
-        return result
+        return compile_cache._CompiledGemm(result)
 
     monkeypatch.setattr(compile_cache, "_compile_target_key", lambda _io: target[0])
+    monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
     monkeypatch.setattr(compile_cache, "_compile_or_load", fake_compile)
+    monkeypatch.setattr(
+        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream, **kw: None
+    )
     compile_cache._COMPILED_GEMM_CACHE.clear()
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)
 
-    io = {"cfg": object()}
+    io = {"cfg": SimpleNamespace(is_rubin=False)}
     first = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
     assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is first
 
@@ -47,9 +56,18 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     target[0] = (1, "sm103a")
     third = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
 
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "1")
+    assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is third
+
+    target[0] = (1, "sm107a")
+    io["cfg"] = SimpleNamespace(is_rubin=True)
+    reencoded = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
+    assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is not reencoded
+
     assert first is not second
     assert second is not third
-    assert len(compiled) == 3
+    assert len(compiled) == 5
 
 
 def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> dict:
@@ -92,7 +110,13 @@ def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> d
     io["shape"] = shape or (4608, 1024, 5120, 48, 128)
     io["launch_early_exit_max_token_ctas"] = 96
     io["c_row_stride"] = io["shape"][0]
-    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0)
+    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0, is_rubin=True)
+    io["tma_desc_storage_dp"] = make_ptr(
+        cutlass.Uint8,
+        address + 8192,
+        cutlass.AddressSpace.generic,
+        assumed_align=64,
+    )
     return io
 
 
@@ -129,6 +153,9 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
         cutlass.BFloat16, 1 << 20, cutlass.AddressSpace.gmem, assumed_align=16
     )
     others.append(compile_cache._disk_kernel_name("cfg", "fc1", io))
+    io = _fake_launch_io()
+    io["tma_desc_storage_dp"] = None
+    others.append(compile_cache._disk_kernel_name("cfg", "fc1", io))
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 3")
     others.append(compile_cache._disk_kernel_name("cfg", "fc1", _fake_launch_io()))
     monkeypatch.delenv("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS")
@@ -143,6 +170,11 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_compiled_gemm_targets_the_launch_device(monkeypatch, request, tmp_path):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    monkeypatch.setattr(
+        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream, **kw: None
+    )
     # The launch tensors live on device 1 (SM103) while device 0 (SM100) is
     # current: the GEMM must be keyed, named, compiled and persisted for SM103.
     capabilities = {0: (10, 0), 1: (10, 3)}
@@ -193,20 +225,243 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request, tmp_path)
     ((key, compiled),) = compile_cache._COMPILED_GEMM_CACHE.items()
     assert key[-2:] == (1, "sm103a")
     ((spec, compile_device),) = specs
-    assert compiled is spec
+    assert compiled.kernel is spec
     assert compile_device == 1
     assert spec.module_dir_name == f"{compile_cache._DISK_MODULE_NAME}_sm103a_cute_dsl"
     assert spec.expected_meta["arch"] == "sm103a"
     assert spec.kernel_name.startswith("fc1_sm103_")
 
-    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
-
     monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: None)
     monkeypatch.setattr(
-        batched_gemm_run, "_compile_for_launch", lambda io, stream: current[0]
+        batched_gemm_run,
+        "_compile_for_launch",
+        lambda io, stream, *, reencode_tma: current[0],
     )
     with mock.patch.object(
         cute_dsl_core, "_compile_in_process", wraps=cute_dsl_core._compile_in_process
     ) as guarded:
         assert compile_cache.get_compiled_gemm("uncacheable", "fc1", io, None) == 1
         guarded.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_compiled_gemm_cache_prepares_new_workspace_on_cache_hit(monkeypatch, request):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    compiled = []
+    prepared = []
+    current = [0]
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
+    preparer = object()
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current[0] = current[0], index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def prepare(io, stream, *, reencode_tma, prepare=None):
+        assert reencode_tma is False
+        assert current[0] == 1
+        assert prepare is None or prepare is preparer
+        io["descriptor_binding"] = io["binding"]
+        prepared.append((io, stream))
+        return preparer
+
+    def compile_for_launch(
+        cfg_hash, fc1_or_fc2, io, stream, device_index, *, reencode_tma
+    ):
+        with device(device_index):
+            prepare(io, stream, reencode_tma=reencode_tma)
+        fn = object()
+        compiled.append(fn)
+        return compile_cache._CompiledGemm(fn, preparer)
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(compile_cache, "_compile_target_key", lambda io: (1, "sm107a"))
+    monkeypatch.setattr(compile_cache, "_compile_or_load", compile_for_launch)
+    monkeypatch.setattr(batched_gemm_run, "_prepare_tma_descriptors", prepare)
+    compile_cache.clear_compiled_gemm_cache()
+    request.addfinalizer(compile_cache.clear_compiled_gemm_cache)
+
+    first_io = {"cfg": SimpleNamespace(is_rubin=True), "binding": "first shard"}
+    second_io = {"cfg": SimpleNamespace(is_rubin=True), "binding": "second shard"}
+    first = compile_cache.get_compiled_gemm("cfg", "fc1", first_io, "first stream")
+    second = compile_cache.get_compiled_gemm("cfg", "fc1", second_io, "second stream")
+    assert first is second
+    assert len(compiled) == 1
+    assert second_io["descriptor_binding"] == "second shard"
+    assert prepared == [(first_io, "first stream"), (second_io, "second stream")]
+
+    second_io["binding"] = "rebound shard"
+    assert (
+        compile_cache.get_compiled_gemm("cfg", "fc1", second_io, "second stream")
+        is first
+    )
+    assert second_io["descriptor_binding"] == "rebound shard"
+    assert current[0] == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("disk_hit", [False, True])
+def test_disk_cache_prepares_each_workspace_before_keying(monkeypatch, disk_hit):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    current = [0]
+    prepared = []
+    compiled = []
+    kernel = object()
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current[0] = current[0], index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def prepare(io, stream, *, reencode_tma):
+        assert reencode_tma is False
+        assert current[0] == 1
+        io["descriptor_binding"] = io["binding"]
+        prepared.append((io["binding"], stream))
+
+    def name(cfg_hash, fc1_or_fc2, io):
+        assert io["descriptor_binding"] == io["binding"]
+        return "gemm"
+
+    class Spec:
+        def __init__(self, module, name, compile_fn, source, **kwargs):
+            self.compile_fn = compile_fn
+
+        def build_and_load(self):
+            if not disk_hit:
+                compiled.append(self.compile_fn())
+            return kernel
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: "sources")
+    monkeypatch.setattr(compile_cache, "_disk_kernel_name", name)
+    monkeypatch.setattr(cute_dsl_core, "cute_dsl_cache_disabled", lambda: False)
+    monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", Spec)
+    monkeypatch.setattr(batched_gemm_run, "_prepare_tma_descriptors", prepare)
+    monkeypatch.setattr(
+        batched_gemm_run,
+        "_compile_for_launch",
+        lambda io, stream, *, reencode_tma: kernel,
+    )
+
+    # Fresh IO objects simulate separate processes loading the same artifact.
+    for binding in ("first shard", "second shard"):
+        io = {"binding": binding}
+        assert (
+            compile_cache._compile_or_load(
+                "cfg", "fc1", io, "stream", 1, reencode_tma=False
+            ).kernel
+            is kernel
+        )
+        assert io["descriptor_binding"] == binding
+    assert current[0] == 0
+    assert prepared == [("first shard", "stream"), ("second shard", "stream")]
+    assert len(compiled) == (0 if disk_hit else 2)
+
+
+@pytest.mark.cpu_only
+def test_descriptor_preparation_reuses_code_without_retaining_bindings(
+    monkeypatch, request
+):
+    from cutlass.cutlass_dsl import BaseDSL
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run as runner
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+
+    monkeypatch.delenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", raising=False)
+    monkeypatch.setattr(BaseDSL, "enable_pyir", contextlib.nullcontext)
+    monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(compile_cache, "_compile_target_key", lambda io: (0, "sm107a"))
+    compile_cache.clear_compiled_gemm_cache()
+    request.addfinalizer(compile_cache.clear_compiled_gemm_cache)
+    compilations, bindings, owners = [], [], []
+    fail = False
+
+    class Prepare:
+        def __call__(self, args):
+            if fail:
+                raise RuntimeError("injected descriptor preparation failure")
+            bindings.append((args[0]._pointer, args[4]._pointer, args[25], args[27]))
+
+    def compile_prepare(fn, args, cfg, **kwargs):
+        assert fn is runner.prepare_gemm_descriptors
+        prepared = Prepare()
+        compilations.append(weakref.ref(prepared))
+        return prepared
+
+    def compile_gemm(cfg_hash, stage, io, stream, device, *, reencode_tma):
+        return compile_cache._CompiledGemm(
+            object(),
+            runner._prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma),
+        )
+
+    monkeypatch.setattr(runner.cute, "compile", compile_prepare)
+    monkeypatch.setattr(compile_cache, "_compile_or_load", compile_gemm)
+    cfg = make_config(sm_arch=107)
+    for index in range(4):
+        io = _fake_launch_io(
+            (index + 1) << 20, shape=(256, 512 * (index + 1), 256, 2, 128)
+        )
+        io.update(cfg=cfg, c_row_stride=256 + 32 * index)
+        io["_keepalive"] = (torch.empty(128),)
+        compiled = compile_cache.get_compiled_gemm("cfg", "fc1", io, None)
+        assert bindings[-1] == (
+            io["a_dp"]._pointer,
+            io["c0_dp"]._pointer,
+            io["shape"],
+            io["c_row_stride"],
+        )
+        assert len(compilations) == 1
+        assert len(compile_cache._COMPILED_GEMM_CACHE) == 1
+        owners.extend(
+            weakref.ref(value)
+            for value in (*io["_keepalive"], io["_tma_descriptor_storage"])
+        )
+        if index == 0:
+            first = compiled
+        else:
+            assert compiled is first
+        if index == 3:
+            cached = tuple(
+                io[name]
+                for name in (
+                    "tma_desc_storage_dp",
+                    "_tma_descriptor_storage",
+                    "_tma_descriptor_key",
+                )
+            )
+            io["c0_dp"] = _fake_launch_io(1 << 28)["c0_dp"]
+            fail = True
+            with pytest.raises(RuntimeError, match="injected"):
+                compile_cache.get_compiled_gemm("cfg", "fc1", io, None)
+            assert all(
+                io[name] is value
+                for name, value in zip(
+                    (
+                        "tma_desc_storage_dp",
+                        "_tma_descriptor_storage",
+                        "_tma_descriptor_key",
+                    ),
+                    cached,
+                    strict=True,
+                )
+            )
+            fail = False
+            compile_cache.get_compiled_gemm("cfg", "fc1", io, None)
+            assert bindings[-1][1] == io["c0_dp"]._pointer
+            del cached
+        del io
+        gc.collect()
+        assert all(owner() is None for owner in owners)
+    assert len(compilations) == 1
+    compile_cache.clear_compiled_gemm_cache()
+    gc.collect()
+    assert compilations[0]() is None

@@ -631,6 +631,7 @@ def _cfg(**overrides) -> SimpleNamespace:
         "fallback_cluster_shape": None,
         "tile_scheduler": int(TileScheduler.PERSISTENT),
         "is_persistent": True,
+        "is_static_persistent": False,
         "load_a_warp_idx": 0,
         "num_load_a_warps": 1,
         "load_a_task_regs": 24,
@@ -639,10 +640,22 @@ def _cfg(**overrides) -> SimpleNamespace:
         "load_b_task_regs": 24,
         "load_b_regs": 24,
         "sync_regs": 24,
+        "is_rubin": False,
         "has_routed_sfs": True,
         "uses_ldgsts_routed_sfs": True,
         "uses_tma_routed_sfs": False,
         "use_deepseek_fp8": False,
+        "dense_rolled_mma": False,
+        "dense_rolled_epilogue": False,
+        "dense_m_repeats": 1,
+        "dense_split_tma_pipeline": False,
+        "uses_routed_weight_pipeline": False,
+        "dense_fuse_tma_pipeline": False,
+        "shares_ldgsts_a_sfa_pipeline": False,
+        "uses_ldgsts_relay": False,
+        "uses_ldgsts_sf_relay": False,
+        "has_gather": True,
+        "dense_preload_epilogue": False,
         "uses_two_cta_mma": True,
         "sfa_smem_to_tmem_copy": int(SfSmemToTmemCopy.UTCCP),
         "sfb_smem_to_tmem_copy": int(SfSmemToTmemCopy.UTCCP),
@@ -757,8 +770,7 @@ def test_persistent_task_factories_build_captured_schedule_lists():
         create_sync_task(
             cfg,
             _res("Proxy"),
-            _res("GatherSmem"),
-            _res("TmaSmem"),
+            [_res("GatherSmem"), _res("TmaSmem")],
             work_queue,
             num_k_tiles,
             sync_warp_idx=12,
@@ -986,55 +998,64 @@ def test_load_a_try_acquire_is_per_k_tile():
 
 
 @pytest.mark.cpu_only
-def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
-    cfg = _cfg(use_early_exit=False, uses_two_cta_mma=False)
-    work_queue = _work_queue()
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook(sm_arch):
+    cfg = _cfg(use_early_exit=False, uses_two_cta_mma=False, is_rubin=sm_arch == 107)
     smem_sfa = _res("SmemSfA")
+    smem_sfa.uses_async_load_pipeline = True
     load_sfa = create_load_sfa_task(
-        cfg,
-        _res("GmemSfA"),
-        smem_sfa,
-        work_queue,
-        num_k_tiles=5,
+        cfg, _res("GmemSfA"), smem_sfa, _work_queue(), num_k_tiles=5
     )
-
-    assert any(
-        resource is smem_sfa and stage == ScheduleStage.ProducerAuxWork
-        for resource, stage, *_ in load_sfa.loop_schedule_list
-    )
-    assert any(
-        resource is smem_sfa
-        and stage == ScheduleStage.ProducerAuxWork
+    has_drain = any(
+        entry[0] is smem_sfa
+        and entry[1] == ScheduleStage.ProducerAuxWork
         and entry[-1] == "drain_loop"
         for entry in load_sfa.loop_schedule_list
-        for resource, stage, *_ in [entry]
     )
+    assert has_drain == (sm_arch in (100, 103))
 
 
 @pytest.mark.cpu_only
-def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers():
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers(sm_arch):
+    relay = sm_arch == 107
+    producer_op = (
+        pipeline.PipelineOp.AsyncLoad if relay else pipeline.PipelineOp.AsyncThread
+    )
     cfg = make_config(
+        sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
+        sf_layout_b=int(SfLayout.R128c4),
         tile_n=128,
     )
+    validate_config(cfg)
     smem_sfa_cfg = _make_pipeline_configs(cfg)["smem_sfa"]
     assert smem_sfa_cfg.pipeline_type == PipelineType.AsyncUmma
-    assert smem_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+    assert smem_sfa_cfg.umma_consumer_producer_op == producer_op
     assert (
         smem_sfa_cfg.producer_group.size
-        == cfg.warp_layout.num_load_sfa_warps * 32 * cfg.umma_cta_count
+        == cfg.warp_layout.num_load_sfa_warps * 32 * (1 if relay else 2)
     )
 
     single_cta_cfg = make_config(
+        sm_arch=sm_arch,
         umma_cta_count=1,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
+        sf_layout_b=int(SfLayout.R128c4),
         tile_n=128,
     )
+    validate_config(single_cta_cfg)
     single_cta_sfa_cfg = _make_pipeline_configs(single_cta_cfg)["smem_sfa"]
     assert single_cta_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncLoad
     assert (
@@ -1043,34 +1064,47 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers():
     )
 
     r128c4_sfb_cfg = make_config(
+        sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(r128c4_sfb_cfg)
     smem_sfa_cfg = _make_pipeline_configs(r128c4_sfb_cfg)["smem_sfa"]
     smem_sfb_cfg = _make_pipeline_configs(r128c4_sfb_cfg)["smem_sfb"]
     assert r128c4_sfb_cfg.use_combined_sfab_copy
     assert smem_sfa_cfg.advance_on_wait
     assert smem_sfb_cfg.pipeline_type == PipelineType.AsyncUmma
-    assert smem_sfb_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+    assert smem_sfb_cfg.umma_consumer_producer_op == producer_op
     assert (
         smem_sfb_cfg.producer_group.size
-        == r128c4_sfb_cfg.warp_layout.num_load_sfb_warps
-        * 32
-        * r128c4_sfb_cfg.umma_cta_count
+        == r128c4_sfb_cfg.warp_layout.num_load_sfb_warps * 32 * (1 if relay else 2)
     )
-    assert smem_sfb_cfg.advance_on_acquire
+    assert smem_sfb_cfg.advance_on_acquire is not relay
+
     assert smem_sfb_cfg.advance_on_wait
-    assert _ldgsts_sfb_producer_commit_prefetch_depth(r128c4_sfb_cfg) == 3
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(r128c4_sfb_cfg) == (
+        0 if relay else 3
+    )
 
     compact_cfg = make_config(
+        sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_n=64,
     )
+    validate_config(compact_cfg)
     smem_sfb_cfg = _make_pipeline_configs(compact_cfg)["smem_sfb"]
     assert compact_cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
     assert compact_cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -1081,11 +1115,18 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers():
         == compact_cfg.warp_layout.num_load_sfb_warps * 32
     )
     assert not smem_sfb_cfg.advance_on_acquire
+    # Rubin's relay joins the local copy warps before the loader can reuse a stage.
+    assert smem_sfb_cfg.consumer_group.size == 32 * (
+        compact_cfg.warp_layout.num_copy_sfb_warps + int(relay)
+    )
 
 
 @pytest.mark.cpu_only
-def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout(sm_arch):
+    relay = sm_arch == 107
     cfg = make_config(
+        sm_arch=sm_arch,
         batch_mode=int(BatchMode.BATCH_N),
         umma_cta_count=2,
         dtype_a=int(DType.E2M1),
@@ -1137,24 +1178,22 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     assert cfg.warp_layout.load_a_warp_idx == 8
     assert cfg.warp_layout.load_sfa_warp_idx == cfg.warp_layout.load_a_warp_idx
     assert cfg.warp_layout.mma_warp_idx == 9
-    assert cfg.warp_layout.workid_warp_idx == 10
-    assert cfg.warp_layout.padding_warp_idx == 11
-    assert cfg.warp_layout.num_sync_warps == 0
+    assert cfg.warp_layout.workid_warp_idx == (11 if relay else 10)
+    assert cfg.warp_layout.num_padding_warps == (0 if relay else 1)
+    assert cfg.warp_layout.sync_warp_idx == 10
+    assert cfg.warp_layout.num_sync_warps == int(relay)
 
     pipeline_cfgs = _make_pipeline_configs(cfg)
     gather_pipeline = pipeline_cfgs["smem_gather"]
-    assert gather_pipeline.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
-    assert gather_pipeline.advance_on_acquire
-    assert (
-        gather_pipeline.producer_group.size
-        == (
-            cfg.warp_layout.num_load_b_warps
-            if cfg.is_swap_ab
-            else cfg.warp_layout.num_load_a_warps
-        )
-        * 32
-        * cfg.umma_cta_count
+    assert gather_pipeline.umma_consumer_producer_op == (
+        pipeline.PipelineOp.AsyncLoad if relay else pipeline.PipelineOp.AsyncThread
     )
+    assert gather_pipeline.advance_on_acquire is not relay
+    assert gather_pipeline.producer_group.size == (
+        cfg.warp_layout.num_load_b_warps
+        if cfg.is_swap_ab
+        else cfg.warp_layout.num_load_a_warps
+    ) * 32 * (1 if relay else cfg.umma_cta_count)
 
     work_queue = _work_queue()
     fused_a = create_fused_load_a_sfa_task(
@@ -1226,9 +1265,13 @@ def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
 
 
 @pytest.mark.cpu_only
-def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
+def test_ldgsts_sf_relay_commits_without_prefetch_throttle():
     cfg = make_config(
+        sm_arch=107,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
@@ -1237,23 +1280,31 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(cfg)
     res = SmemSfLdgstsBResource(
         cfg=cfg,
         pipeline_config=_make_pipeline_configs(cfg)["smem_sfb"],
         producer_commit_prefetch_depth=_ldgsts_sfb_producer_commit_prefetch_depth(cfg),
         name="SmemSfB",
     )
-    assert res.cp_async_wait_group_depth == 2
+    assert res.uses_async_load_pipeline
+    assert res.producer_commit_prefetch_depth == 0
 
     two_stage_cfg = make_config(
+        sm_arch=107,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
         num_stages_smem_sfb=2,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(two_stage_cfg)
     two_stage_res = SmemSfLdgstsBResource(
         cfg=two_stage_cfg,
         pipeline_config=_make_pipeline_configs(two_stage_cfg)["smem_sfb"],
@@ -1266,8 +1317,9 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
 
 
 @pytest.mark.cpu_only
-def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
+def test_ldgsts_sfb_relay_commits_each_load_without_drain():
     cfg = make_config(
+        sm_arch=107,
         umma_cta_count=2,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
@@ -1291,46 +1343,21 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
         num_k_tiles=8,
     )
 
-    head_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.head_schedule_list
-        if resource is smem_sfb
-    ]
-    loop_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.loop_schedule_list
-        if resource is smem_sfb
-    ]
-    tail_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.tail_schedule_list
-        if resource is smem_sfb
-    ]
-
-    assert head_stages.count(ScheduleStage.ProducerWork) == 3
-    assert ScheduleStage.ProducerCommit not in head_stages
+    assert not smem_sfb.pipeline_config.advance_on_acquire
+    entries = (
+        load_sfb.head_schedule_list
+        + load_sfb.loop_schedule_list
+        + load_sfb.tail_schedule_list
+    )
+    assert not any(entry[-1] in ("drain_loop", "drain_tail") for entry in entries)
     loop_entries = [
         entry for entry in load_sfb.loop_schedule_list if entry[0] is smem_sfb
     ]
-    tail_entries = [
-        entry for entry in load_sfb.tail_schedule_list if entry[0] is smem_sfb
-    ]
-
-    assert loop_stages[:2] == [
+    assert [entry[1] for entry in loop_entries][-2:] == [
         ScheduleStage.ProducerWork,
         ScheduleStage.ProducerCommit,
     ]
-    assert loop_entries[0][-1] == "drain_loop"
-    assert tail_stages == [
-        ScheduleStage.ProducerWork,
-        ScheduleStage.ProducerCommit,
-        ScheduleStage.ProducerWork,
-        ScheduleStage.ProducerCommit,
-        ScheduleStage.ProducerWork,
-        ScheduleStage.ProducerCommit,
-    ]
-    assert [entry[-1] for entry in tail_entries[::2]] == ["drain_tail"] * 3
-    assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
+    assert loop_entries[-2][-1] == "load_sfb_tile"
 
 
 @pytest.mark.cpu_only
@@ -1357,8 +1384,9 @@ def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
 
 
 @pytest.mark.cpu_only
-def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
+def test_ldgsts_sfb_relay_ignores_host_prefetch_depth():
     cfg = make_config(
+        sm_arch=107,
         umma_cta_count=2,
         mma_m=256,
         num_stages_smem_sfb=6,
@@ -1372,25 +1400,30 @@ def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
         sf_layout_b=int(SfLayout.LINEAR),
     )
 
-    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 3
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 0
 
     validate_config(cfg, problem_mnk=(128, 128, 256))
 
-    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 3
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 0
     specialized = _runtime_config(cfg, 256)
-    assert _ldgsts_sfb_producer_commit_prefetch_depth(specialized) == 1
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(specialized) == 0
 
 
 @pytest.mark.cpu_only
 def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     cfg = make_config(
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(cfg)
     assert cfg.use_combined_sfab_copy
 
     tmem_sfab_cfg = _make_pipeline_configs(cfg)["tmem_sfab"]

@@ -1779,3 +1779,42 @@ def test_select_expert_weights_ignores_1d_autotune_placeholder():
         {"routing_input_mode": RoutingInputMode.PackedPrecomputed},
     )
     assert picked is routed
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_nvfp4_finalize_modes_only_affect_rubin_tuning_keys(monkeypatch, sm_arch):
+    monkeypatch.setattr(runner_module, "_sm_arch_for_tensor", lambda _: sm_arch)
+    runner = runner_module.PrimsTsNvfp4MoERunner(
+        None, top_k=2, num_local_experts=8, hidden_size=1024, intermediate_size=512
+    )
+    inputs = MoeRunnerInputs(
+        output=torch.empty(32, 1024, dtype=torch.bfloat16),
+        routing_logits=torch.empty(32, 8),
+        topk_ids=torch.empty(0, dtype=torch.int32),
+        expert_weights=torch.empty(0, dtype=torch.bfloat16),
+        hidden_states=torch.empty(32, 512, dtype=torch.uint8),
+        hidden_states_scale=torch.empty(0),
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    ).to_list()
+    keys = []
+    for do_finalize, use_fused_finalize, deterministic in (
+        (True, True, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, True),
+    ):
+        monkeypatch.setattr(
+            torch,
+            "are_deterministic_algorithms_enabled",
+            lambda value=deterministic: value,
+        )
+        runner.set_cache_key_static_extras(
+            do_finalize=do_finalize, use_fused_finalize=use_fused_finalize
+        )
+        keys.append(runner.get_cache_key_extras(inputs))
+    assert len(set(keys)) == (len(keys) if sm_arch == 107 else 1)
+    assert dict(keys[0])["prims_ts_moe_config_version"] == (
+        14 if sm_arch == 107 else 11
+    )

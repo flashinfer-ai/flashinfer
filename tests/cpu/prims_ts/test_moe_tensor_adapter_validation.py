@@ -116,3 +116,77 @@ def test_gemm1_oa_validation_uses_local_expert_count():
     )
 
     assert ok, reason
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rows,width,coeff_offset",
+    [
+        (512, 256, 0),
+        (768, 256, 0),
+        (512, 288, 0),
+        (1, 256, 0),
+        (1, 288, 0),
+        (1, 288, 1),
+    ],
+)
+def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width, coeff_offset):
+    from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
+    from flashinfer.prims_ts.moe.tensor_adapter import build_nvfp4_launch_io
+
+    cfg = map_trtllm_nvfp4_moe_tactic([1024, 0], sm_arch=107).fc2.cfg.build()
+    data = torch.empty((512, 128), dtype=torch.uint8)
+    scales = torch.empty((512, 16), dtype=torch.float8_e4m3fn)
+    weights = torch.empty((2, 256, 128), dtype=torch.uint8)
+    metadata = torch.zeros(2, dtype=torch.int32)
+    scale = torch.ones(2)
+    kwargs = dict(
+        fc="fc2",
+        cfg=cfg,
+        hidden_states=data,
+        hidden_states_scale=scales,
+        gemm1_weights=weights,
+        gemm1_weights_scale=scales,
+        gemm2_weights=weights,
+        gemm2_weights_scale=scales,
+        gemm1_output=data,
+        gemm1_output_scale=scales,
+        gemm2_output=torch.empty((rows, width), dtype=torch.bfloat16),
+        output1_scale_scalar=scale,
+        output1_scale_gate_scalar=scale,
+        output2_scale_scalar=scale,
+        tile_idx=metadata,
+        mn_limit=metadata,
+        route_map=torch.zeros(512, dtype=torch.int32),
+        num_non_exiting_ctas=metadata,
+        total_num_padded_tokens=metadata,
+        routed_token_capacity=512,
+        activation_type=int(ActivationType.Swiglu),
+        num_experts=2,
+        num_tokens=17,
+        top_k=2,
+        intermediate_size=256,
+        hidden_size=256,
+    )
+    if rows == 1:
+        from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_config
+
+        kwargs.update(
+            cfg=fused_finalize_config(cfg),
+            num_tokens=1,
+            finalize_output=kwargs["gemm2_output"][:, :256],
+            finalize_scales=torch.ones(2 + coeff_offset, dtype=torch.bfloat16)[
+                coeff_offset:
+            ].view(1, 2),
+            finalize_route_map=kwargs["route_map"],
+        )
+    if width != 256 and rows > 1:
+        with pytest.raises(
+            ValueError, match="Batch-M output requires storage row stride"
+        ):
+            build_nvfp4_launch_io(**kwargs)
+    else:
+        io = build_nvfp4_launch_io(**kwargs)
+        assert io["c0_dp"]._pointer == kwargs["gemm2_output"].data_ptr()
+        if rows == 1:
+            assert io["finalize_scale_dp"]._assumed_align == (2 if coeff_offset else 16)

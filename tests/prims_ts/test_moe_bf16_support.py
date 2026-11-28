@@ -31,6 +31,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_mxfp4_mxfp8_moe_tactic,
+    map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
@@ -793,6 +794,37 @@ def test_gpt_oss_high_throughput_fused_fc1_gpu_correctness():
         problem_n=256,
         problem_k=512,
         seed=123,
+        **pair.fc1.cfg.kwargs,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.parametrize(
+    "mapper", [map_trtllm_mxfp4_mxfp8_moe_tactic, map_trtllm_mxfp8_mxfp8_moe_tactic]
+)
+def test_mxfp_tile256_fc1_register_budget_gpu(mapper):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Requires SM100, SM103, or SM107")
+    pair = mapper(
+        [256, 0],
+        sm_arch=major * 10 + minor,
+        num_tokens=517,
+        top_k=2,
+        num_local_experts=3,
+    )
+    assert reference_check(
+        num_experts=3,
+        num_tokens=517,
+        top_k=2,
+        problem_n=512,
+        problem_k=768,
+        seed=123,
+        repeat_launches=3,
+        output_guard_elements=256,
         **pair.fc1.cfg.kwargs,
     )
 

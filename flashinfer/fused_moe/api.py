@@ -544,8 +544,8 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
 
-# Prims-TS (CUTLASS primitives + task scheduling) GEMMs are SM100/SM103 only.
-_PRIMS_TS_ARCHS = (100, 103)
+# Prims-TS also requires an installed DSL that natively targets the device.
+_PRIMS_TS_ARCHS = (100, 103, 107)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
 # CUTLASS API.
@@ -1193,7 +1193,7 @@ def _block_major_k_fp4_weights(view: dict, *, block_bytes: int) -> dict:
 
 @dataclass(frozen=True)
 class PrimsTsConfig:
-    """Explicit Prims-TS backend for SM100 and SM103.
+    """Explicit Prims-TS backend for SM100/SM103, plus NVFP4×NVFP4 on SM107.
 
     Opt-in only: this config is never part of the default backend list.
     NVFP4×NVFP4, MXFP4×MXFP8, and MXFP4×BF16 reuse
@@ -1206,8 +1206,17 @@ class PrimsTsConfig:
     shuffles the weight payloads (epilogue tile 64); do not register that
     dictionary under ``"trtllm_fp8_block"``.
 
-    The GEMM middle stage is Prims-TS; routing and finalize stay on the
-    TRT-LLM Gen path.
+    GEMMs use Prims-TS and routing uses TRT-LLM Gen. Rubin NVFP4 swap-AB
+    tactics use token tiles of 8, 16, 32, 64, 128, or 256 rows and follow
+    the caller's PDL setting. Rubin non-swap-AB tactics use 512 or 1024 rows,
+    disable PDL, and can fuse finalize into FC2 using BF16 atomic reductions. Set
+    ``MoEFinalizeConfig(use_fused_finalize=False)`` for the separate FP32
+    finalizer; deterministic PyTorch execution and unsupported tactics also
+    use the separate path. Pass ``nvfp4_weight_layout`` to :meth:`prepare_weights`
+    to choose how to pack NVFP4 weights. On SM100, SM103, and SM107, the
+    runner infers ``MajorK`` from 3D weights and ``BlockMajorK`` from 4D
+    weights. Both layouts share one shuffled weight set across decode and
+    prefill tactics.
     """
 
     @classmethod
@@ -1228,16 +1237,30 @@ class PrimsTsConfig:
         permute_cache=None,
         hidden_states_scale_global=None,
         intermediate_scale_global=None,
+        nvfp4_weight_layout: Literal["MajorK", "BlockMajorK"] = "MajorK",
     ):
         """Build the Prims-TS weight view for one supported quant pair.
 
         Register the returned dictionary with
         ``MoEWeightPack.prepare_for("prims_ts", view)``. Except for
-        DeepSeekFp8 and MXFP4×MXFP8, the same dictionary may also be
-        registered for the matching TRT-LLM backend key. The Prims-TS backend
-        also accepts the MajorK TRT-LLM MXFP4×MXFP8 view.
+        DeepSeekFp8, MXFP4×MXFP8 and BlockMajorK NVFP4, the same dictionary
+        may also be registered for the matching TRT-LLM backend key. The
+        Prims-TS backend also accepts the MajorK TRT-LLM MXFP4×MXFP8 view.
+        NVFP4 defaults to 3D ``MajorK`` weights. Choosing ``BlockMajorK``
+        requires hidden and intermediate sizes divisible by 256. The packer
+        stores the shuffled payload as ``[E, K/256, N, 128]`` packed bytes
+        and keeps the existing scale layout.
         """
         pair = quant.pair
+        if nvfp4_weight_layout not in ("MajorK", "BlockMajorK"):
+            raise ValueError("nvfp4_weight_layout must be MajorK or BlockMajorK.")
+        if nvfp4_weight_layout == "BlockMajorK":
+            if pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+                raise ValueError("nvfp4_weight_layout applies only to NVFP4×NVFP4.")
+            if hidden_size % 256 or intermediate_size % 256:
+                raise ValueError(
+                    "BlockMajorK NVFP4 requires dimensions divisible by 256."
+                )
         if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             view = TrtllmFp4Config.prepare_weights(
                 w1_bf16,
@@ -1255,7 +1278,7 @@ class PrimsTsConfig:
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.BF16),
         ):
-            return TrtllmFp4Config.prepare_weights(
+            view = TrtllmFp4Config.prepare_weights(
                 w1_bf16,
                 w2_bf16,
                 quant=quant,
@@ -1266,6 +1289,9 @@ class PrimsTsConfig:
                 device=device,
                 permute_cache=permute_cache,
             )
+            if nvfp4_weight_layout == "BlockMajorK":
+                return _block_major_k_fp4_weights(view, block_bytes=128)
+            return view
         if pair == (QuantFormat.BF16, QuantFormat.BF16):
             return TrtllmBf16Config.prepare_weights(
                 w1_bf16,

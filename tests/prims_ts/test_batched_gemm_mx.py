@@ -737,7 +737,8 @@ class TestMxFp4Bf16Fc1:
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
 
-    def test_tile16_cluster2_swiglu_persistent_correctness(self):
+    @pytest.mark.parametrize("problem_k", [256, 1792])
+    def test_tile16_cluster2_swiglu_persistent_correctness(self, problem_k):
         cfg = {
             **_mxfp4_bf16_base(has_activation_epilogue=True),
             "tile_n": 16,
@@ -746,7 +747,7 @@ class TestMxFp4Bf16Fc1:
             "mma_m": 256,
             "umma_cta_count": 2,
         }
-        _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
+        _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256, problem_k=problem_k)
 
     def test_tile16_cluster2_swiglu_mixed_cga(self):
         """CastA plus LDGSTS gather under multiwave mixed CGAs."""

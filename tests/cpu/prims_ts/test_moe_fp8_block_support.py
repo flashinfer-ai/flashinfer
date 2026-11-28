@@ -22,6 +22,7 @@ from flashinfer.fused_moe.shared.inputs import RoutingInputMode
 from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
+    map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
 )
 from flashinfer.prims_ts.moe import support
@@ -75,9 +76,19 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
 
 
 @pytest.mark.cpu_only
-def test_mxfp8_mxfp8_mapper_supports_tile256():
-    pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
+@pytest.mark.parametrize(
+    "sm_arch, padding_regs, sync_regs, cta_warps",
+    [(100, 88, 48, 20), (103, 88, 48, 20), (107, 80, 88, 24)],
+)
+@pytest.mark.parametrize(
+    "mapper", [map_trtllm_mxfp4_mxfp8_moe_tactic, map_trtllm_mxfp8_mxfp8_moe_tactic]
+)
+def test_mxfp_mapper_supports_tile256(
+    mapper, sm_arch, padding_regs, sync_regs, cta_warps
+):
+    pair = mapper(
         [256, 0],
+        sm_arch=sm_arch,
         activation_type=int(ActivationType.Swiglu),
         num_tokens=128,
         top_k=8,
@@ -91,6 +102,13 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
     assert not fc2.has_output_block_scaling
+    # Blackwell's SFB loaders publish completion directly. Rubin adds a
+    # relay warp, moving the work scheduler into a new warp group.
+    assert fc1.padding_regs == fc1.workid_regs == padding_regs
+    assert fc1.sync_regs == sync_regs
+    assert fc1.mma_regs == 88
+    assert fc1.warp_layout.num_sync_warps == int(sm_arch == 107)
+    assert fc1.warp_layout.threads_per_cta == cta_warps * 32
 
 
 @pytest.mark.cpu_only
