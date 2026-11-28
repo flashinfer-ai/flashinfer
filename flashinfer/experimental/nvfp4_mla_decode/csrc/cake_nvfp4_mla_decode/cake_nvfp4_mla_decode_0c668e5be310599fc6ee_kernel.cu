@@ -3262,6 +3262,7 @@ kernel_cake_nvfp4_mla_decode_0c668e5be310599fc6ee(const __grid_constant__ CUtens
                     " [%0], {%1};"
                     :: "r"(taddr + (unsigned int)lane_base_c + 320 + 24 + 4 + 3), "r"((q_words_c + 7)[0]));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile(
                     "{\n\t"
@@ -3375,6 +3376,7 @@ kernel_cake_nvfp4_mla_decode_0c668e5be310599fc6ee(const __grid_constant__ CUtens
                         " [%0], {%1};"
                         :: "r"(sfb_base_c_0 + 24 + 4), "r"((k_words_c_0 + 7)[0]));
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                 raw_stage_c += 1;
@@ -3496,6 +3498,7 @@ kernel_cake_nvfp4_mla_decode_0c668e5be310599fc6ee(const __grid_constant__ CUtens
                             " [%0], {%1};"
                             :: "r"(sfb_base_c_2 + 24 + 4), "r"((k_words_c_2 + 7)[0]));
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                     raw_stage_c += 1;
@@ -3666,6 +3669,7 @@ kernel_cake_nvfp4_mla_decode_0c668e5be310599fc6ee(const __grid_constant__ CUtens
                                 " [%0], {%1};"
                                 :: "r"(sfb_base_c_4 + 24 + 4), "r"((k_words_c_4 + 7)[0]));
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                         raw_stage_c += 1;
