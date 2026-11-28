@@ -76,6 +76,7 @@ fused_kda_decode_h12_d128.json
 packed_fused_kda_decode_t3_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+gemm_tf32_N256_K8192.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 mm_bf16_fp8_N4096_K4096.json
@@ -122,7 +123,7 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
-prims_ts_decode_mla_one_shot_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_cp8_i128_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -817,6 +818,13 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── GEMM tf32 ─────────────────────────────────────────────────────────────────
+# MoE router logits with fp32 weights (256 experts x 8192 hidden), M tokens.
+a = torch.randn(16, 8192, dtype=torch.float32, device=device)
+b = torch.randn(256, 8192, dtype=torch.float32, device=device).T  # [K, N] col-major
+with contextlib.suppress(Exception):
+    flashinfer.mm_tf32(a, b)
 
 # ── W8A16 FP8 GEMM (bf16 activation, e4m3 weight [N, K], per-tensor scale) ────
 # Trace is dumped before kernel launch; suppress Hopper/Blackwell-only failures.
@@ -3093,6 +3101,7 @@ with contextlib.suppress(Exception):
     _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
 
     _attention_ts_mla_decode.fi_trace(
+        save_dir=SAVE_DIR,
         query=_pmla_q,
         kv_cache=_pmla_cache,
         block_tables=_pmla_block_tables,
@@ -3102,9 +3111,9 @@ with contextlib.suppress(Exception):
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
         mask_type="causal",
-        kv_bounds=torch.arange(
-            _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
-        ).repeat(_pmla_B),
+        cp_world=8,
+        cp_interleave_size=128,
+        cp_rank=0,
         zero_empty_rows=True,
     )
 

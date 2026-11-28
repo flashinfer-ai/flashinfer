@@ -822,6 +822,7 @@ _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES = {
     (12, 1): "sm_121a",
 }
 _CAKE_GDN_AFFINE_SPLIT_HEADS = (4, 8, 16, 32)
+_CAKE_GDN_AFFINE_SPLIT_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _cake_gdn_affine_split_scope(
@@ -846,13 +847,11 @@ def _cake_gdn_affine_split_scope(
     ``output`` of ``None`` is the one the entry allocates, which fits."""
 
     capability = (int(device_capability[0]), int(device_capability[1]))
-    if capability != (10, 3):
-        if capability == (10, 0):
-            return "sm_100a is not yet supported"
+    if capability not in _CAKE_GDN_AFFINE_SPLIT_CAPABILITIES:
         arch = _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES.get(
             capability, f"sm_{capability[0]}{capability[1]}"
         )
-        return f"{arch} is not supported (sm_103a only)"
+        return f"{arch} is not supported (sm_100a, sm_103a and sm_107a only)"
     device = q.device
     io = (q, k, v) if output is None else (q, k, v, output)
     total = int(q.shape[0]) if q.ndim == 3 else -1
@@ -1007,6 +1006,9 @@ def _run_cake_gdn_affine_split(
         num_heads=num_v_heads,
         max_seqlen=bound,
         sm_count=sm_count,
+        target=_CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES[
+            (int(device_capability[0]), int(device_capability[1]))
+        ],
         split_count=split_count,
     )
     tiles, _ = _affine_split.pass1_grid(num_seqs, num_v_heads, plan.p_bound, sm_count)
@@ -1041,26 +1043,31 @@ def _run_cake_gdn_affine_split(
         # it ships no initial-state variant without a final state, so
         # neither is used. The launch depends on the bound only, as the
         # split route's does.
-        return _run_cake_gdn_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            output=output,
-            output_state=output_state,
-            state_checkpoints=None,
-            checkpoint_cu_starts=None,
-            checkpoint_every_n_tokens=0,
-            state_indices=None,
-            max_seqlen=bound,
-            cu_seqlens_cpu=None,
-        )
+        try:
+            return _run_cake_gdn_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+                output=output,
+                output_state=output_state,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                state_indices=None,
+                max_seqlen=bound,
+                cu_seqlens_cpu=None,
+            )
+        except _cake_gdn.CakeGDNUnsupportedError:
+            # No unsplit record for this key: the resolver refuses it on the
+            # host, before any launch, and the first kernel alone serves it.
+            pass
     # p_bound == 1: the first kernel alone at a cap of one segment, the bits
     # of a one-segment sequence inside any split launch, whatever the batch.
     _chunk_gated_delta_rule_gdn_affine_split_sm100(
@@ -1593,6 +1600,7 @@ def chunk_gated_delta_rule(
     use_affine_split: bool = False,
     _affine_split_count: Optional[int] = None,
     batch_invariant: bool = False,
+    train_states: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1908,14 +1916,20 @@ def chunk_gated_delta_rule(
         sequence of at most 960 tokens is never split. When the longest
         possible sequence (the exact longest of ``cu_seqlens_cpu``, else
         ``max_seqlen``, else ``total_seq_len``) gets ``P = 1``, the first
-        kernel runs alone, the default Cake kernel's DV-split arithmetic: each
-        sequence's output is bitwise equal to ``use_affine_split=False`` on
-        that sequence alone, and on the whole call while that route resolves
-        its DV-split variant (``2 * num_seqs * num_v_heads <= 160`` on SM103). Supported: SM103, BF16 Q/K/V/output, head size 128,
+        kernel runs alone, the non-CP Cake kernel's DV-split arithmetic: each
+        sequence's output is bitwise equal to the non-CP route
+        (``use_affine_split=False, use_cp=False``) on that sequence alone, and
+        on the whole call while that route resolves its DV-split variant
+        (``2 * num_seqs * num_v_heads`` at most the device's active clusters:
+        148 on SM100, 160 on SM103 and 212 on SM107). Supported: SM100, SM103 and
+        SM107, BF16 Q/K/V/output, head size 128,
         ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads == num_q_heads``
-        dividing it, any number of sequences with FP32 ``initial_state`` /
-        ``output_state`` ``[num_seqs, H, V, K]`` (contiguous, 16-byte aligned
-        addresses), FP32
+        dividing it, any number of sequences up to 2**20 packed tokens and
+        131072 first-kernel tiles (``num_seqs * num_v_heads * (4 * P - 2)``
+        at the cap ``P`` of the bound, so a tighter bound from
+        ``cu_seqlens_cpu`` or ``max_seqlen`` admits more sequences), with
+        FP32 ``initial_state`` / ``output_state`` ``[num_seqs, H, V, K]``
+        (contiguous, 16-byte aligned addresses), FP32
         ``g``/``beta`` (or the gate forms materialized to them). Checkpoints, state pools, ``prefix_lens`` and
         ``use_cp=True`` are rejected with ``ValueError``. The call owns
         workspaces (768 B per token and value head, plus 192 KiB per
@@ -1927,7 +1941,8 @@ def chunk_gated_delta_rule(
         between replays, omit ``cu_seqlens_cpu`` and warm up and capture with
         a ``max_seqlen`` that covers every replay. A ``max_seqlen`` hint
         smaller than a live sequence changes that sequence's segments (its
-        result stays exact, its bits change).
+        result stays exact, its bits change); with ``cu_seqlens_cpu``, a hint
+        smaller than its longest sequence raises ``ValueError``.
     _affine_split_count : int, optional
         Internal segment-cap override of ``use_affine_split=True``, used for
         testing. ``None`` lets the route choose the cap; an explicit positive
@@ -1959,7 +1974,15 @@ def chunk_gated_delta_rule(
         64 tokens per sequence. A new sequence in a slot must start with a
         prefill call or carry ``prefix_lens``. ``output_final_state=True``
         returns the pool (the states at the last chunk boundaries, not the
-        states after the last token); ``max_seqlen`` is not used. Requires ``backend="auto"``,
+        states after the last token); ``max_seqlen`` is not used. Without
+        ``initial_state`` the call is stateless (the form of a trainer's
+        forward pass): every sequence is whole and runs from the zero state,
+        its rows are bit for bit the rows the pool calls return for it, no
+        state is kept or returned, and ``state_indices``, ``prefix_lens``,
+        ``output_state`` and ``output_final_state=True`` are refused. The
+        rows carry no ``grad_fn``, also when an input requires grad: the
+        class has no backward (``train_states`` exports the state series one takes).
+        Requires ``backend="auto"``,
         ``use_cp="auto"``, ``gate_domain="log"`` with fp32 ``g`` and ``beta``,
         ``use_qk_l2norm_in_kernel=True``, bf16 ``q`` / ``k`` / ``v`` of head
         size 128, a v-head count that is a multiple of the q-head count and
@@ -1970,6 +1993,23 @@ def chunk_gated_delta_rule(
         instead of falling back.
         ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")``
         names the class; see ``flashinfer/batch_invariant/README.md``.
+    train_states : torch.Tensor, optional
+        Keyword-only, with ``batch_invariant=True`` and no ``initial_state``:
+        an fp32 buffer ``[slots, HV, 128, 128]`` with at least
+        ``flashinfer.batch_invariant.gdn.training_state_slots(seq_lens)`` rows
+        that the stateless call fills with the state every 64-token chunk of
+        every sequence starts from (row order:
+        ``flashinfer.batch_invariant.gdn.training_state_rows(seq_lens)``; per
+        sequence the zero state, then the state after each 64 tokens short
+        of its end). It is the row layout cuDNN's GDN backward takes as
+        ``state_checkpoints`` at a 64-token cadence, and the one term a
+        backward pass cannot recompute from a chunk's own inputs without
+        re-running the state scan. A state is ``[HV, 128 (value), 128 (key)]``,
+        one per v head. The output rows are unchanged, and each
+        stored state is bit for bit the state the inference prefill of the
+        same prefix leaves in its pool. The buffer must be 16-byte aligned
+        and share no memory with a state pool (or the storage after one),
+        the output, an input or the offsets.
 
     Returns
     -------
@@ -2012,6 +2052,8 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if train_states is not None and not batch_invariant:
+        raise ValueError("train_states requires batch_invariant=True")
     if batch_invariant:
         from .batch_invariant.gdn.api import chunk_gated_delta_rule_batch_invariant
 
@@ -2031,6 +2073,7 @@ def chunk_gated_delta_rule(
             output_state=output_state,
             state_indices=state_indices,
             prefix_lens=prefix_lens,
+            train_states=train_states,
             gate_domain=gate_domain,
             backend=backend,
             use_cp=use_cp,

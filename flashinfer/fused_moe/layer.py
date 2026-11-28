@@ -69,8 +69,10 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
+    FireflyNvfp4Config,
     BatchInvariantBf16Config,
     BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp4Config,
     FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
@@ -118,6 +120,7 @@ from .runners import (
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    FireflyNvfp4Runner,
     PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
@@ -136,6 +139,7 @@ from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .batch_invariant.runner import BatchInvariantMoeRunner
 from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
+from .batch_invariant.runner_fp4 import BatchInvariantFp4Runner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
@@ -173,6 +177,7 @@ _RunnerT = Union[
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    FireflyNvfp4Runner,
     PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
@@ -188,6 +193,7 @@ _RunnerT = Union[
     RecordsNvfp4Bf16Runner,
     RecordsNvfp4Runner,
     RecordsMxfp4Runner,
+    BatchInvariantFp4Runner,
 ]
 
 # Map backend-config class -> runner class
@@ -224,6 +230,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
+    FireflyNvfp4Config: FireflyNvfp4Runner,
     PrimsTsConfig: PrimsTsRunner,
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
@@ -240,6 +247,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     RecordsNvfp4Config: RecordsNvfp4Runner,
     RecordsMxfp4Config: RecordsMxfp4Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
+    BatchInvariantFp4Config: BatchInvariantFp4Runner,
 }
 
 

@@ -888,6 +888,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp4` | `BatchInvariantFp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp4` | `BatchInvariantFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `batch_invariant_fp8_per_tensor` | `BatchInvariantFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
@@ -925,6 +927,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `firefly_nvfp4` | `FireflyNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `ReLU2` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `FP16×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
@@ -965,6 +968,14 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+The batch-invariant fp4 backend (`BatchInvariantFp4Config`) computes the exponential and the divisions of the typed activations
+above with the part's SFU (`ex2.approx` / `rcp.approx`): deterministic and batch-invariant per part, the bits a property of
+the architecture family (the fold's instruction class and the SFU tables; SM100 and SM103 are one family, SM107 another),
+so an output is not, in general, equal across families; the ReLU family and `PowLU` are the declared sequences with no SFU
+step. The tests pin the SFU tables' digest per part they run on; on a part without a pinned digest the digest test skips
+and reports the part's digest, and the classes run unchanged (deterministic and batch-invariant on that part). The
+verification standard is in `flashinfer/batch_invariant/README.md`.
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).

@@ -28,40 +28,52 @@ def _reference(
     weight: torch.Tensor,
     eps: float,
     group: dist.ProcessGroup,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute torch references for allreduce, RMSNorm, and dynamic FP8 quant."""
-    reduced = allreduce_in.clone()
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch references for the reduced residual, the RMSNorm output and the FP8 scale.
+
+    As the kernel computes them with ``fp32_acc=True``: the ranks are summed in
+    fp32 and rounded once to the input dtype, the residual is added in that
+    dtype, and the norm is taken in fp32. Summing in the input dtype instead
+    rounds after every rank and lands on other FP8 codes.
+    """
+    reduced = allreduce_in.to(torch.float32, copy=True)
     dist.all_reduce(reduced, group=group)
+    reduced = reduced.to(allreduce_in.dtype)
     h = reduced if residual is None else reduced + residual
-    y = torch.nn.functional.rms_norm(h, (h.shape[-1],), weight=weight, eps=eps)
+    y = torch.nn.functional.rms_norm(
+        h.float(), (h.shape[-1],), weight=weight.float(), eps=eps
+    )
     scale = torch.clamp(
-        y.float().abs().amax(dim=-1, keepdim=True) / FP8_MAX,
+        y.abs().amax(dim=-1, keepdim=True) / FP8_MAX,
         min=MIN_FP8_SCALE,
     )
-    q = (
-        (y.float() / scale)
-        .clamp(
-            min=float(torch.finfo(torch.float8_e4m3fn).min),
-            max=float(torch.finfo(torch.float8_e4m3fn).max),
-        )
-        .to(torch.float8_e4m3fn)
-    )
-    return reduced, h, y, q, scale
+    return h, y, scale
+
+
+def _e4m3_step(x: torch.Tensor) -> torch.Tensor:
+    """Spacing of float8_e4m3fn values at magnitude ``x`` (3 mantissa bits)."""
+    exponent = torch.floor(torch.log2(x.abs().clamp(min=2.0**-6)))
+    return torch.exp2(exponent - 3)
 
 
 def _assert_dynamic_fp8_dequant_close(
     quant_out: torch.Tensor,
     scale_out: torch.Tensor,
-    ref_quant: torch.Tensor,
-    ref_scale: torch.Tensor,
+    y_ref: torch.Tensor,
+    scale_ref: torch.Tensor,
 ) -> None:
-    """Compare dequantized dynamic FP8 outputs with scale-aware tolerances."""
-    scale_max = float(ref_scale.max().item())
-    torch.testing.assert_close(
-        quant_out.float() * scale_out,
-        ref_quant.float() * ref_scale,
-        atol=scale_max * 0.05,
-        rtol=0.05,
+    """The dequantized output is within FP8 rounding of the unquantized reference.
+
+    Rounding to e4m3 moves a value by at most half a step. The further 0.1 step
+    covers the kernel's intermediate rounding to the input dtype. Comparing two
+    quantized tensors instead fails on any element that sits on a rounding
+    boundary, since one code is 6.25% to 12.5% of the value.
+    """
+    step = _e4m3_step(y_ref / scale_ref) * scale_ref
+    error = (quant_out.float() * scale_out - y_ref).abs()
+    worst = (error / step).max().item()
+    assert worst <= 0.6, (
+        f"dequantized output is {worst:.3f} FP8 steps from the reference"
     )
 
 
@@ -141,7 +153,7 @@ def _worker(
         )
         torch.cuda.synchronize()
 
-        _, h_ref, y_ref, q_ref, scale_ref = _reference(
+        h_ref, y_ref, scale_ref = _reference(
             allreduce_ref, residual_ref, weight, eps, group
         )
 
@@ -155,7 +167,7 @@ def _worker(
         )
         torch.testing.assert_close(scale_out, scale_ref, atol=1e-3, rtol=1e-3)
 
-        _assert_dynamic_fp8_dequant_close(quant_out, scale_out, q_ref, scale_ref)
+        _assert_dynamic_fp8_dequant_close(quant_out, scale_out, y_ref, scale_ref)
     finally:
         if workspace is not None:
             workspace.destroy()
@@ -245,14 +257,14 @@ def _worker_cuda_graph(
             graph.replay()
             torch.cuda.synchronize()
 
-            _, h_ref, _y_ref, q_ref, scale_ref = _reference(
+            h_ref, y_ref, scale_ref = _reference(
                 replay_input, residual, weight, eps, group
             )
             torch.testing.assert_close(
                 residual_out.float(), h_ref.float(), atol=8e-1, rtol=1e-2
             )
             torch.testing.assert_close(scale_out, scale_ref, atol=1e-3, rtol=1e-3)
-            _assert_dynamic_fp8_dequant_close(quant_out, scale_out, q_ref, scale_ref)
+            _assert_dynamic_fp8_dequant_close(quant_out, scale_out, y_ref, scale_ref)
     finally:
         if workspace is not None:
             workspace.destroy()

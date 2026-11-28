@@ -688,9 +688,15 @@ def _build_decode_gen_schedule(
         advance_on_wait=True,
     )
 
-    def _make_raw_kv_cfg(num_stages: int, tile_bytes: int) -> PipelineConfig:
+    def _make_raw_kv_cfg(
+        num_stages: int, tile_bytes: int, is_v: bool = False
+    ) -> PipelineConfig:
         """Create a per-operand raw pipeline with its actual TMA byte count."""
-        num_bytes = tile_bytes + cfg.smem_kv_sf_tile_transaction_bytes
+        num_bytes = tile_bytes + (
+            cfg.sf_stage_transaction_bytes(is_v)
+            if cfg.use_nvfp4_kv
+            else cfg.smem_kv_sf_tile_transaction_bytes
+        )
         bytes_per_load_warp = (
             num_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
         )
@@ -730,10 +736,23 @@ def _build_decode_gen_schedule(
             cta_layout_vmnk=cta_layout,
             advance_on_wait=True,
         )
+    smem_transformed_k_cfg = smem_transformed_v_cfg = smem_transformed_kv_cfg
+    if (
+        cfg.uses_dual_smem_transform
+        and cfg.transformed_v_stages > 0
+        and cfg.transformed_v_stages != cfg.transformed_kv_stages
+    ):
+        smem_transformed_v_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=cfg.transformed_v_stages,
+            producer_group=transform_kv_grp,
+            consumer_group=umma_hw,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
     smem_k0_cfg = _make_raw_kv_cfg(split_k0_stages, cfg.smem_k_tile_bytes)
     smem_k1_cfg = _make_raw_kv_cfg(split_k1_stages, cfg.smem_k_tile_bytes)
-    smem_v0_cfg = _make_raw_kv_cfg(split_v0_stages, cfg.smem_v_tile_bytes)
-    smem_v1_cfg = _make_raw_kv_cfg(split_v1_stages, cfg.smem_v_tile_bytes)
+    smem_v0_cfg = _make_raw_kv_cfg(split_v0_stages, cfg.smem_v_tile_bytes, True)
+    smem_v1_cfg = _make_raw_kv_cfg(split_v1_stages, cfg.smem_v_tile_bytes, True)
     smem_kv_raw_cfg = None
     if cfg.uses_keeps_transformed_kv:
         # The loader fills a raw NVFP4 ring for TransformKvTask, which in turn
@@ -1033,6 +1052,18 @@ def _build_decode_gen_schedule(
     kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
+    membership_plane_stride = None
+    if cutlass.const_expr(cfg.page_membership_planes > 1):
+        # Plane p of a G9-G32 route row starts p * (row words / planes) words
+        # in. A widened per-head stride spans Hkv rows; planes stay inside one
+        # head's row, so undo the widening once per CTA.
+        assert not isinstance(page_idx_kv, DirectSparseMetadataView)
+        membership_row_words = q_token_kv_block_sparse_page_membership_stride
+        if cutlass.const_expr(cfg.widens_sparse_metadata_rows_per_head):
+            membership_row_words = membership_row_words // num_heads_kv
+        membership_plane_stride = membership_row_words // Int32(
+            cfg.page_membership_planes
+        )
     if uses_page_offsets_task:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
@@ -1046,6 +1077,7 @@ def _build_decode_gen_schedule(
             num_heads_kv=num_heads_kv,
             q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
+            q_token_kv_block_sparse_page_membership_plane_stride=membership_plane_stride,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
             max_seq_len_kv=max_seq_len_kv,
@@ -1071,6 +1103,7 @@ def _build_decode_gen_schedule(
                 num_heads_kv=num_heads_kv,
                 q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
                 q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
+                q_token_kv_block_sparse_page_membership_plane_stride=membership_plane_stride,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
                 max_seq_len_kv=max_seq_len_kv,
@@ -1333,13 +1366,13 @@ def _build_decode_gen_schedule(
             # One-instance Keeps: separate K and V rings replace the raw K and
             # V rings at the MMA.
             transformed_kv = SmemTransformedKvResource(
-                pipeline_config=smem_transformed_kv_cfg,
+                pipeline_config=smem_transformed_k_cfg,
                 cfg=cfg,
                 src_smem_k0=smem_k0,
                 name="smemTransformedK",
             )
             transformed_kv1 = SmemTransformedKvResource(
-                pipeline_config=smem_transformed_kv_cfg,
+                pipeline_config=smem_transformed_v_cfg,
                 cfg=cfg,
                 src_smem_v0=smem_v0,
                 name="smemTransformedV",
@@ -3539,11 +3572,7 @@ def decode_gen_kernel(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
     q_group_cta_idx, h_k_idx, b_idx = split_kv_grid_coord(cfg, cute.arch.block_idx())
-    if cutlass.const_expr(
-        cfg.use_q_token_kv_block_sparse_route
-        and not cfg.shares_sparse_pattern
-        and not cfg.use_persistent_scheduler
-    ):
+    if cutlass.const_expr(cfg.widens_sparse_metadata_rows_per_head):
         if cutlass.const_expr(isinstance(g_page_idx_kv, DirectSparseMetadataView)):
             g_page_idx_kv = g_page_idx_kv.with_head(h_k_idx)
         else:
@@ -3866,9 +3895,7 @@ def fmha_decode_launch(
         if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
             # Interleaved rows hold the packed payload and then its scales.
             kv_tma_d = Int32(cfg.nvfp4_interleaved_row_bytes)
-        elif cutlass.const_expr(
-            cfg.use_nvfp4_kv and not cfg.store_transformed_kv_in_tmem
-        ):
+        elif cutlass.const_expr(cfg.uses_packed_nvfp4_raw_payload):
             kv_tma_d = d // Int32(2)
         if cutlass.const_expr(use_native_paged_kv):
             total_pages = num_physical_kv_pages
@@ -3880,7 +3907,9 @@ def fmha_decode_launch(
             v_tma_head_stride = v_head_stride
             v_tma_token_stride = v_token_stride
             if cutlass.const_expr(
-                cfg.store_transformed_kv_in_tmem and not cfg.use_nvfp4_interleaved_kv
+                cfg.store_transformed_kv_in_tmem
+                and not cfg.use_nvfp4_interleaved_kv
+                and not cfg.use_packed_nvfp4_raw_payload
             ):
                 # B4X16_P64 tensor-map strides are expressed in logical FP4
                 # lanes while the native cache reports packed-byte strides.
@@ -4002,7 +4031,7 @@ def fmha_decode_launch(
         tma_swizzle_k = cuda.TensorMapSwizzle.none
         tma_swizzle_v = cuda.TensorMapSwizzle.none
     elif cutlass.const_expr(cfg.use_nvfp4_kv):
-        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+        if cutlass.const_expr(not cfg.uses_packed_nvfp4_raw_payload):
             # Unpacking TMA consumes 128 logical FP4 lanes and materializes
             # one s128b-swizzled byte per lane in the raw SMEM stage.
             tma_box0_k = cfg.head_dim_kv_stage
@@ -4011,14 +4040,24 @@ def fmha_decode_launch(
             tma_swizzle_v = cuda.TensorMapSwizzle.s128b
         else:
             # Packed E2M1: two channels per byte, one raw head-dim stage.
-            tma_box0_k = cfg.raw_kv_head_dim_stage // 2
-            tma_box0_v = cfg.raw_kv_head_dim_stage // 2
+            # Whole-tile raw stages issue one 64-byte D128 slice box per
+            # slice (a 64B-swizzled box cannot be wider than 64 bytes).
+            packed_box_hd = (
+                cfg.head_dim_kv_stage
+                if cfg.use_whole_tile_nvfp4_raw_stage
+                else cfg.raw_kv_head_dim_stage
+            )
+            tma_box0_k = packed_box_hd // 2
+            tma_box0_v = packed_box_hd // 2
             tma_swizzle_k = cuda.TensorMapSwizzle.none
             if cutlass.const_expr(cfg.uses_sw128_nvfp4_raw_payload):
                 tma_swizzle_k = cuda.TensorMapSwizzle.s128b
-            elif cutlass.const_expr(cfg.uses_fast_smem_nvfp4_transform):
+            elif cutlass.const_expr(
+                cfg.uses_fast_smem_nvfp4_transform or cfg.use_packed_nvfp4_raw_payload
+            ):
                 # 64-byte packed rows; the 64B swizzle gives conflict-free
-                # 16-byte row loads in the fast SMEM converter.
+                # 16-byte row loads in the fast SMEM converter and in the
+                # packed-payload TMEM converters.
                 tma_swizzle_k = cuda.TensorMapSwizzle.s64b
             tma_swizzle_v = tma_swizzle_k
     if cutlass.const_expr(cfg.tile_size_kv == 256):
@@ -4107,7 +4146,9 @@ def fmha_decode_launch(
         v_box_dims = (tma_box0_v, tma_kv_tokens, 1, 1)
         kv_stride_order = (0, 1, 2, 3)
     if cutlass.const_expr(
-        cfg.store_transformed_kv_in_tmem and not cfg.use_nvfp4_interleaved_kv
+        cfg.store_transformed_kv_in_tmem
+        and not cfg.use_nvfp4_interleaved_kv
+        and not cfg.use_packed_nvfp4_raw_payload
     ):
         tma_desc_k = create_tensor_map_tiled_from_view(
             k_tma,
@@ -4218,17 +4259,91 @@ def fmha_decode_launch(
                 swizzle=swizzle,
             )
 
-        tma_desc_k_sf = sf_tma_desc(
-            k_sf_iter, k_sf_tma_strides, cuda.TensorMapSwizzle.none
-        )
-        # D512 V scales use the 128 B swizzle (FmhaDecodeConfig.swizzles_v_scale_factors).
-        tma_desc_v_sf = sf_tma_desc(
-            v_sf_iter,
-            v_sf_tma_strides,
-            cuda.TensorMapSwizzle.s128b
-            if cutlass.const_expr(cfg.swizzles_v_scale_factors)
-            else cuda.TensorMapSwizzle.none,
-        )
+        # Gather4 launches encode only their two flat scale maps; stage-sliced
+        # scales copy one D128 stage's columns per transaction; other
+        # profiles copy complete scale rows.
+        if cutlass.const_expr(cfg.uses_nvfp4_scale_gather4):
+            # Compact scale tensors: each page fragment's scale rows are one
+            # contiguous row of a flat 2-D map (32-bit words), gathered four
+            # rows per copy (FmhaDecodeConfig.uses_nvfp4_scale_gather4).
+            sf_frag_bytes = cfg.num_tokens_per_page * sf_per_token
+            sf_frag_rows = Int32(
+                Int64(total_pages)
+                * Int64(sf_storage_tokens_per_page // cfg.num_tokens_per_page)
+                * Int64(cfg.flat_nvfp4_scale_num_heads)
+            )
+
+            def sf_gather4_desc(sf_iter):
+                """Flat fragment-row TensorMap of one compact scale tensor."""
+                return create_tensor_map_tiled(
+                    global_address=sf_iter.toint(),
+                    dtype=Int32,
+                    global_dims=[sf_frag_bytes // 4, sf_frag_rows],
+                    global_strides=[sf_frag_bytes // 16],
+                    box_dims=[sf_frag_bytes // 4, 1],
+                    swizzle=cuda.TensorMapSwizzle.none,
+                )
+
+            tma_desc_k_sf = sf_gather4_desc(k_sf_iter)
+            tma_desc_v_sf = sf_gather4_desc(v_sf_iter)
+        elif cutlass.const_expr(cfg.uses_stage_sliced_nvfp4_sf):
+            # K: one token per box row, 16 B (the half row holding a D128
+            # stage's 8 scales); the loader selects the half by column.
+            k_token_stride = k_sf_tma_strides[0]
+            tma_desc_k_sf = cuda.create_tensor_map_tiled_from_view(
+                cute.make_tensor(
+                    k_sf_iter,
+                    cute.make_layout(
+                        (
+                            Int32(sf_per_token),
+                            Int32(sf_storage_tokens_per_page),
+                            h_k,
+                            total_pages,
+                        ),
+                        stride=(
+                            1,
+                            k_token_stride,
+                            k_sf_tma_strides[1],
+                            k_sf_tma_strides[2],
+                        ),
+                    ),
+                ),
+                box_dims=(16, cfg.num_tokens_per_page, 1, 1),
+                stride_order=(0, 1, 2, 3),
+                swizzle=cuda.TensorMapSwizzle.none,
+            )
+            # V: folded 4-token rows (128 B); a stage's scales are the 32 B
+            # at column 32 * stage of each row.
+            v_token_stride, v_head_stride, v_page_stride = v_sf_tma_strides
+            tma_desc_v_sf = cuda.create_tensor_map_tiled_from_view(
+                cute.make_tensor(
+                    v_sf_iter,
+                    cute.make_layout(
+                        sf_shape,
+                        stride=(
+                            1,
+                            v_token_stride * Int64(sf_r),
+                            v_head_stride,
+                            v_page_stride,
+                        ),
+                    ),
+                ),
+                box_dims=(32, cfg.num_tokens_per_page // sf_r, 1, 1),
+                stride_order=(0, 1, 2, 3),
+                swizzle=cuda.TensorMapSwizzle.none,
+            )
+        else:
+            tma_desc_k_sf = sf_tma_desc(
+                k_sf_iter, k_sf_tma_strides, cuda.TensorMapSwizzle.none
+            )
+            # D512 V scales use the 128 B swizzle (FmhaDecodeConfig.swizzles_v_scale_factors).
+            tma_desc_v_sf = sf_tma_desc(
+                v_sf_iter,
+                v_sf_tma_strides,
+                cuda.TensorMapSwizzle.s128b
+                if cutlass.const_expr(cfg.swizzles_v_scale_factors)
+                else cuda.TensorMapSwizzle.none,
+            )
 
     grid_x = q_groups
     grid_batch = b

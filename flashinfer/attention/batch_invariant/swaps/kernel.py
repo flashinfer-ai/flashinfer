@@ -30,11 +30,12 @@ from ..plan import (
     F_GROUP,
     F_KVHEAD,
     F_KVLEN,
+    F_KVPTR0,
     F_MODE,
+    F_NPAGES,
     F_QBASE,
     F_QLEN,
     F_QTOK0,
-    F_REQ,
     F_ROWS,
     F_SLOT,
     F_TILE_HI,
@@ -74,10 +75,17 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         pdl: bool = False,
+        *,
+        causal: bool = True,
+        sinks: bool = False,
     ):
+        self.sinks = (
+            sinks  # the sink step where a row is completed: a kernel of its own
+        )
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     @cute.jit
     def __call__(
@@ -86,20 +94,31 @@ class SwapsKernel:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
+        lse_mode: Int32,
         stream: cuda.CUstream,
     ):
-        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
+        st = SwapsPlan(
+            self.D,
+            self.g,
+            self.page,
+            self.n_pad,
+            self.ragged,
+            self.cap,
+            causal=self.causal,
+        )
+        st.sinks = self.sinks
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
@@ -120,16 +139,18 @@ class SwapsKernel:
             tma.atom_v,
             tma.tensor_v,
             mO,
+            mLse,
+            mSink,
             mWs,
             mGroups,
             mCounters,
             mDesc,
-            mKvIndptr,
             mKvIndices,
             c,
             nc,
             window_left,
             num_units,
+            lse_mode,
             st.qk_tiled_mma,
             st.pv_tiled_mma,
             st.q_smem_layout,
@@ -157,16 +178,18 @@ class SwapsKernel:
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        lse_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
         q_smem_layout: cute.ComposedLayout,
@@ -328,13 +351,15 @@ class SwapsKernel:
                     sKV_view,
                     q_prod,
                     kv_prod,
-                    mKvIndptr,
                     mKvIndices,
-                    mDesc[(u, F_REQ)],
+                    mDesc[(u, F_KVPTR0)],
+                    mDesc[(u, F_NPAGES)],
                     mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],
                     mDesc[(u, F_TILE_HI)],
+                    storage.kv_mbar.data_ptr(),
+                    u == bidx,
                 )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
@@ -464,6 +489,9 @@ class SwapsKernel:
                     mDesc[(u, F_TILE_HI)],
                     mDesc[(u, F_MODE)],
                     mDesc[(u, F_SLOT)],
+                    mLse,
+                    mSink,
+                    lse_mode,
                 )
                 fold_group(
                     st,
@@ -477,6 +505,9 @@ class SwapsKernel:
                     nc,
                     window_left,
                     Hq,
+                    mLse,
+                    mSink,
+                    lse_mode,
                 )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()

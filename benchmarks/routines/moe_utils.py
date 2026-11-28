@@ -318,6 +318,19 @@ def dequantize_fp8(
     return (tensor_fp8.float() * scale.float()).to(dtype)
 
 
+def pack_topk_ids(
+    expert_ids: torch.Tensor, expert_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack top-k ids for the TRT-LLM ``*_routed_moe`` APIs.
+
+    Same format as the library's ``_pack_prerouted_topk_ids``
+    (flashinfer/fused_moe/runners.py): ``(global id << 16) | bf16 weight bits``.
+    The kernel maps global ids to the local shard through ``local_expert_offset``.
+    """
+    weight_bits = expert_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    return ((expert_ids.to(torch.int32) << 16) | (weight_bits & 0xFFFF)).contiguous()
+
+
 def calculate_moe_tflops(
     num_tokens: int,
     hidden_size: int,
@@ -412,6 +425,9 @@ def calculate_moe_kernel_bandwidth(
             return 0.5 + 1 / SF_VEC_SIZE["mxfp4"]
         elif fmt == "mxfp8":
             return 1.0 + 1 / SF_VEC_SIZE["mxfp8"]
+        elif fmt == "mxint4":
+            # packed int4 + one bf16 scale per 32-element K block
+            return 0.5 + 2 / 32
         elif fmt == "fp8":
             # 1 e4m3
             return 1.0
@@ -482,7 +498,9 @@ def compute_routing(
     return routing_weights, selected_experts
 
 
-def add_common_moe_args(parser: argparse.ArgumentParser) -> None:
+def add_common_moe_args(
+    parser: argparse.ArgumentParser, hidden_size_required: bool = True
+) -> None:
     """
     Add common MoE CLI arguments to a parser.
 
@@ -490,6 +508,7 @@ def add_common_moe_args(parser: argparse.ArgumentParser) -> None:
 
     Args:
         parser: ArgumentParser to add arguments to
+        hidden_size_required: False for routines without an expert FFN (moe_routing)
     """
     parser.add_argument(
         "--num_tokens",
@@ -500,7 +519,7 @@ def add_common_moe_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--hidden_size",
         type=int,
-        required=True,
+        required=hidden_size_required,
         help="Hidden dimension size.",
     )
     parser.add_argument(
