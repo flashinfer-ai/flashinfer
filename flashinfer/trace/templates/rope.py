@@ -15,7 +15,7 @@
 """TraceTemplates for RoPE (Rotary Position Embedding) operations."""
 
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -24,6 +24,17 @@ from ._init_helpers import make_pos_ids, make_rope_cos_sin_cache
 
 _AxisT = Union[Var, Const]
 _InputT = Union[Tensor, Scalar]
+
+
+def _bind_trace_reference_dependencies(wrapper: Any, *dependencies: Any) -> Any:
+    """Mark helpers to inline with a serialized reference.
+
+    ``_render_reference_source`` inlines only the listed helpers and does not
+    follow their calls, so list every module-level helper that the reference
+    reaches, directly or through another helper.
+    """
+    wrapper._trace_reference_dependencies = dependencies
+    return wrapper
 
 
 # ── Reference helpers ────────────────────────────────────────────────────────
@@ -265,6 +276,40 @@ def _apply_rope_with_cos_sin_cache_reference(
         q_rope.reshape(query.shape).to(query.dtype),
         k_rope.reshape(key.shape).to(key.dtype),
     )
+
+
+_bind_trace_reference_dependencies(
+    _apply_rope_reference,
+    _rope_freqs,
+    _positions_from_indptr,
+    _rotate,
+    _apply_rope_core,
+)
+_bind_trace_reference_dependencies(
+    _apply_rope_pos_ids_reference,
+    _rope_freqs,
+    _rotate,
+    _apply_rope_core,
+)
+_bind_trace_reference_dependencies(
+    _apply_llama31_rope_reference,
+    _rope_freqs,
+    _llama31_freqs,
+    _positions_from_indptr,
+    _rotate,
+    _apply_rope_core,
+)
+_bind_trace_reference_dependencies(
+    _apply_llama31_rope_pos_ids_reference,
+    _rope_freqs,
+    _llama31_freqs,
+    _rotate,
+    _apply_rope_core,
+)
+_bind_trace_reference_dependencies(
+    _apply_rope_with_cos_sin_cache_reference,
+    _rotate,
+)
 
 
 # ── Shared axes ───────────────────────────────────────────────────────────────
@@ -765,6 +810,13 @@ def _rope_quantize_fp8_reference(
     )
 
 
+_bind_trace_reference_dependencies(
+    _rope_quantize_fp8_reference,
+    _fp8_saturation_bounds,
+    _rotate,
+)
+
+
 _ROPE_QUANT_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "num_q_heads": Const(abbrev="h"),
@@ -1084,6 +1136,14 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
                 k_cache[page_id, :, in_page_offset] = k_full[i]
                 v_cache[page_id, :, in_page_offset] = v_q[i]
     return q_rope_q, q_nope_q
+
+
+_bind_trace_reference_dependencies(
+    _rope_quantize_fp8_append_paged_kv_cache_reference,
+    _fp8_saturation_bounds,
+    _rotate,
+    _rope_quantize_fp8_reference,
+)
 
 
 def _rope_quantize_fp8_append_paged_kv_cache_init(
