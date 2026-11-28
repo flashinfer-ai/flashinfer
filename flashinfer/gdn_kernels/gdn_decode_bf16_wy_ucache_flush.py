@@ -125,8 +125,10 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
 try:
+    from .cute_dsl_cache import build_and_load_gdn_kernel
     from .device_target import gdn_compile_options, gdn_device_target
 except ImportError:  # tests and benchmarks load this file by path, outside the package
+    from flashinfer.gdn_kernels.cute_dsl_cache import build_and_load_gdn_kernel
     from flashinfer.gdn_kernels.device_target import (
         gdn_compile_options,
         gdn_device_target,
@@ -3808,12 +3810,11 @@ def gated_delta_rule_mtp_ucache_flush(
     # compiled artifact bakes in the captured tensors' layouts (H0 TMA descriptor,
     # q/k/v/out head+feature strides — only the batch mode-0 dim is dynamic), so a
     # process mixing HV values would otherwise reuse a cubin with the wrong strides.
-    cache_key: tuple = (
+    specialization: tuple = (
         "ucache-flush-v2",
         str(IO_TORCH),
         str(ST_TORCH),
         str(RING_TORCH),
-        target.compile_key,
         mbp,
         t_disc,
         n_valid,
@@ -3834,7 +3835,7 @@ def gated_delta_rule_mtp_ucache_flush(
     if _qkv_rs > 0:
         # Static descriptors bake tensor strides into the cubin: key on the
         # pool layout too (paged vs dense pools must compile separately).
-        cache_key = cache_key + (
+        specialization += (
             B,
             h0.shape[0],
             h0.stride(0),
@@ -3842,6 +3843,7 @@ def gated_delta_rule_mtp_ucache_flush(
             u_cache.stride(0),
             g_cache.stride(0),
         )
+    cache_key = (target.compile_key, specialization)
     mk = from_dlpack
 
     def mk_dyn(t):
@@ -3910,18 +3912,27 @@ def gated_delta_rule_mtp_ucache_flush(
     ]
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](
-            GdnDecodeUCacheFlushKernel(
-                disable_state_update=True,
-                min_blocks_per_mp=mbp,
-                t_input=t_disc,
-                n_valid=n_valid,
-                qkv_row_stride=_qkv_rs,
-                ab_native=_ab_native_flag,
-                ab_t_stride=_ab_ts,
-                pdl_trigger=pdl_trigger,
+        _CACHE[cache_key] = build_and_load_gdn_kernel(
+            "gdn_decode_bf16_wy_ucache_flush",
+            "ucache_flush",
+            specialization,
+            args,
+            lambda: cute.compile[gdn_compile_options(device)](
+                GdnDecodeUCacheFlushKernel(
+                    disable_state_update=True,
+                    min_blocks_per_mp=mbp,
+                    t_input=t_disc,
+                    n_valid=n_valid,
+                    qkv_row_stride=_qkv_rs,
+                    ab_native=_ab_native_flag,
+                    ab_t_stride=_ab_ts,
+                    pdl_trigger=pdl_trigger,
+                ),
+                *args,
             ),
-            *args,
+            target_arch=target.arch,
+            extra_key_files=(__file__,),
+            enable_tvm_ffi=False,
         )
     _CACHE[cache_key](*args)
 

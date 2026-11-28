@@ -155,6 +155,7 @@ class JitSpecCuteDsl(JitSpec):
         source_sha256: str,
         *,
         enable_tvm_ffi: bool = True,
+        target_arch: Optional[str] = None,
         export_compile_fn: Optional[Callable[[], Any]] = None,
     ):
         self.module_name = module_name
@@ -162,15 +163,18 @@ class JitSpecCuteDsl(JitSpec):
         self.compile_fn = compile_fn
         self.export_compile_fn = export_compile_fn
         self.enable_tvm_ffi = enable_tvm_ffi
-        self.module_dir_name = sanitize_symbol_name(
-            f"{module_name}_{_get_compile_arch()}_cute_dsl"
+        arch = (
+            _get_compile_arch()
+            if target_arch is None
+            else sanitize_symbol_name(target_arch.replace("_", ""))
         )
+        self.module_dir_name = sanitize_symbol_name(f"{module_name}_{arch}_cute_dsl")
         self.name = f"{self.module_dir_name}/{self.kernel_name}"
         self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
         self.expected_meta: dict[str, Any] = {
-            "arch": _get_compile_arch(),
+            "arch": arch,
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,
         }
@@ -180,6 +184,7 @@ class JitSpecCuteDsl(JitSpec):
         # Retained by build() as a fallback when the artifact cannot be loaded
         # from the disk cache because persistence failed or it was invalidated.
         self._compiled_kernel: Optional[Any] = None
+        self._export_failed = False
         self._exported_without_engine = False
 
     @property
@@ -261,6 +266,7 @@ class JitSpecCuteDsl(JitSpec):
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
+        self._export_failed = False
         self._exported_without_engine = False
         self._compiled_kernel = _compile_in_process(
             self.export_compile_fn or self.compile_fn
@@ -281,6 +287,7 @@ class JitSpecCuteDsl(JitSpec):
                 self._export()
                 exported = True
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
+                self._export_failed = True
                 logger.warning(
                     f"Failed to persist CuTe-DSL kernel {self.name} to "
                     f"{self.object_path}: {e}. The kernel will be recompiled next run."
@@ -308,7 +315,7 @@ class JitSpecCuteDsl(JitSpec):
             self._timed_build()
 
     def load(self) -> Any:
-        """The kernel to hand back: the exported artifact whenever one exists.
+        """Load the exported artifact or return the in-process kernel.
 
         The artifact is preferred even immediately after ``build()``.
         ``cute.compile`` does not reject a ``--gpu-arch`` the current device
@@ -323,13 +330,13 @@ class JitSpecCuteDsl(JitSpec):
         reloaded artifact, so every second run was exercising that form
         anyway.  Miss and hit now hand back the same thing.
 
-        Falls back to the in-process object when no valid artifact exists -- export
-        is best-effort (``build()`` logs and continues on failure) and the
-        on-disk cache can be disabled outright.
+        An export failure can leave an older object at the final path. Return
+        the freshly compiled kernel if export failed or the artifact is absent.
         """
-        kernel = self._cached_entry(load=True)
-        if kernel is not None:
-            return kernel
+        if not self._export_failed:
+            kernel = self._cached_entry(load=True)
+            if kernel is not None:
+                return kernel
         if self._compiled_kernel is None and self._exported_without_engine:
             if os.environ.get("FLASHINFER_DISABLE_JIT"):
                 raise MissingJITCacheError(
@@ -398,6 +405,7 @@ def build_and_load_cute_dsl_kernel(
     extra_key_files: Sequence[str] = (),
     *,
     enable_tvm_ffi: bool = True,
+    target_arch: Optional[str] = None,
     export_compile_fn: Optional[Callable[[], Any]] = None,
     source_sha256: Optional[str] = None,
 ) -> Any:
@@ -424,6 +432,9 @@ def build_and_load_cute_dsl_kernel(
     enable_tvm_ffi : bool
         Whether ``compile_fn`` compiles with TVM-FFI (see
         :class:`JitSpecCuteDsl`).
+    target_arch : str, optional
+        Explicit GPU architecture used by ``compile_fn``. When omitted, use
+        the CuTe-DSL environment or current device to key the artifact.
     export_compile_fn : Optional[Callable[[], Any]]
         ``compile_fn`` without the DSL's execution engine, for the exported
         object (see :class:`JitSpecCuteDsl`).
@@ -460,6 +471,7 @@ def build_and_load_cute_dsl_kernel(
         compile_fn,
         source_sha256,
         enable_tvm_ffi=enable_tvm_ffi,
+        target_arch=target_arch,
         export_compile_fn=export_compile_fn,
     )
     return spec.build_and_load()
