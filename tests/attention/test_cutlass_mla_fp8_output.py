@@ -79,6 +79,7 @@ def _planned_cutlass_backend(
     backend._output_scale = output_scale
     backend._kv_len = torch.tensor([1], dtype=torch.int32)
     backend._page_table = torch.zeros((1, 128), dtype=torch.int32)
+    backend._planned_required_pages = 1
     backend._empty_lse = torch.empty(0, dtype=torch.float32)
     return backend
 
@@ -302,14 +303,15 @@ def test_planned_cutlass_run_enforces_planned_dtypes(field, match):
     backend._cached_module = object()
     query = torch.empty((1, 128, 576), dtype=torch.bfloat16)
     kv_cache = torch.empty((1, 1, 576), dtype=torch.bfloat16)
+    kv_len = page_table = None
     if field == "query_dtype":
         query = query.to(torch.float16)
     elif field == "kv_dtype":
         kv_cache = kv_cache.to(torch.float16)
     elif field == "kv_len_dtype":
-        backend._kv_len = backend._kv_len.to(torch.int64)
+        kv_len, page_table = backend._kv_len.to(torch.int64), backend._page_table
     else:
-        backend._page_table = backend._page_table.to(torch.int64)
+        kv_len, page_table = backend._kv_len, backend._page_table.to(torch.int64)
 
     with pytest.raises(ValueError, match=match):
         backend.run_from_wrapper(
@@ -319,8 +321,8 @@ def test_planned_cutlass_run_enforces_planned_dtypes(field, match):
             lse=None,
             return_lse=False,
             profiler_buffer=None,
-            kv_len=None,
-            page_table=None,
+            kv_len=kv_len,
+            page_table=page_table,
             return_lse_base_on_e=False,
             o_scale=None,
             ckv_scale=None,
