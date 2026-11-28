@@ -6,6 +6,7 @@ import triton  # type: ignore[import]
 from flashinfer.triton.kernels.norm import rms_norm_kernel
 
 
+@torch.library.custom_op("flashinfer::triton_rms_norm", mutates_args=("out",))
 def rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -13,10 +14,14 @@ def rms_norm(
     eps: float,
     in_scale: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
+    *,
+    round_before_weight: bool = False,
 ) -> None:
     """RMS norm.
 
     Computes `out[i,j] = x[i,j] * weight[j] / sqrt(eps + sum(x[i]^2) / n)`.
+    With ``round_before_weight``, round the normalized value to the input dtype
+    before multiplying by the weight.
     """
 
     b, n = x.shape
@@ -42,8 +47,23 @@ def rms_norm(
         HAS_OUT_SCALE=out_scale is not None,
         HAS_OUTPUT=True,
         HAS_RESIDUAL=False,
+        ROUND_BEFORE_WEIGHT=round_before_weight,
         num_warps=num_warps,
     )
+
+
+@rms_norm.register_fake
+def _rms_norm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    in_scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    *,
+    round_before_weight: bool = False,
+) -> None:
+    pass
 
 
 def rms_norm_add_residual(
