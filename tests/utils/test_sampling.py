@@ -4980,6 +4980,9 @@ def test_top_k_top_p_sampling_rejects_unaligned_input_as_stored(api, vocab_size,
         (torch.float32, 2, 65537, 0, False),
         # base 4 bytes past an 8-byte boundary, enough for the radix kernel
         (torch.float16, 1, 65537, 2, False),
+        # base 8 bytes past a 16-byte boundary: enough for the clusters kernel, which
+        # is the only one called, though not for the radix kernel
+        (torch.float16, 2, 65536, 4, True),
     ],
 )
 def test_top_k_first_routes_only_aligned_rows_to_clusters_top_k(

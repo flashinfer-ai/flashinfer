@@ -2192,20 +2192,12 @@ def _top_k_first_fast_path_applicable(
         and select_k < x.size(-1)
     ):
         return False
-    # The radix top-k kernel faults on a base that is unaligned for its vector loads.
-    # Such an input takes the original kernels, which refuse it with a ValueError.
-    # Dynamo cannot trace arithmetic on data_ptr(), so a traced call takes them as well.
+    # The top-k kernel reads the input as stored and faults on an alignment it does not
+    # support. Such an input takes the original kernels, which refuse it with a
+    # ValueError. Dynamo cannot trace arithmetic on data_ptr(), so a traced call takes
+    # them as well.
     if torch.compiler.is_dynamo_compiling():
         return False
-    load_bytes = (
-        math.gcd(_TOP_K_VECTOR_LOAD_BYTES // x.element_size(), x.size(-1))
-        * x.element_size()
-    )
-    if x.data_ptr() % load_bytes != 0:
-        return False
-    # A non-deterministic call on SM100 goes to the clusters top-k kernel instead, which
-    # reads _TOP_K_CLUSTERS_VEC_SIZE elements at once from every row: its base and its
-    # row stride must both suit that width, or the call takes the original kernels.
     from .topk import TopKTieBreak, can_use_clusters_topk
 
     if can_use_clusters_topk(
@@ -2215,12 +2207,19 @@ def _top_k_first_fast_path_applicable(
         TopKTieBreak.NONE,
         False,
     ):
+        # A non-deterministic call on SM100 goes to the clusters kernel only. It reads
+        # _TOP_K_CLUSTERS_VEC_SIZE elements at once from every row, so its base and its
+        # row stride must both suit that width.
         clusters_load_bytes = _TOP_K_CLUSTERS_VEC_SIZE * x.element_size()
-        if x.data_ptr() % clusters_load_bytes != 0 or (
+        return x.data_ptr() % clusters_load_bytes == 0 and not (
             x.size(0) > 1 and x.stride(0) % _TOP_K_CLUSTERS_VEC_SIZE != 0
-        ):
-            return False
-    return True
+        )
+    # The radix kernel reads each row with vector loads of up to 16 bytes from the base.
+    load_bytes = (
+        math.gcd(_TOP_K_VECTOR_LOAD_BYTES // x.element_size(), x.size(-1))
+        * x.element_size()
+    )
+    return x.data_ptr() % load_bytes == 0
 
 
 def _top_k_first_fast_path(
