@@ -6,6 +6,7 @@ or dtypes. General workflow rules are in [AGENTS.md](../../AGENTS.md).
 - [cuDNN linear attention](#cudnn-linear-attention)
 - [cuDNN query sparse attention](#cudnn-query-sparse-attention)
 - [Attention plans and CUDA graphs](#attention-plan-and-cuda-graph-lifetime)
+- [SM100 blk64 Sage FP8 and KV tails](#sm100-blk64-sage-fp8-and-kv-tails)
 - [Grouped FP8 GEMM](#grouped-fp8-gemm)
 - [SM90 FP4 MegaMoE](#sm90-fp4-megamoe)
 - [Prims-TS decode dtypes](#prims-ts-decode-dtypes)
@@ -234,6 +235,55 @@ graph contract, without selecting a particular engine.
 The transfer changes admission only. Existing shape-override eligibility is
 unchanged. Test actual FP16 auto execution and retained captures; matching
 predicate decisions alone does not establish runtime or performance parity.
+
+## SM100 blk64 Sage FP8 and KV tails
+
+The CuTe blk64 kernel incorporates the Sage FP8 optimizations and prerequisite
+native-tail/synchronization fixes from Block-Sparse-Attention commit `9698fce`
+(upstream PR #9). Its existing MHA, head dimension 128, FP8 batch size 1 and
+4/8-head admission remains in place. Cake remains the default eligible `auto`
+backend; scheduler overrides and split-KV requests use CuTe as before.
+
+Keep the real Q/K/V sequence extents in FP8 TMA descriptors. BF16 partial KV
+blocks use the exact rank-5 descriptor, with Int32 or Int64 strides as required.
+The softmax takes the minimum of a physical tail length and an explicit
+`block_sizes` entry, even if the supplied entry is 64. It masks phantom sparse
+slots independently of whether `block_sizes` is present. Valid sparse indices
+and counts remain the caller's responsibility. Explicit block sizes accept
+`[Nk]`, `[B,Nk]` and `[B,H,Nk]` layouts.
+
+The direct CuTe API supports partial Q/KV tiles, variable counts, and empty rows
+(zero output and negative-infinite LSE). The `BlockSparseAttentionWrapper`
+accepts partial KV blocks for `vsa_sm100_blk64`, using ceiling division for the
+block count; its Q-length alignment and rejection of empty sparse rows remain.
+Other wrapper backends retain their existing alignment requirements.
+
+Unsplit FP8 uses CLC by default on SM100/SM103 and a separate epilogue shared
+allocation. Split-KV keeps the static default and aliases epilogue/KV storage,
+with the load/epilogue pipeline protecting reuse. CLC roles must not meet on a
+CTA-aligned barrier inside their independently progressing scheduler loops.
+FP8 TMEM allocation and teardown still synchronize the entire CTA.
+
+Automatic FP8 splitting uses the input device's SM count and Q-tile parallelism.
+For underfilled GPUs with variable counts, eager execution reads the maximum
+active count; capture/fake execution uses index capacity without host readback.
+Consequently eager and captured executions can select different, valid split
+counts. Warm the capture specialization before capture, or specify a split
+count when the application needs a fixed workspace bound. Do not read back
+metadata or change captured tensor storage during graph replay.
+
+Unsplit FP8 writes contiguous, aligned BSHD outputs directly. Other requested
+output layouts use an aligned temporary and copy back. The split combine also
+writes directly to aligned caller outputs. This reduces live
+output memory without retaining a resource pool. The compile-key schema is
+bumped for the changed layouts and masking behavior.
+
+Use `benchmarks/bench_bsa_sage_fp8.py` for matching CuTe/Cake/auto measurements;
+`--quantize` includes the existing fused quantizer and `--cold-l2` flushes L2
+for the eager GPU measurement. Graph replay measurements always flush L2. Compilation
+and warmup are excluded; warmed host enqueue and peak temporary allocation are
+reported separately. CUPTI measures the span of the operation's kernels,
+including gaps between multiple launches, rather than their summed durations.
 
 ## Grouped FP8 GEMM
 

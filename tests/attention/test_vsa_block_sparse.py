@@ -1192,10 +1192,8 @@ def test_vsa_blk64_sage_fp8_auto_kv_splits(num_heads, workspace):
     untested (and previously unimplemented: the port had no FP8-specific
     heuristic at all).
 
-    MB=8, NB=512 at density=0.5 -> exactly 256 active KV blocks per row,
-    with q_tiles = num_heads * MB well under the 512 large-Q gate for both
-    num_heads=4 and 8, so this exercises sm100_blk64_auto_fp8_kv_splits'
-    topk-tiered branches (not its own large-Q gate).
+    MB=8, NB=512 at density=0.5 gives 256 active KV blocks per row.
+    The expected split depends on Q-tile parallelism and the actual SM count.
     """
     from unittest.mock import patch
 
@@ -1229,7 +1227,12 @@ def test_vsa_blk64_sage_fp8_auto_kv_splits(num_heads, workspace):
     assert active_blocks == 256, (
         f"expected exactly 256 active KV blocks per row, got {active_blocks}"
     )
-    expected_kv_splits = sm100_blk64_auto_fp8_kv_splits(active_blocks, num_heads, M)
+    expected_kv_splits = sm100_blk64_auto_fp8_kv_splits(
+        active_blocks,
+        num_heads,
+        M,
+        num_sms=torch.cuda.get_device_properties(device).multi_processor_count,
+    )
     assert expected_kv_splits > 1, (
         f"test shape should exercise the split-KV path, got kv_splits={expected_kv_splits}"
     )

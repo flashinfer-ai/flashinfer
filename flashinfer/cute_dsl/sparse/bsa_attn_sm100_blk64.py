@@ -31,6 +31,7 @@ from .sm100_blk64.bsa_fwd_sm100 import BlockSparseAttnForwardSm100Blk64
 from .sm100_blk64.cute_dsl_utils import constexpr_tvm_ffi_converter_patched
 from .sm100_blk64.dispatch_helpers import (
     _get_device_arch,
+    get_sm100_device_num_sms,
     maybe_contiguous,
     torch2cute_dtype_map,
     validate_sm100_blk64_int32_bounds,
@@ -84,7 +85,8 @@ def bsa_attn_sm100_blk64_fwd(
         block_sparse_num: Number of KV blocks each Q block attends to (>= 1).
             Ignored when q2k_block_nums is provided.
         block_sizes: Actual token count per KV block (num_kv_blocks,), int32.  Pass None to
-            skip per-block padding masking (assumes all blocks are full).
+            use physical block lengths. Explicit sizes are capped by the physical tail.
+            Shapes [Nk], [B,Nk] and [B,H,Nk] are accepted.
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32.  When None, uses fixed block_sparse_num.
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
@@ -96,14 +98,14 @@ def bsa_attn_sm100_blk64_fwd(
             single-kernel behavior exactly.
         use_clc: Optional scheduler override (True forces the CLC persistent
             scheduler, False forces the static scheduler, None uses the
-            shape-based heuristic).
+            FP8 CLC policy on SM100/SM103 or the BF16 shape heuristic).
         q_scale, k_scale, v_scale: Sage FP8 quantization scales. All three
             must be provided together to enable the FP8 path (q/k/v must then
             be float8_e4m3fn); otherwise all three must be None and q/k/v must
             be bfloat16. With ``backend="cute"`` the FP8 path additionally
-            requires batch_size == 1, num_head in (4, 8), q2k_block_nums is
-            None, and block_sizes is None (upstream kernel limits, not specific
-            to this integration).
+            requires batch_size == 1 and num_head in (4, 8). Physical tails,
+            block_sizes and variable q2k_block_nums (including empty rows)
+            are supported.
         backend: ``"auto"`` (default; earlier releases defaulted to
             ``"cute"``, which a caller can pass to keep that behavior) runs the Cake backend for a Sage FP8 call on
             SM100/SM103 that leaves ``kv_splits=1`` and ``use_clc=None``, outside
@@ -114,7 +116,7 @@ def bsa_attn_sm100_blk64_fwd(
             refuses, runs the CuTe-DSL kernel exactly as ``"cute"`` does (BF16,
             SM107, split-KV, scheduler overrides, strided or misaligned views,
             larger tensors).
-            ``"cute"`` runs the CuTe-DSL kernel, unchanged. ``"cake"``
+            ``"cute"`` runs the CuTe-DSL kernel. ``"cake"``
             runs the Cake-generated Sage-FP8 kernel
             (:func:`flashinfer.cute_dsl.sparse.bsa_sage_sm100_cake.bsa_attn_sm100_sage_fwd_cake`)
             which requires the FP8 path and lifts its limits: any batch size
@@ -276,7 +278,11 @@ def bsa_attn_sm100_blk64_fwd(
         block_sizes = maybe_contiguous(block_sizes)
         assert block_sizes.dtype == torch.int32
         assert block_sizes.device == q_bhsd.device
-        assert block_sizes.shape == (num_kv_blocks,)
+        assert tuple(block_sizes.shape) in (
+            (num_kv_blocks,),
+            (batch_size, num_kv_blocks),
+            (batch_size, num_head, num_kv_blocks),
+        ), "block_sizes must be [Nk], [B,Nk], or [B,H,Nk]"
     else:
         block_sizes = None
 
@@ -300,16 +306,7 @@ def bsa_attn_sm100_blk64_fwd(
         uniform_block_sparse_num = int(block_sparse_num)
         q2k_block_nums = None
 
-    # Phantom block masking: when using variable block nums, the kernel pads
-    # each row's KV count to a multiple of 8 and fills phantom slots with the
-    # last real block.  Phantom blocks are only masked correctly when
-    # HasBlockSizes=True.  Passing a full-block sizes tensor (all 64)
-    # activates that path and ensures phantom blocks are zeroed in softmax.
-    if block_sizes is None and has_variable_block_nums:
-        block_sizes = torch.full(
-            (num_kv_blocks,), 64, dtype=torch.int32, device=q_bhsd.device
-        )
-        has_block_sizes = True
+    block_sizes_mode = block_sizes.ndim if has_block_sizes else 1
 
     validate_sm100_blk64_int32_bounds(
         q_bhsd,
@@ -321,6 +318,7 @@ def bsa_attn_sm100_blk64_fwd(
         q2k_block_nums,
     )
     use_int64_kv_strides = sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    use_exact_kv_layout = use_int64_kv_strides or seqlen_k % 64 != 0
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -333,11 +331,22 @@ def bsa_attn_sm100_blk64_fwd(
 
     if auto_kv_splits:
         if is_sage_fp8:
-            # Sage-FP8 requires a uniform top-k (validate_sm100_blk64_fp8_sage
-            # rejects q2k_block_nums), so uniform_block_sparse_num is always
-            # the FP8 heuristic's topk_num.
+            num_sms = get_sm100_device_num_sms(
+                q.device.index
+                if q.device.index is not None
+                else torch.cuda.current_device()
+            )
+            policy_blocks = uniform_block_sparse_num
+            if has_variable_block_nums:
+                policy_blocks = q2k_block_index.shape[-1]
+                if (
+                    batch_size * num_head * num_q_blocks < num_sms
+                    and not is_fake_mode()
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    policy_blocks = int(q2k_block_nums.max())
             kv_splits_i = sm100_blk64_auto_fp8_kv_splits(
-                uniform_block_sparse_num, num_head, seqlen_q
+                policy_blocks, num_head, seqlen_q, batch=batch_size, num_sms=num_sms
             )
         else:
             kv_splits_i = sm100_blk64_auto_kv_splits(
@@ -350,10 +359,12 @@ def bsa_attn_sm100_blk64_fwd(
         allow_fallback=auto_kv_splits,
         output_dtype=output_dtype,
     )
-    allow_empty_block_nums = kv_splits_i > 1
+    allow_empty_block_nums = kv_splits_i > 1 or has_variable_block_nums
     if use_clc is None:
         if kv_splits_i > 1:
             use_clc_scheduler = False
+        elif is_sage_fp8 and arch in (100, 103):
+            use_clc_scheduler = True
         else:
             use_clc_scheduler = choose_sm100_blk64_use_clc(
                 q_bhsd,
@@ -367,6 +378,12 @@ def bsa_attn_sm100_blk64_fwd(
     pack_gqa = False
 
     split_offsets = None
+    output_is_requested = False
+    can_write_requested_out = (
+        requested_out is not None
+        and requested_out.is_contiguous()
+        and requested_out.data_ptr() % 16 == 0
+    )
     if kv_splits_i > 1:
         if has_variable_block_nums or use_clc_scheduler:
             split_offsets = build_sm100_blk64_kv_split_offsets(
@@ -389,15 +406,26 @@ def bsa_attn_sm100_blk64_fwd(
             device=q_bhsd.device,
         )
     else:
-        # Always allocate a fresh contiguous BHSD output for the kernel (even
-        # when the caller pre-allocated a BSHD `out`); a transposed view of
-        # `out` would hand the kernel a non-contiguous destination, which the
-        # upstream kernel does not expect. Copy back into `out` at the end.
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
-            dtype=output_dtype,
-            device=q_bhsd.device,
-        )
+        if is_sage_fp8:
+            # TMA supports BSHD output strides. Store directly in the public
+            # layout to avoid a transpose kernel and an extra live output.
+            output = (
+                requested_out
+                if requested_out is not None and can_write_requested_out
+                else torch.empty(
+                    (batch_size, seqlen_q, num_head, head_dim_v),
+                    dtype=output_dtype,
+                    device=q_bhsd.device,
+                )
+            )
+            output_is_requested = output is requested_out
+            out_bhsd = output.transpose(1, 2)
+        else:
+            out_bhsd = torch.empty(
+                (batch_size, num_head, seqlen_q, head_dim_v),
+                dtype=output_dtype,
+                device=q_bhsd.device,
+            )
         lse = (
             requested_lse
             if requested_lse is not None
@@ -436,8 +464,10 @@ def bsa_attn_sm100_blk64_fwd(
             use_clc_scheduler,
             "bhsd_native",
             use_int64_kv_strides,
+            use_exact_kv_layout,
+            block_sizes_mode,
             is_sage_fp8,
-            "tvm_ffi_env_stream_v1",
+            "tvm_ffi_bsa9_native_tails_v2",
         ),
         (
             q_bhsd,
@@ -488,6 +518,8 @@ def bsa_attn_sm100_blk64_fwd(
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
+            block_sizes_mode=block_sizes_mode,
+            use_exact_kv_layout=use_exact_kv_layout,
             num_splits=kv_splits_i,
             use_int64_kv_strides=use_int64_kv_strides,
         )
@@ -525,16 +557,19 @@ def bsa_attn_sm100_blk64_fwd(
             kv_splits_i,
             arch,
             output_dtype=torch.bfloat16 if is_sage_fp8 else None,
+            out=requested_out if can_write_requested_out else None,
             use_fast_16_split=(
                 kv_splits_i == 16
                 and not has_variable_block_nums
                 and uniform_block_sparse_num >= kv_splits_i
             ),
         )
+        output_is_requested = can_write_requested_out
 
     result_out = out_bhsd.transpose(1, 2).contiguous()
-    if requested_out is not None and result_out is not requested_out:
-        requested_out.copy_(result_out)
+    if requested_out is not None:
+        if not output_is_requested:
+            requested_out.copy_(result_out)
         result_out = requested_out
     if requested_lse is not None and lse is not requested_lse:
         requested_lse.copy_(lse)
