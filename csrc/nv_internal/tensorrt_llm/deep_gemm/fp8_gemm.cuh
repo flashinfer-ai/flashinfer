@@ -180,8 +180,8 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
              int ld_d, float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n,
              uint32_t shape_k, uint32_t block_m, uint32_t block_n, uint32_t block_k,
              uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-             LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms,
-             uint32_t smem_size) {
+             LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size,
+             bool enable_pdl = false) {
   auto tma_a_desc = make_2d_tma_a_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k,
                                        block_m, block_k, num_groups, gemm_type, ld_a);
   auto tma_b_desc = make_2d_tma_b_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k,
@@ -206,11 +206,15 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
   // Clusters for TMA multicast
   // NOTES: `>= 4` cluster size will cause performance degradation
-  cudaLaunchAttribute attr;
-  attr.id = cudaLaunchAttributeClusterDimension;
-  attr.val.clusterDim = {num_tma_multicast, 1, 1};
-  config.attrs = &attr;
-  config.numAttrs = 1;
+  cudaLaunchAttribute attrs[2];
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim = {num_tma_multicast, 1, 1};
+  // PDL: the grid may be scheduled while the previous kernel drains; the kernel
+  // runs griddepcontrol.wait before its first TMA load.
+  attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[1].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+  config.attrs = attrs;
+  config.numAttrs = 2;
 
   NormalSchedulerInput input;
   input.shape_m = shape_m;
@@ -229,7 +233,7 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
                    uint32_t shape_k, uint32_t block_m, uint32_t block_n, uint32_t block_k,
                    uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
                    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms,
-                   uint32_t smem_size) {
+                   uint32_t smem_size, bool enable_pdl = false) {
   auto tma_a_desc =
       make_2d_tma_a_desc_swapAB(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m,
                                 block_k, num_groups, gemm_type, ld_a);
@@ -256,11 +260,15 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
   config.stream = stream;
 
   // Clusters for TMA multicast
-  cudaLaunchAttribute attr;
-  attr.id = cudaLaunchAttributeClusterDimension;
-  attr.val.clusterDim = {num_tma_multicast, 1, 1};
-  config.attrs = &attr;
-  config.numAttrs = 1;
+  cudaLaunchAttribute attrs[2];
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim = {num_tma_multicast, 1, 1};
+  // PDL: the grid may be scheduled while the previous kernel drains; the kernel
+  // runs griddepcontrol.wait before its first TMA load.
+  attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[1].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+  config.attrs = attrs;
+  config.numAttrs = 2;
 
   NormalSchedulerInputSwapAB input;
   input.shape_n = shape_n;

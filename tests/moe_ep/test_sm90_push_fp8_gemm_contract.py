@@ -119,25 +119,19 @@ def test_private_fp8_jit_checks_exact_caches_before_nvcc() -> None:
     assert "fp8_moe_fc1_fused_jit_cache_ready" in launcher
 
     compiler = _csrc_source("nv_internal/tensorrt_llm/deep_gemm/compiler.cuh")
-    upstream_start = compiler.index(
-        'std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_")'
-    )
-    private_start = jit.index(
-        "std::string const name =", jit.index("grouped_kernel_cache_path")
-    )
-    upstream_key = compiler[upstream_start : compiler.index(";", upstream_start) + 1]
-    private_key = jit[private_start : jit.index(";", private_start) + 1]
-
-    def normalize_key(source: str) -> str:
-        return (
-            "".join(source.split())
-            .replace("const", "")
-            .replace("swap_ab", "swapAB")
-            .replace("gemm_type_to_string(gemm_type)", '"GroupedWithOffset"')
-            .replace('+"_"+"GroupedWithOffset"', '+"_GroupedWithOffset"')
-        )
-
-    assert normalize_key(private_key) == normalize_key(upstream_key)
+    # The probe and Compiler::build get the cache name from one helper, so the
+    # probe cannot fall behind when the name changes (e.g. its version token).
+    helper_start = compiler.index("inline std::string kernel_cache_name(")
+    helper = compiler[helper_start : compiler.index("\n}", helper_start)]
+    assert "kKernelCacheVersion" in helper
+    build = compiler[compiler.index("Runtime* build(") :]
+    assert "std::string name = kernel_cache_name(" in build
+    assert '"gemm_' not in build
+    private_start = jit.index("grouped_kernel_cache_path")
+    private_key = jit[private_start : jit.index("getCacheDir()", private_start)]
+    assert "deep_gemm::jit::kernel_cache_name(" in private_key
+    assert "deep_gemm::GemmType::GroupedWithOffset, swap_ab)" in private_key
+    assert '"gemm_' not in private_key
 
     _assert_in_order(
         runner,
