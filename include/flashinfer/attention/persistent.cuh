@@ -655,11 +655,14 @@ struct BlockBatchReductionPersistent {
   }
 };
 
+// Everything a cooperative launch of the two-stage persistent kernel is built from: the
+// per-task kernel traits, the dynamic shared memory the kernel requests, and the kernel
+// itself. The planner has to size the grid from the number of CTAs this launch can keep
+// resident, so both the planner and the launcher read the configuration from here instead
+// of restating it.
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
-cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
-                                          const uint32_t num_blks_x, const uint32_t num_blks_y,
-                                          const cudaStream_t stream) {
+struct BatchPagedAttentionPersistentConfig {
   static_assert(HEAD_DIM_VO <= 256 && HEAD_DIM_QK <= 256,
                 "BatchAttention (holistic persistent) kernel does not support "
                 "head_dim > 256; use the FA2 prefill/decode path for large head dims.");
@@ -667,41 +670,96 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
-  constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
-  constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
-  constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
-  constexpr uint32_t NUM_MMA_KV_1 = 4;
-  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
-  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
+  static constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
+  static constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
+  static constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
+  static constexpr uint32_t NUM_MMA_KV_1 = 4;
+  static constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  static constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,
                                 NUM_MMA_D_VO, NUM_WARPS_Q_1, NUM_WARPS_KV_1, PosEncodingMode::kNone,
                                 DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
-  constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
-  constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
-  constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
-  constexpr uint32_t NUM_MMA_KV_2 = 2;
+  static constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
+  static constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
+  static constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
+  static constexpr uint32_t NUM_MMA_KV_2 = 2;
   using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
                                 NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
                                 DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
 
   // Attention state reduction kernel
-  constexpr uint32_t NUM_THREADS =
+  static constexpr uint32_t NUM_THREADS =
       KTraits1::NUM_THREADS > KTraits2::NUM_THREADS ? KTraits1::NUM_THREADS : KTraits2::NUM_THREADS;
   using ReductionKTraits =
       StateReductionKernelTraits<HEAD_DIM_VO, 4, NUM_THREADS, DTypeO, DTypeO, IdType>;
-  size_t smem_size =
-      max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));
-  smem_size = max(smem_size, ReductionKTraits::SMEM_SIZE);
+
+  static size_t smem_size() {
+    size_t size =
+        max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));
+    return max(size, ReductionKTraits::SMEM_SIZE);
+  }
+
+  static auto kernel() {
+    return PersistentKernelTemplate<
+        BlockBatchPagedAttentionPersistent<KTraits1, Params, EQUAL_KV_STRIDES>,
+        BlockBatchPagedAttentionPersistent<KTraits2, Params, EQUAL_KV_STRIDES>,
+        BlockBatchReductionPersistent<ReductionKTraits>>;
+  }
+};
+
+// How many CTAs of this kernel a cooperative launch can keep resident on one SM, and the
+// shared memory that number was computed for. A cooperative launch rejects a grid larger
+// than blocks_per_sm * num_sm, and how many fit depends on the shared memory the traits
+// below request, which varies with head dim, dtype and the device's per-SM budget; a
+// head-dim test in the planner cannot see any of that. blocks_per_sm is 0 when a single
+// CTA already asks for more shared memory than the device can give it.
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
+cudaError_t BatchPagedAttentionPersistentResidentBlocks(int* blocks_per_sm, size_t* smem_size) {
+  using Config =
+      BatchPagedAttentionPersistentConfig<CTA_TILE_Q_1, CTA_TILE_Q_2, HEAD_DIM_QK, HEAD_DIM_VO,
+                                          MASK_MODE, EQUAL_KV_STRIDES, AttentionVariant, Params>;
+  const size_t size = Config::smem_size();
+  *smem_size = size;
+
+  // Raising the opt-in limit is what fails for a kernel whose request exceeds the device's
+  // per-block budget, and the error it returns ("invalid argument") says nothing about the
+  // request. Answer that question here instead, so a size that cannot be hosted is reported
+  // as a kernel that does not fit rather than as a failed call.
+  int device = 0;
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  if (size > static_cast<size_t>(max_smem_per_block_optin)) {
+    *blocks_per_sm = 0;
+    return cudaSuccess;
+  }
+
+  auto kernel = Config::kernel();
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks_per_sm, kernel,
+                                                                     Config::NUM_THREADS, size));
+  return cudaSuccess;
+}
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
+cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
+                                          const uint32_t num_blks_x, const uint32_t num_blks_y,
+                                          const cudaStream_t stream) {
+  using Config =
+      BatchPagedAttentionPersistentConfig<CTA_TILE_Q_1, CTA_TILE_Q_2, HEAD_DIM_QK, HEAD_DIM_VO,
+                                          MASK_MODE, EQUAL_KV_STRIDES, AttentionVariant, Params>;
+  const size_t smem_size = Config::smem_size();
 
   // Launch persistent kernel
-  auto kernel = PersistentKernelTemplate<
-      BlockBatchPagedAttentionPersistent<KTraits1, Params, EQUAL_KV_STRIDES>,
-      BlockBatchPagedAttentionPersistent<KTraits2, Params, EQUAL_KV_STRIDES>,
-      BlockBatchReductionPersistent<ReductionKTraits>>;
+  auto kernel = Config::kernel();
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   dim3 nblks(num_blks_x, num_blks_y);
-  dim3 nthrs(NUM_THREADS);
+  dim3 nthrs(Config::NUM_THREADS);
   void* args[] = {(void*)&params_1, (void*)&params_2};
   FLASHINFER_CUDA_CALL(
       cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

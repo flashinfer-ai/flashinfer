@@ -307,6 +307,37 @@ def test_batch_attention_correctness(
     get_compute_capability(torch.device(device="cuda"))[0] == 12,
     reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
 )
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_batch_attention_grid_fits_a_cooperative_launch(head_dim):
+    """The persistent kernel is launched cooperatively, so every block of the planned grid
+    has to be resident at once.
+
+    How many CTAs fit one SM depends on the shared memory the kernel for this head dim and
+    dtype requests, not on the head dim alone: on a 100 KiB opt-in part (SM89) the head_dim
+    128 kernel holds one CTA per SM, while the planner used to ask for two, and the launch
+    was rejected with ``cudaErrorCooperativeLaunchTooLarge`` for every sequence length.
+    head_dim 64 is the control - it fits two CTAs and ran before this fix.
+    """
+    _run_attention(
+        kv_lens=[2048],
+        qo_lens=[128],
+        page_block_size=16,
+        num_kv_heads=8,
+        num_qo_heads=8,
+        head_dim=head_dim,
+        v_scale=None,
+        causal=True,
+        layout="NHD",
+        test_dtype=torch.bfloat16,
+        logits_soft_cap=0.0,
+        device="cuda",
+    )
+
+
+@pytest.mark.xfail(
+    get_compute_capability(torch.device(device="cuda"))[0] == 12,
+    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
+)
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])
