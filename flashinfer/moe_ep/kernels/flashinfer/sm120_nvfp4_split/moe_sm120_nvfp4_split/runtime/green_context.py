@@ -1,0 +1,982 @@
+"""Execution resources for the split SM120 MegaMoE kernels."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import torch
+
+# Diagnostics only (p2p_split): emulate model work between dispatch and compute
+# (MEGAMOE_XNUMA_OVERLAP_US with MODE overlap|serial), or inject per-rank
+# delays before the dispatch and the forwarder (MEGAMOE_XNUMA_JITTER_US).
+_OVERLAP_US = float(os.environ.get("MEGAMOE_XNUMA_OVERLAP_US", "0"))
+_OVERLAP_MODE = os.environ.get("MEGAMOE_XNUMA_OVERLAP_MODE", "overlap")
+JITTER_US = float(os.environ.get("MEGAMOE_XNUMA_JITTER_US", "0"))
+# Diagnostics only: per-launch CUDA-event phase times, printed at close().
+_PHASES = os.environ.get("MEGAMOE_LAUNCH_PHASES", "0") == "1"
+# p2p_split, opt-in (MEGA_SPLIT_LATE_FORWARDER_JOIN=1): join the cross-NUMA
+# forwarder after the K2 finalizer instead of before it. Measured neutral on
+# NVFP4 (EP8 DSv4.1/GLM5.3 T16-64 within +-0.3 %, EP16 within the run-to-run
+# spread), so the default keeps the original order.
+# FlashInfer runs the K2 finalizer after this graph (primary context), so the
+# late join has no position to move to; the opt-in is not ported.
+_LATE_FORWARDER_JOIN = False
+_CYCLES_PER_US = None
+
+
+def spin_us(stream: torch.cuda.Stream, us: float) -> None:
+    """Enqueue a device busy-wait of about ``us`` microseconds on ``stream``."""
+    global _CYCLES_PER_US
+    if us <= 0:
+        return
+    if _CYCLES_PER_US is None:
+        from cuda.bindings import runtime as cudart
+
+        err, khz = cudart.cudaDeviceGetAttribute(
+            cudart.cudaDeviceAttr.cudaDevAttrClockRate, torch.cuda.current_device())
+        _CYCLES_PER_US = (khz / 1000.0) if int(err) == 0 and khz else 2000.0
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(int(us * _CYCLES_PER_US))
+
+
+def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
+    error = result[0]
+    if int(error) != 0:
+        raise RuntimeError(f"{operation} failed with CUDA error {error!r}")
+    return result[1:]
+
+
+def query_sm_resource_info(
+    device: Optional[int] = None,
+) -> tuple[int, int, int]:
+    """Return SM count, minimum partition, and co-schedule alignment."""
+
+    from cuda.core import Device
+
+    torch.cuda.init()
+    if device is None:
+        device = torch.cuda.current_device()
+    sm_resource = Device(device).resources.sm
+    return (
+        int(sm_resource.sm_count),
+        max(1, int(sm_resource.min_partition_size)),
+        max(1, int(sm_resource.coscheduled_alignment)),
+    )
+
+
+def query_green_context_sm_counts(
+    *,
+    k1_sm_count: int,
+    device: Optional[int] = None,
+) -> tuple[int, int]:
+    """Return the actual CUDA-aligned K1/K2 partition sizes."""
+    from cuda.bindings import driver as cuda
+
+    torch.cuda.init()
+    if device is None:
+        device = torch.cuda.current_device()
+    _check_cuda(cuda.cuInit(0), "cuInit")
+    (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
+    (sm_resource,) = _check_cuda(
+        cuda.cuDeviceGetDevResource(
+            cuda_device,
+            cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+        ),
+        "cuDeviceGetDevResource",
+    )
+    total_sms = int(sm_resource.sm.smCount)
+    min_partition = max(1, int(sm_resource.sm.minSmPartitionSize))
+    if not min_partition <= k1_sm_count <= total_sms - min_partition:
+        raise ValueError(f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs")
+    groups, num_groups, remainder = _check_cuda(
+        cuda.cuDevSmResourceSplitByCount(1, sm_resource, 0, k1_sm_count),
+        "cuDevSmResourceSplitByCount",
+    )
+    if int(num_groups) != 1 or len(groups) != 1:
+        raise RuntimeError("CUDA did not produce one K1 SM partition.")
+    counts = (int(groups[0].sm.smCount), int(remainder.sm.smCount))
+    if min(counts) <= 0:
+        raise RuntimeError(f"CUDA produced an empty SM partition: {counts}.")
+    return counts
+
+
+@dataclass
+class NativeGreenContextResources:
+    """Four disjoint Green Contexts for K1, TX, RX, and K2.
+
+    CUDA does not support recursively splitting an already partitioned SM
+    resource.  The general resource API is therefore used once to create all
+    four groups.  TX and RX use separate communication partitions: a sender
+    waiting for an ACK can therefore never prevent the matching receiver CTA
+    from becoming resident (and vice versa).
+    """
+
+    k1_sm_count: int
+    k2_sm_count: int
+    comm_sm_count: int
+    comm_tx_sm_count: int
+    comm_rx_sm_count: int
+    comm_streams: tuple[torch.cuda.ExternalStream, ...]
+    green_contexts: tuple[Any, ...]
+    execution_contexts: tuple[Any, ...]
+    _raw_comm_streams: tuple[Any, ...]
+    _core_resources: tuple[Any, ...]
+    _driver_resources: tuple[Any, ...]
+    _closed: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        k1_sm_count: int,
+        k2_sm_count: int,
+        comm_tx_sm_count: int,
+        comm_rx_sm_count: int,
+        num_comm_streams: int = 4,
+        device: Optional[int] = None,
+    ) -> "NativeGreenContextResources":
+        from .driver_caps import driver_cuda_version, hybrid_sm_split_available
+
+        if not hybrid_sm_split_available():
+            version = driver_cuda_version()
+            raise RuntimeError(
+                "the GIN-ring hybrid (gin_hybrid) needs four Green Contexts from "
+                "the CUDA 13.1 structured SM split (cuDevSmResourceSplit); this "
+                f"driver reports CUDA {version // 1000}.{version % 1000 // 10}. Use "
+                "p2p_split (the cross-NUMA default without --comm_backend) or a "
+                "driver >= 13.1.")
+        from cuda.bindings import driver as cuda
+        from cuda.core import Device, SMResourceOptions
+
+        torch.cuda.init()
+        if device is None:
+            device = torch.cuda.current_device()
+        if num_comm_streams <= 0:
+            raise ValueError("num_comm_streams must be positive")
+
+        _check_cuda(cuda.cuInit(0), "cuInit")
+        (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
+        sm_resource = Device(device).resources.sm
+        total_sms = int(sm_resource.sm_count)
+        min_partition = max(1, int(sm_resource.min_partition_size))
+        alignment = max(1, int(sm_resource.coscheduled_alignment))
+        requested_counts = (
+            k1_sm_count,
+            comm_tx_sm_count,
+            comm_rx_sm_count,
+            k2_sm_count,
+        )
+        if sum(requested_counts) != total_sms:
+            raise ValueError(
+                f"K1/TX/RX/K2 counts {requested_counts} must sum to "
+                f"the device SM count {total_sms}."
+            )
+        if min(requested_counts) < min_partition:
+            raise ValueError(
+                f"each Green Context needs at least {min_partition} SMs; "
+                f"got {requested_counts}."
+            )
+        if any(count % alignment for count in requested_counts[:-1]):
+            raise ValueError(
+                f"K1/TX/RX counts must be multiples of {alignment}; "
+                f"got {requested_counts[:-1]}."
+            )
+
+        (driver_version,) = _check_cuda(cuda.cuDriverGetVersion(), "cuDriverGetVersion")
+        if driver_version < 13010:
+            # CUDA 13.0 cannot split a remainder again. Partition once into
+            # equal disjoint units, then merge units in resource descriptors.
+            # The unstructured remainder supplies the exact K2 allocation.
+            unit = alignment
+            n_units = sum(requested_counts[:-1]) // unit
+            (raw_resource,) = _check_cuda(
+                cuda.cuDeviceGetDevResource(cuda_device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+                "cuDeviceGetDevResource",
+            )
+            units, count, remainder = _check_cuda(
+                cuda.cuDevSmResourceSplitByCount(n_units, raw_resource, 0, unit),
+                "cuDevSmResourceSplitByCount",
+            )
+            if int(count) != n_units or any(int(x.sm.smCount) != unit for x in units[:n_units]):
+                raise RuntimeError("CUDA cannot supply the requested disjoint SM units")
+            resource_sets = []
+            cursor = 0
+            for requested in requested_counts[:-1]:
+                stop = cursor + requested // unit
+                resource_sets.append(tuple(units[cursor:stop]))
+                cursor = stop
+            resource_sets.append((remainder,))
+            actual_counts = tuple(sum(int(x.sm.smCount) for x in part) for part in resource_sets)
+            groups = ()
+            driver_resources = tuple(units[:n_units]) + (remainder,)
+        else:
+            # Structured API creates heterogeneous partitions in one call.
+            options = SMResourceOptions(
+                count=[k1_sm_count, comm_tx_sm_count, comm_rx_sm_count, None],
+                coscheduled_sm_count=[alignment, alignment, alignment, 2],
+                backfill=True,
+            )
+            groups, remainder = sm_resource.split(options)
+            if int(remainder.sm_count) != 0 or len(groups) != 4:
+                raise RuntimeError("CUDA did not produce the requested K1/TX/RX/K2 split.")
+            actual_counts = tuple(int(group.sm_count) for group in groups)
+            driver_resources = tuple(cuda.CUdevResource(group.handle) for group in groups)
+            resource_sets = [(resource,) for resource in driver_resources]
+        if actual_counts != requested_counts:
+            raise RuntimeError(f"CUDA produced {actual_counts}, requested {requested_counts}.")
+        contexts = []
+        execution_contexts = []
+        raw_streams = []
+        try:
+            for label, resource in zip(
+                ("K1", "COMM_TX", "COMM_RX", "K2"), resource_sets
+            ):
+                (descriptor,) = _check_cuda(
+                    cuda.cuDevResourceGenerateDesc(list(resource), len(resource)),
+                    f"cuDevResourceGenerateDesc({label})",
+                )
+                (green_context,) = _check_cuda(
+                    cuda.cuGreenCtxCreate(
+                        descriptor,
+                        cuda_device,
+                        cuda.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
+                    ),
+                    f"cuGreenCtxCreate({label})",
+                )
+                contexts.append(green_context)
+                (execution_context,) = _check_cuda(
+                    cuda.cuCtxFromGreenCtx(green_context),
+                    f"cuCtxFromGreenCtx({label})",
+                )
+                execution_contexts.append(execution_context)
+
+            for index in range(num_comm_streams):
+                priority = -1 if index < 2 else 0
+                # Runner order is dispatch-TX, dispatch-RX, combine-TX,
+                # combine-RX.  Even streams use TX; odd streams use RX.
+                context_index = 1 if index % 2 == 0 else 2
+                (raw_stream,) = _check_cuda(
+                    cuda.cuGreenCtxStreamCreate(
+                        contexts[context_index],
+                        cuda.CUstream_flags.CU_STREAM_NON_BLOCKING,
+                        priority,
+                    ),
+                    f"cuGreenCtxStreamCreate(COMM:{index})",
+                )
+                raw_streams.append(raw_stream)
+        except Exception:
+            for raw_stream in reversed(raw_streams):
+                cuda.cuStreamDestroy(raw_stream)
+            for context in reversed(contexts):
+                cuda.cuGreenCtxDestroy(context)
+            raise
+
+        external_streams = tuple(
+            torch.cuda.ExternalStream(int(raw_stream), device=device)
+            for raw_stream in raw_streams
+        )
+        return cls(
+            k1_sm_count=actual_counts[0],
+            comm_sm_count=actual_counts[1] + actual_counts[2],
+            comm_tx_sm_count=actual_counts[1],
+            comm_rx_sm_count=actual_counts[2],
+            k2_sm_count=actual_counts[3],
+            comm_streams=external_streams,
+            green_contexts=tuple(contexts),
+            execution_contexts=tuple(execution_contexts),
+            _raw_comm_streams=tuple(raw_streams),
+            _core_resources=tuple(groups),
+            _driver_resources=driver_resources,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        from cuda.bindings import driver as cuda
+
+        for stream in self.comm_streams:
+            stream.synchronize()
+        for index, raw_stream in reversed(list(enumerate(self._raw_comm_streams))):
+            _check_cuda(
+                cuda.cuStreamDestroy(raw_stream),
+                f"cuStreamDestroy(COMM:{index})",
+            )
+        for label, context in reversed(
+            list(
+                zip(
+                    ("K1", "COMM_TX", "COMM_RX", "K2"),
+                    self.green_contexts,
+                )
+            )
+        ):
+            _check_cuda(
+                cuda.cuGreenCtxDestroy(context),
+                f"cuGreenCtxDestroy({label})",
+            )
+        self._closed = True
+
+
+@dataclass
+class NativeGreenContextPair:
+    """A workspace-owned K1/K2 partition shared by sequential layer graphs."""
+
+    k1_sm_count: int
+    k2_sm_count: int
+    green_contexts: tuple[Any, Any]
+    execution_contexts: tuple[Any, Any]
+    _closed: bool = False
+
+    @classmethod
+    def create(cls, *, k1_sm_count: int, device: int) -> "NativeGreenContextPair":
+        from cuda.bindings import driver as cuda
+
+        _check_cuda(cuda.cuInit(0), "cuInit")
+        (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
+        (resource,) = _check_cuda(
+            cuda.cuDeviceGetDevResource(
+                cuda_device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            ),
+            "cuDeviceGetDevResource",
+        )
+        minimum = max(1, int(resource.sm.minSmPartitionSize))
+        if not minimum <= k1_sm_count <= int(resource.sm.smCount) - minimum:
+            raise ValueError(f"invalid K1 SM count {k1_sm_count}")
+        groups, count, remainder = _check_cuda(
+            cuda.cuDevSmResourceSplitByCount(1, resource, 0, k1_sm_count),
+            "cuDevSmResourceSplitByCount",
+        )
+        if int(count) != 1 or len(groups) != 1:
+            raise RuntimeError("CUDA did not produce one K1 SM partition.")
+        resources = (groups[0], remainder)
+        contexts, execution_contexts = [], []
+        try:
+            for resource in resources:
+                (descriptor,) = _check_cuda(
+                    cuda.cuDevResourceGenerateDesc([resource], 1),
+                    "cuDevResourceGenerateDesc",
+                )
+                (context,) = _check_cuda(
+                    cuda.cuGreenCtxCreate(
+                        descriptor,
+                        cuda_device,
+                        cuda.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
+                    ),
+                    "cuGreenCtxCreate",
+                )
+                contexts.append(context)
+                (execution_context,) = _check_cuda(
+                    cuda.cuCtxFromGreenCtx(context), "cuCtxFromGreenCtx"
+                )
+                execution_contexts.append(execution_context)
+        except Exception:
+            for context in reversed(contexts):
+                cuda.cuGreenCtxDestroy(context)
+            raise
+        return cls(
+            k1_sm_count=int(resources[0].sm.smCount),
+            k2_sm_count=int(resources[1].sm.smCount),
+            green_contexts=tuple(contexts),
+            execution_contexts=tuple(execution_contexts),
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        from cuda.bindings import driver as cuda
+
+        # Workspace teardown closes every referring graph before this call.
+        for context in reversed(self.green_contexts):
+            _check_cuda(cuda.cuGreenCtxDestroy(context), "cuGreenCtxDestroy")
+        self._closed = True
+
+
+@dataclass
+class NativeGreenContextGraph:
+    """A native CUDA Graph with K1/K2 nodes bound to disjoint contexts."""
+
+    root_stream: torch.cuda.Stream
+    k1_sm_count: int
+    k2_sm_count: int
+    _graph: Any
+    _graph_exec: Any
+    _green_contexts: tuple[Any, Any]
+    _owns_green_contexts: bool
+    _launch_ready: torch.cuda.Event
+    _launch_done: torch.cuda.Event
+    _compiled_kernels: tuple[Any, ...]
+    _post_graph_k3: Optional[Callable[[], None]]
+    _post_graph_finalizer: Optional[Callable[[], None]] = None
+    _closed: bool = False
+    # p2p_split cross-NUMA transport (transport.xnuma.XnumaTransport) or None.
+    _xnuma: Optional[Any] = None
+    _compute_ready: Optional[torch.cuda.Event] = None
+    _jitter_rng: Optional[Any] = None
+    _phase_events: Optional[list] = None
+
+    @staticmethod
+    def _library_kernels(compiled_kernels: tuple[Any, ...]) -> dict[int, Any]:
+        """Map captured CUfunctions to context-independent CUkernels.
+
+        Keep the compiled owners on the graph: a CUkernel is valid only while
+        its CUlibrary remains loaded. CUDA-dialect executors alone do not
+        retain/expose all of this information through kernel_functions.
+        """
+        from cuda.bindings import driver as cuda
+
+        kernels = {}
+        libraries = set()
+        for compiled in compiled_kernels:
+            library = cuda.CUlibrary(int(compiled.library))
+            if int(library) in libraries:
+                continue
+            libraries.add(int(library))
+            (count,) = _check_cuda(
+                cuda.cuLibraryGetKernelCount(library), "cuLibraryGetKernelCount"
+            )
+            (handles,) = _check_cuda(
+                cuda.cuLibraryEnumerateKernels(count, library),
+                "cuLibraryEnumerateKernels",
+            )
+            for kernel in handles:
+                (function,) = _check_cuda(
+                    cuda.cuKernelGetFunction(kernel), "cuKernelGetFunction"
+                )
+                kernels[int(function)] = kernel
+        return kernels
+
+    @staticmethod
+    def _bind_kernel(params, function, kernel, context, device) -> None:
+        from cuda.bindings import driver as cuda
+
+        # The original function's launch attributes are not graph parameters.
+        # Preserve them when selecting a CUkernel in another context.
+        for name in (
+            "CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES",
+            "CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT",
+        ):
+            attribute = getattr(cuda.CUfunction_attribute, name)
+            (value,) = _check_cuda(
+                cuda.cuFuncGetAttribute(attribute, function), "cuFuncGetAttribute"
+            )
+            _check_cuda(
+                cuda.cuKernelSetAttribute(attribute, value, kernel, device),
+                "cuKernelSetAttribute",
+            )
+        # With a non-null func, CUDA ignores ctx and uses func's context.
+        params.func = cuda.CUfunction(0)
+        params.kern = kernel
+        params.ctx = context
+
+    @staticmethod
+    def _function_handles(executor: Any) -> set[int]:
+        context = getattr(executor, "exec_context", None)
+        functions = getattr(context, "kernel_functions", None)
+        if not functions:
+            # CUDA-dialect executors load cudaKernel_t through the generated
+            # host shim and do not expose driver CUfunction objects here.
+            return set()
+        return {int(function) for function in functions}
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        root_stream: torch.cuda.Stream,
+        k1_stream: torch.cuda.Stream,
+        k2_stream: torch.cuda.Stream,
+        k1_executor: Any,
+        k2_executor: Any,
+        k2_drain_executor: Optional[Any],
+        k2_finalizer_executor: Optional[Any],
+        k3_executor: Optional[Any],
+        compiled_kernels: tuple[Any, ...],
+        compiled_role_owners: Optional[dict] = None,
+        launch_k1: Callable[[], None],
+        launch_k2: Callable[[], None],
+        launch_k2_drain: Optional[Callable[[], None]],
+        launch_k2_finalizer: Optional[Callable[[], None]],
+        launch_k3: Optional[Callable[[], None]],
+        launch_reset: Optional[Callable[[], None]] = None,
+        launch_transport_end: Optional[Callable[[], None]] = None,
+        k1_sm_count: int,
+        k1_grid_clusters: Optional[int] = None,
+        k2_grid_clusters: Optional[int] = None,
+        k2_drain_grid_clusters: Optional[int] = None,
+        green_resources: Optional[
+            NativeGreenContextResources | NativeGreenContextPair
+        ] = None,
+        device: Optional[int] = None,
+        xnuma: Optional[Any] = None,
+    ) -> "NativeGreenContextGraph":
+        """Rebind K1/K2 to Green Contexts; join K3 on the root stream."""
+        from cuda.bindings import driver as cuda
+        from cuda.bindings import runtime as cudart
+
+        torch.cuda.init()
+        if device is None:
+            device = torch.cuda.current_device()
+
+        raw_root = cudart.cudaStream_t(root_stream.cuda_stream)
+        capture_ready = torch.cuda.Event()
+        k1_done = torch.cuda.Event()
+        k2_done = torch.cuda.Event()
+        torch.cuda.synchronize()
+
+        _check_cuda(
+            cudart.cudaStreamBeginCapture(
+                raw_root,
+                cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal,
+            ),
+            "cudaStreamBeginCapture",
+        )
+        try:
+            if launch_reset is not None:
+                # Queue reset and publication belong to one replay DAG. This
+                # prevents replay N+1 from clearing state while replay N's
+                # Green-Context consumers are still retiring.
+                with torch.cuda.stream(root_stream):
+                    launch_reset()
+            capture_ready.record(root_stream)
+            k1_stream.wait_event(capture_ready)
+            k2_stream.wait_event(capture_ready)
+            launch_k1()
+            forwarder_done = None
+            if xnuma is not None:
+                # Forked once K1 retired: K1's SMs are free and K2 is fully
+                # resident, so the polling forwarder never blocks persistent
+                # residency. K1-stream completion includes it.
+                forwarder_done = xnuma.launch_forwarder_after(k1_stream)
+            serialize_k2 = os.environ.get("MEGA_DIAG_SERIALIZE_K2", "0") == "1"
+            if serialize_k2 and launch_k2_drain is not None:
+                raise RuntimeError(
+                    "MEGA_DIAG_SERIALIZE_K2 is incompatible with K2 tail "
+                    "reclaim because the drain shares the K2 work queue."
+                )
+            if serialize_k2:
+                k1_done.record(k1_stream)
+                k2_stream.wait_event(k1_done)
+            launch_k2()
+            if launch_k2_drain is not None:
+                # The drain runs on the K1 stream, so it starts only after K1
+                # releases that Green partition and then joins the main K2
+                # worker grid through the shared atomic queue.
+                launch_k2_drain()
+            if forwarder_done is not None and not _LATE_FORWARDER_JOIN:
+                k1_stream.wait_event(forwarder_done)
+            if not serialize_k2:
+                k1_done.record(k1_stream)
+            k2_done.record(k2_stream)
+            root_stream.wait_event(k1_done)
+            root_stream.wait_event(k2_done)
+            if launch_transport_end is not None:
+                with torch.cuda.stream(root_stream):
+                    launch_transport_end()
+            # Primary-context finalizer and K3 run after this mixed-context
+            # graph. Embedding the finalizer here can stall a pooled Green
+            # Context launch (reproduced at the N16/dual-N8 decode bucket).
+            # launch() orders both before caller-visible completion.
+            (graph,) = _check_cuda(
+                cudart.cudaStreamEndCapture(raw_root),
+                "cudaStreamEndCapture",
+            )
+        except Exception:
+            # End capture to release stream capture state when the host wrapper
+            # failed after begin-capture. The original error remains primary.
+            cudart.cudaStreamEndCapture(raw_root)
+            raise
+
+        k1_handles = cls._function_handles(k1_executor)
+        if k2_drain_executor is not None:
+            k1_handles.update(cls._function_handles(k2_drain_executor))
+        k2_handles = cls._function_handles(k2_executor)
+        if k1_handles and k2_handles and k1_handles & k2_handles:
+            _check_cuda(cuda.cuGraphDestroy(graph), "cuGraphDestroy")
+            raise RuntimeError("K1 and K2 CUfunction handle sets overlap.")
+
+        _check_cuda(cuda.cuInit(0), "cuInit")
+        (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
+        owns_green_contexts = green_resources is None
+        if green_resources is None:
+            (sm_resource,) = _check_cuda(
+                cuda.cuDeviceGetDevResource(
+                    cuda_device,
+                    cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+                ),
+                "cuDeviceGetDevResource",
+            )
+            total_sms = int(sm_resource.sm.smCount)
+            min_partition = max(1, int(sm_resource.sm.minSmPartitionSize))
+            if not min_partition <= k1_sm_count <= total_sms - min_partition:
+                raise ValueError(
+                    f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs"
+                )
+            groups, num_groups, remainder = _check_cuda(
+                cuda.cuDevSmResourceSplitByCount(1, sm_resource, 0, k1_sm_count),
+                "cuDevSmResourceSplitByCount",
+            )
+            if int(num_groups) != 1 or len(groups) != 1:
+                _check_cuda(cuda.cuGraphDestroy(graph), "cuGraphDestroy")
+                raise RuntimeError("CUDA did not produce one K1 SM partition.")
+            resources = (groups[0], remainder)
+            k1_sm_count = int(resources[0].sm.smCount)
+            k2_sm_count = int(resources[1].sm.smCount)
+            green_contexts = []
+            execution_contexts = []
+        else:
+            resources = None
+            k1_sm_count = green_resources.k1_sm_count
+            k2_sm_count = green_resources.k2_sm_count
+            green_contexts = [
+                green_resources.green_contexts[0],
+                green_resources.green_contexts[-1],
+            ]
+            execution_contexts = [
+                green_resources.execution_contexts[0],
+                green_resources.execution_contexts[-1],
+            ]
+        if compiled_role_owners is not None and any(role >= 2 for role in compiled_role_owners):
+            if not isinstance(green_resources, NativeGreenContextResources):
+                raise ValueError("Transport graph roles require four Green partitions")
+            execution_contexts.extend((green_resources.execution_contexts[1],
+                                       green_resources.execution_contexts[2]))
+        try:
+            library_kernels = cls._library_kernels(compiled_kernels)
+            role_functions = {}
+            if compiled_role_owners is not None:
+                for role, owners in compiled_role_owners.items():
+                    for function in cls._library_kernels(
+                        tuple(x for x in owners if x is not None)
+                    ):
+                        if (
+                            function in role_functions
+                            and role_functions[function] != role
+                        ):
+                            raise RuntimeError("Compiled K1/K2 role identities overlap")
+                        role_functions[function] = role
+            if green_resources is None:
+                for index, resource in enumerate(resources):
+                    (descriptor,) = _check_cuda(
+                        cuda.cuDevResourceGenerateDesc([resource], 1),
+                        f"cuDevResourceGenerateDesc(K{index + 1})",
+                    )
+                    (green_context,) = _check_cuda(
+                        cuda.cuGreenCtxCreate(
+                            descriptor,
+                            cuda_device,
+                            cuda.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
+                        ),
+                        f"cuGreenCtxCreate(K{index + 1})",
+                    )
+                    green_contexts.append(green_context)
+                    (execution_context,) = _check_cuda(
+                        cuda.cuCtxFromGreenCtx(green_context),
+                        f"cuCtxFromGreenCtx(K{index + 1})",
+                    )
+                    execution_contexts.append(execution_context)
+
+            nodes, num_nodes = _check_cuda(
+                cuda.cuGraphGetNodes(graph, 0),
+                "cuGraphGetNodes(count)",
+            )
+            nodes, num_nodes = _check_cuda(
+                cuda.cuGraphGetNodes(graph, num_nodes),
+                "cuGraphGetNodes",
+            )
+            rebound = [0] * len(execution_contexts)
+            for node in nodes:
+                (node_type,) = _check_cuda(
+                    cuda.cuGraphNodeGetType(node),
+                    "cuGraphNodeGetType",
+                )
+                if node_type != cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+                    continue
+                (params,) = _check_cuda(
+                    cuda.cuGraphKernelNodeGetParams(node),
+                    "cuGraphKernelNodeGetParams",
+                )
+                function = int(params.func)
+                grid_blocks = (
+                    int(params.gridDimX) * int(params.gridDimY) * int(params.gridDimZ)
+                )
+                if compiled_role_owners is not None:
+                    context_index = role_functions.get(function)
+                elif k1_handles or k2_handles:
+                    context_index = (
+                        0
+                        if function in k1_handles
+                        else 1 if function in k2_handles else None
+                    )
+                else:
+                    # Public CuTeDSL 4.6 uses a CUDA-dialect host shim whose
+                    # executor does not expose CUfunction handles. K1/K2 are
+                    # persistent cluster=1 kernels.  A kernel normally has
+                    # one CTA per partition SM, but K2 may deliberately
+                    # launch two resident CTAs per SM.  Use the explicitly
+                    # supplied captured-grid volumes to identify nodes; the
+                    # Green Context still owns only k1_sm_count/k2_sm_count
+                    # physical SMs.
+                    context_index = (
+                        0
+                        if grid_blocks
+                        in {
+                            k1_grid_clusters or k1_sm_count,
+                            k2_drain_grid_clusters,
+                        }
+                        else (
+                            1
+                            if grid_blocks == (k2_grid_clusters or k2_sm_count)
+                            else None
+                        )
+                    )
+                if context_index is None:
+                    continue
+
+                updated = cuda.CUgraphNodeParams()
+                updated.type = cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+                kernel = library_kernels.get(function)
+                if kernel is None:
+                    raise RuntimeError(
+                        f"No retained CUkernel for captured function {function}."
+                    )
+                cls._bind_kernel(
+                    updated.kernel,
+                    params.func,
+                    kernel,
+                    execution_contexts[context_index],
+                    cuda_device,
+                )
+                updated.kernel.gridDimX = params.gridDimX
+                updated.kernel.gridDimY = params.gridDimY
+                updated.kernel.gridDimZ = params.gridDimZ
+                updated.kernel.blockDimX = params.blockDimX
+                updated.kernel.blockDimY = params.blockDimY
+                updated.kernel.blockDimZ = params.blockDimZ
+                updated.kernel.sharedMemBytes = params.sharedMemBytes
+                updated.kernel.kernelParams = params.kernelParams
+                updated.kernel.extra = params.extra
+                _check_cuda(
+                    cuda.cuGraphNodeSetParams(node, updated),
+                    f"cuGraphNodeSetParams(K{context_index + 1})",
+                )
+                rebound[context_index] += 1
+
+            if min(rebound) <= 0:
+                raise RuntimeError(
+                    "Failed to identify both CuTeDSL K1/K2 graph nodes: "
+                    f"rebound={tuple(rebound)}."
+                )
+
+            instantiate_params = cuda.CUDA_GRAPH_INSTANTIATE_PARAMS()
+            (graph_exec,) = _check_cuda(
+                cuda.cuGraphInstantiateWithParams(graph, instantiate_params),
+                "cuGraphInstantiateWithParams",
+            )
+        except Exception:
+            if owns_green_contexts:
+                for green_context in reversed(green_contexts):
+                    cuda.cuGreenCtxDestroy(green_context)
+            cuda.cuGraphDestroy(graph)
+            raise
+
+        return cls(
+            root_stream=root_stream,
+            k1_sm_count=k1_sm_count,
+            k2_sm_count=k2_sm_count,
+            _graph=graph,
+            _graph_exec=graph_exec,
+            _green_contexts=(green_contexts[0], green_contexts[1]),
+            _owns_green_contexts=owns_green_contexts,
+            _launch_ready=torch.cuda.Event(),
+            _launch_done=torch.cuda.Event(),
+            _compiled_kernels=compiled_kernels,
+            _post_graph_k3=launch_k3,
+            _post_graph_finalizer=launch_k2_finalizer,
+            _xnuma=xnuma,
+        )
+
+    def _launch_post_graph(self) -> None:
+        # Callbacks use the current stream for both eager and outer capture.
+        # The K2 finalizer precedes the p2p_split scatter, which precedes K3.
+        if self._post_graph_finalizer is not None:
+            self._post_graph_finalizer()
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
+        if self._xnuma is not None:
+            # p2p_split: copy the returned cross-NUMA rows before K3 reads them.
+            self._xnuma.before_k3(torch.cuda.current_stream())
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
+        if self._post_graph_k3 is not None:
+            self._post_graph_k3()
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
+
+    def _launch_captured(self, caller_stream: torch.cuda.Stream) -> None:
+        """Outer CUDA graph capture: add the compute graph as a child node."""
+        from cuda.bindings import driver as cuda
+
+        caller_cuda = cuda.CUstream(caller_stream.cuda_stream)
+        if self._xnuma is not None:
+            # Epoch bump + sender precede the child graph in capture order;
+            # the capture info below then includes them as dependencies.
+            self._xnuma.before_compute(caller_stream)
+        (
+            capture_status,
+            _capture_id,
+            capture_graph,
+            dependencies,
+            _edge_data,
+            num_dependencies,
+        ) = _check_cuda(
+            cuda.cuStreamGetCaptureInfo(caller_cuda),
+            "cuStreamGetCaptureInfo",
+        )
+        if capture_status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+            raise RuntimeError(
+                "the current torch stream reported capture without an active "
+                "CUDA capture graph"
+            )
+        (child_node,) = _check_cuda(
+            cuda.cuGraphAddChildGraphNode(
+                capture_graph,
+                dependencies,
+                num_dependencies,
+                self._graph,
+            ),
+            "cuGraphAddChildGraphNode",
+        )
+        _check_cuda(
+            cuda.cuStreamUpdateCaptureDependencies(
+                caller_cuda,
+                [child_node],
+                None,
+                1,
+                cuda.CUstreamUpdateCaptureDependencies_flags.CU_STREAM_SET_CAPTURE_DEPENDENCIES,
+            ),
+            "cuStreamUpdateCaptureDependencies",
+        )
+        # K3 stays on the primary context after the mixed-context child.
+        # The frontend callback must use the current stream, not a captured
+        # root-stream handle, so outer capture records this dependency.
+        with torch.cuda.stream(caller_stream):
+            self._launch_post_graph()
+
+    def launch_dispatch(self, caller_stream: torch.cuda.Stream) -> None:
+        """Start the call once the caller's inputs are ready: for p2p_split,
+        the epoch bump and the network sender run on the root stream now, so
+        work the caller enqueues before :meth:`launch_compute` overlaps the
+        transfer."""
+        self._launch_ready.record(caller_stream)
+        self.root_stream.wait_event(self._launch_ready)
+        if _PHASES:
+            self._phase_mark(start=True)
+        if self._xnuma is not None:
+            # Epoch bump + sender in stream order before the compute graph.
+            self._xnuma.before_compute(self.root_stream)
+        if _PHASES:
+            self._phase_mark()
+
+    def launch_compute(self, caller_stream: torch.cuda.Stream) -> None:
+        """Replay the compute graph after the caller's intervening work, then
+        complete K3 and rejoin the caller before its next reset."""
+        self._launch_compute(caller_stream, after_caller_work=True)
+
+    def _launch_compute(self, caller_stream: torch.cuda.Stream, *, after_caller_work: bool) -> None:
+        from cuda.bindings import driver as cuda
+
+        if after_caller_work:
+            if self._compute_ready is None:
+                self._compute_ready = torch.cuda.Event()
+            self._compute_ready.record(caller_stream)
+            self.root_stream.wait_event(self._compute_ready)
+        _check_cuda(
+            cuda.cuGraphLaunch(
+                self._graph_exec,
+                cuda.CUstream(self.root_stream.cuda_stream),
+            ),
+            "cuGraphLaunch",
+        )
+        # Phase marks (diagnostics) follow the finalizer, scatter and K3.
+        with torch.cuda.stream(self.root_stream):
+            self._launch_post_graph()
+        self._launch_done.record(self.root_stream)
+        caller_stream.wait_event(self._launch_done)
+
+    def _phase_mark(self, start: bool = False) -> None:
+        if self._phase_events is None:
+            self._phase_events = []
+        if start:
+            self._phase_events.append([])
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(self.root_stream)
+        self._phase_events[-1].append(event)
+
+    def _report_phases(self) -> None:
+        """Median per-phase times over the launches (diagnostics)."""
+        import statistics
+
+        if not self._phase_events:
+            return
+        torch.cuda.synchronize()
+        names = ("dispatch(bump+sender)", "graph(K1+K2)", "scatter", "K3")
+        rows = [[a.elapsed_time(b) * 1000.0 for a, b in zip(ev, ev[1:])]
+                for ev in self._phase_events[len(self._phase_events) // 4:] if len(ev) == 5]
+        if rows:
+            med = [statistics.median(r[i] for r in rows) for i in range(4)]
+            rank = int(self._xnuma.rank) if self._xnuma is not None else -1
+            print(f"[launch phases] rank={rank} n={len(rows)} " + " ".join(
+                f"{n}={v:.1f}us" for n, v in zip(names, med)) + f" sum={sum(med):.1f}us", flush=True)
+        self._phase_events = None
+
+    def launch(self, caller_stream: torch.cuda.Stream) -> None:
+        """Replay, complete K3, then rejoin before the next caller reset."""
+        if torch.cuda.is_current_stream_capturing():
+            self._launch_captured(caller_stream)
+            return
+        if self._xnuma is not None and _OVERLAP_US > 0:
+            if _OVERLAP_MODE == "serial":
+                spin_us(caller_stream, _OVERLAP_US)
+                self.launch_dispatch(caller_stream)
+            else:
+                self.launch_dispatch(caller_stream)
+                spin_us(caller_stream, _OVERLAP_US)
+            self._launch_compute(caller_stream, after_caller_work=True)
+            return
+        if self._xnuma is not None and JITTER_US > 0:
+            if self._jitter_rng is None:
+                import random
+
+                self._jitter_rng = random.Random(1000 + int(self._xnuma.rank))
+            spin_us(caller_stream, self._jitter_rng.uniform(0.0, JITTER_US))
+        self.launch_dispatch(caller_stream)
+        self._launch_compute(caller_stream, after_caller_work=False)
+
+    def close(self) -> None:
+        if _PHASES:
+            self._report_phases()
+        if self._xnuma is not None and getattr(self._xnuma, "sender_trace", None) is not None:
+            self._xnuma.report_sender_trace()
+        if self._closed:
+            return
+
+        from cuda.bindings import driver as cuda
+
+        self.root_stream.synchronize()
+        _check_cuda(
+            cuda.cuGraphExecDestroy(self._graph_exec),
+            "cuGraphExecDestroy",
+        )
+        _check_cuda(cuda.cuGraphDestroy(self._graph), "cuGraphDestroy")
+        if self._owns_green_contexts:
+            for index, green_context in reversed(list(enumerate(self._green_contexts))):
+                _check_cuda(
+                    cuda.cuGreenCtxDestroy(green_context),
+                    f"cuGreenCtxDestroy(K{index + 1})",
+                )
+        self._closed = True
+        self._post_graph_k3 = None
+        self._post_graph_finalizer = None
+        self._xnuma = None
+        self._compiled_kernels = ()

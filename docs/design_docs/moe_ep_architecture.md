@@ -290,6 +290,7 @@ its `shim/` subpackage map to the same adapter package.
 | `kernel_src/sm107/next_cutedsl_megamoe/` | `shims/sm107/cutedsl_megamoe/` |
 | `kernel_src/sm90/pull_style_cutedsl_megakernel/` | `shims/sm90/cutedsl_megamoe/` |
 | `kernel_src/sm120/split_cutedsl_megakernel/` | `shims/sm120/split_cutedsl/` |
+| `kernel_src/sm120/nvfp4_split_cutedsl_megakernel/` | `shims/sm120/nvfp4_split_cutedsl/` |
 | `kernel_src/sm120/swapab_cutedsl_megakernel/` | `shims/sm120/swapab_cutedsl/` |
 | `kernel_src/sm100/kimi-k3-megamoe/` | `shims/sm100/kimi_k3/` |
 | `kernel_src/sm100/_kimi_k3_megamoe.py` | `shims/sm100/kimi_k3/` |

@@ -36,6 +36,11 @@ import pytest
             "MegaMoESm120W4A8Config",
         ),
         (
+            "shims.sm120.nvfp4_split_cutedsl",
+            "runtime",
+            "MegaMoESm120Nvfp4Config",
+        ),
+        (
             "shims.sm120.swapab_cutedsl",
             "mxfp8",
             "MegaMoESm120Mxfp8Config",

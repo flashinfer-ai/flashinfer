@@ -28,6 +28,7 @@ kernels/
     ├── bf16_nvfp4/
     ├── bf16_rank_major/
     ├── push_style_megamoe/
+    ├── sm120_nvfp4_split/
     ├── sm120_split/
     └── sm120_swapab/
 ```
@@ -35,7 +36,7 @@ kernels/
 The provider's `sources/` and `pre_unification/` trees remain independent.
 Blackwell and Rubin share the exported `sources/` dependencies.
 Hopper uses the same canonical `pre_unification/` tree, including shared
-legacy communication and reducer modules. The two separately maintained
+legacy communication and reducer modules. The separately maintained
 SM120 drops have their own pins.
 The SM120 drops stay under `flashinfer/`; their records preserve their source
 revisions and attribution. Directory placement does not imply support for every

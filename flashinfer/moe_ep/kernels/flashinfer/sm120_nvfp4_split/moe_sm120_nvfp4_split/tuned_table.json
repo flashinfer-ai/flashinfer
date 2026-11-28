@@ -1,0 +1,877 @@
+{
+ "schema": 1,
+ "tables": [
+  {
+   "model": "dsv41",
+   "signature": [
+    5120,
+    4608,
+    6,
+    384
+   ],
+   "topology": "ep16_2x2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 32,
+      "k2_n": 64,
+      "k2_tail_reclaim": "off",
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 689.1,
+     "default_us": 739.0
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 32,
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 743.8,
+     "default_us": 786.6,
+     "note": "2026-11-25 retune (K1 N16) kept off: -4.7% balanced but +15.2% power-law"
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3,
+      "k2_launch_factor": 1,
+      "fc1_utility_postprocess": "on"
+     },
+     "p50_us": 713.3,
+     "default_us": 799.3,
+     "confirm": {
+      "best_us": 721.6,
+      "default_us": 811.6,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k2_launch_factor": 1,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4,
+      "k2_stages": 3
+     },
+     "p50_us": 829.9,
+     "default_us": 910.3,
+     "confirm": {
+      "best_us": 835.6,
+      "default_us": 915.8,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 256,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1219.2,
+     "default_us": 1396.5
+    }
+   ]
+  },
+  {
+   "model": "dsv41",
+   "signature": [
+    5120,
+    4608,
+    6,
+    384
+   ],
+   "topology": "ep4_1numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_direct"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1236.4,
+     "default_us": 1259.5
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3
+     },
+     "p50_us": 1730.5,
+     "default_us": 1740.8,
+     "confirm": {
+      "best_us": 1855.9,
+      "default_us": 1859.6,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1724.4,
+     "default_us": 1738.8
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1746.1,
+     "default_us": 1758.3
+    },
+    {
+     "tokens": 512,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k1_stages": 2
+     },
+     "p50_us": 1952.8,
+     "default_us": 2151.2
+    },
+    {
+     "tokens": 1024,
+     "knobs": {
+      "sms": [
+       64,
+       0,
+       0,
+       46
+      ],
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 2456.6,
+     "default_us": 2495.7
+    },
+    {
+     "tokens": 2048,
+     "knobs": {
+      "k1_n": 128,
+      "k1_stages": 2,
+      "k2_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 4089.3,
+     "default_us": 4362.8
+    },
+    {
+     "tokens": 4096,
+     "knobs": {
+      "k2_stages": 3
+     },
+     "p50_us": 7599.5,
+     "default_us": 7794.6
+    },
+    {
+     "tokens": 8192,
+     "knobs": {},
+     "p50_us": 15086.1,
+     "default_us": 15086.1
+    },
+    {
+     "tokens": 12288,
+     "knobs": {},
+     "p50_us": 22484.7,
+     "default_us": 22484.7
+    },
+    {
+     "tokens": 16384,
+     "knobs": {},
+     "p50_us": 30003.3,
+     "default_us": 30003.3
+    },
+    {
+     "tokens": 20480,
+     "knobs": {},
+     "p50_us": 37454.8,
+     "default_us": 37454.8
+    },
+    {
+     "tokens": 24576,
+     "knobs": {},
+     "p50_us": 44900.2,
+     "default_us": 44900.2
+    }
+   ]
+  },
+  {
+   "model": "dsv41",
+   "signature": [
+    5120,
+    4608,
+    6,
+    384
+   ],
+   "topology": "ep8_2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "gin_hybrid",
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4,
+      "k1_n": 16
+     },
+     "p50_us": 939.0,
+     "default_us": 1077.2,
+     "confirm": {
+      "best_us": 942.1,
+      "default_us": 1074.2,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4,
+      "k1_n": 16
+     },
+     "p50_us": 1030.1,
+     "default_us": 1169.1,
+     "confirm": {
+      "best_us": 1031.5,
+      "default_us": 1168.4,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 64,
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 1309.7,
+     "default_us": 1351.8,
+     "note": "2026-11-25 retune (K1 N16) kept off: -6.6% balanced but +18.1% power-law and slower end to end"
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 1339.9,
+     "default_us": 1393.2
+    },
+    {
+     "tokens": 512,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1986.5,
+     "default_us": 2274.8
+    },
+    {
+     "tokens": 1024,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 4
+     },
+     "p50_us": 3229.7,
+     "default_us": 3456.5
+    },
+    {
+     "tokens": 2048,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_stages": 3,
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ],
+      "dispatch_rank_cache": "on",
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 5783.2,
+     "default_us": 6600.4
+    },
+    {
+     "tokens": 4096,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_stages": 4,
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ],
+      "dispatch_rank_cache": "on",
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 9979.5,
+     "default_us": 11991.2
+    },
+    {
+     "tokens": 8192,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3
+     },
+     "p50_us": 17373.7,
+     "default_us": 17519.1
+    },
+    {
+     "tokens": 12288,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k2_n": 128
+     },
+     "p50_us": 25371.7,
+     "default_us": 25575.9
+    },
+    {
+     "tokens": 16384,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k2_launch_factor": 1
+     },
+     "p50_us": 32934.4,
+     "default_us": 33280.5
+    },
+    {
+     "tokens": 20480,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3
+     },
+     "p50_us": 41271.3,
+     "default_us": 41524.2
+    },
+    {
+     "tokens": 24576,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3
+     },
+     "p50_us": 49274.4,
+     "default_us": 49699.3
+    }
+   ]
+  },
+  {
+   "model": "glm53",
+   "signature": [
+    4096,
+    4096,
+    8,
+    288
+   ],
+   "topology": "ep16_2x2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "dispatch_rank_cache": "on"
+     },
+     "p50_us": 443.6,
+     "default_us": 481.3
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "dispatch_rank_cache": "on"
+     },
+     "p50_us": 453.6,
+     "default_us": 496.7,
+     "confirm": {
+      "best_us": 454.5,
+      "default_us": 497.8,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 4,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 2,
+      "k1_ctas_per_sm": 1,
+      "push_dispatch": "on"
+     },
+     "p50_us": 506.4,
+     "default_us": 582.6,
+     "confirm": {
+      "best_us": 521.6,
+      "default_us": 598.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 64,
+      "k1_stages": 4
+     },
+     "p50_us": 656.8,
+     "default_us": 740.4
+    },
+    {
+     "tokens": 256,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ]
+     },
+     "p50_us": 984.1,
+     "default_us": 1064.5,
+     "note": "2026-11-25 retune (K1 4 stages) kept off: -2.8% balanced but +3.8% power-law"
+    }
+   ]
+  },
+  {
+   "model": "glm53",
+   "signature": [
+    4096,
+    4096,
+    8,
+    288
+   ],
+   "topology": "ep4_1numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_direct"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3
+     },
+     "p50_us": 857.1,
+     "default_us": 871.4
+    },
+    {
+     "tokens": 32,
+     "knobs": {},
+     "p50_us": 968.9,
+     "default_us": 968.9
+    },
+    {
+     "tokens": 64,
+     "knobs": {},
+     "p50_us": 983.3,
+     "default_us": 983.3
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3
+     },
+     "p50_us": 990.6,
+     "default_us": 1013.8
+    },
+    {
+     "tokens": 512,
+     "knobs": {
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1150.0,
+     "default_us": 1150.0
+    },
+    {
+     "tokens": 1024,
+     "knobs": {},
+     "p50_us": 2024.8,
+     "default_us": 2024.8
+    },
+    {
+     "tokens": 2048,
+     "knobs": {
+      "weight_prefetch_ahead": 8
+     },
+     "p50_us": 3935.2,
+     "default_us": 3935.2
+    },
+    {
+     "tokens": 4096,
+     "knobs": {},
+     "p50_us": 7829.5,
+     "default_us": 7829.5
+    },
+    {
+     "tokens": 8192,
+     "knobs": {},
+     "p50_us": 15657.7,
+     "default_us": 15657.7
+    },
+    {
+     "tokens": 12288,
+     "knobs": {},
+     "p50_us": 23448.0,
+     "default_us": 23448.0
+    },
+    {
+     "tokens": 16384,
+     "knobs": {},
+     "p50_us": 31207.5,
+     "default_us": 31207.5
+    },
+    {
+     "tokens": 20480,
+     "knobs": {},
+     "p50_us": 38981.8,
+     "default_us": 38981.8
+    },
+    {
+     "tokens": 24576,
+     "knobs": {},
+     "p50_us": 46833.4,
+     "default_us": 46833.4
+    }
+   ]
+  },
+  {
+   "model": "glm53",
+   "signature": [
+    4096,
+    4096,
+    8,
+    288
+   ],
+   "topology": "ep8_2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "gin_hybrid",
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 591.9,
+     "default_us": 688.1,
+     "confirm": {
+      "best_us": 590.0,
+      "default_us": 683.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 4,
+      "k1_n": 16
+     },
+     "p50_us": 600.1,
+     "default_us": 707.6,
+     "confirm": {
+      "best_us": 600.1,
+      "default_us": 697.3,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 686.3,
+     "default_us": 765.4
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 64,
+      "k2_n": 64,
+      "k1_ctas_per_sm": 2,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "xnuma_fsplit": 4,
+      "weight_prefetch_ahead": 4,
+      "k1_stages": 3,
+      "push_dispatch": "on"
+     },
+     "p50_us": 706.6,
+     "default_us": 938.9,
+     "confirm": {
+      "best_us": 710.7,
+      "default_us": 939.0,
+      "seed": 6197
+     },
+     "note": "retuned 2026-11-25 on the ported decode transport"
+    },
+    {
+     "tokens": 512,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3
+     },
+     "p50_us": 1343.5,
+     "default_us": 1525.7
+    },
+    {
+     "tokens": 1024,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3,
+      "k2_stages": 3
+     },
+     "p50_us": 2418.7,
+     "default_us": 2467.8
+    },
+    {
+     "tokens": 2048,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 5353.2,
+     "default_us": 5733.4
+    },
+    {
+     "tokens": 4096,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_stages": 3,
+      "k2_stages": 3,
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 10325.5,
+     "default_us": 11064.0
+    },
+    {
+     "tokens": 8192,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_stages": 3,
+      "k2_stages": 3,
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 20090.4,
+     "default_us": 21295.0
+    },
+    {
+     "tokens": 12288,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "fc1_utility_postprocess": "off"
+     },
+     "p50_us": 26955.0,
+     "default_us": 28670.8
+    },
+    {
+     "tokens": 16384,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_n": 128,
+      "k2_launch_factor": 1,
+      "k1_stages": 2
+     },
+     "p50_us": 34643.9,
+     "default_us": 36317.2
+    },
+    {
+     "tokens": 20480,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k2_launch_factor": 1,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 42815.7,
+     "default_us": 43150.8
+    },
+    {
+     "tokens": 24576,
+     "knobs": {
+      "backend": "gin_hybrid",
+      "k1_stages": 3
+     },
+     "p50_us": 50831.3,
+     "default_us": 51597.3
+    }
+   ]
+  }
+ ]
+}
