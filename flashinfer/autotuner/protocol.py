@@ -140,10 +140,7 @@ class TuningContext:
         """Cache a result in memory; disk writes follow ambient tuning controls."""
         if self.skipped:
             return
-        persist = (
-            self.tuner.is_tuning_mode
-            and self.namespace not in self.tuner._effective_skip_ops
-        )
+        persist = self.tuner.tuning_enabled(self.namespace)
         self.tuner.publish_protocol_record(self.namespace, key, value, persist=persist)
 
 

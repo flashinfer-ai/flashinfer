@@ -1594,7 +1594,11 @@ def test_nvfp4_plan_refines_exact_tokens_in_tuning(planner_state, monkeypatch) -
     monkeypatch.setattr(
         native_policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
 
     refined = []
@@ -1634,7 +1638,11 @@ def test_nvfp4_plan_suppresses_failed_refine(planner_state, monkeypatch) -> None
     monkeypatch.setattr(
         native_policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     attempts = []
 
@@ -1685,7 +1693,11 @@ def test_nvfp4_noncanonical_layout_skips_profile(planner_state, monkeypatch) -> 
     monkeypatch.setattr(
         native_policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     # No stored profile for this key (has_topk_length=False): padded strides
     # must not start measurement; canonical strides do.
