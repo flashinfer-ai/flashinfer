@@ -178,6 +178,13 @@ when little changed; after a widely included header changes, it takes about
 1.75 hours on x64 and 2-3.5 hours on arm64. Scheduled PR Test runs and pull
 requests from branches in this repository also write the cache.
 
+PR runs skip the `AOT Build Import` lanes when `scripts/infra/pr_checks/aot_scope.py`
+finds that no changed file can affect the provider wheels (docs, tests,
+benchmarks, and `flashinfer/**/*.py` that `flashinfer/aot.py` cannot import).
+Everything unclassified runs AOT, as do scheduled and manual runs. The rules and
+their limits are in that script's docstring; `tests/cpu/infra/test_aot_scope.py` covers
+them.
+
 ## Adding a new operation
 
 For stable CUDA operations, use the
