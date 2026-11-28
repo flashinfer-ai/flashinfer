@@ -1662,6 +1662,10 @@ class FP4PrefillMQALogitsKernel:
                         q_last_next=min(next_q_block_idx*self.block_q+self.block_q-1,num_q_tokens-1)
                         next_num_kv=(cutlass.Int32(self.fixed_samples) if cutlass.const_expr(self.fixed_samples>0) else runtime_samples((num_kv_tokens if cutlass.const_expr(self.pro_common_domain) else mCuSeqLenKEnd[q_last_next]),self.top_k,heads=self.num_heads,coverage=4 if self.qsa_weights==2 or self.num_heads==32 else 8,dsv4=self.dsv4))//128
                     has_work=next_q_block_idx<num_q_blocks
+            # Every math warp has waited for its own TMEM loads (fence_view_async_tmem_load after each tcgen05.ld);
+            # this barrier orders the other math warps' last loads before math warp 0 frees the columns,
+            # as sampler_upper_fp8 does.
+            subset_barrier(barrier_id=15,number_of_threads=512)
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
