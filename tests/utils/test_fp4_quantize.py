@@ -315,6 +315,64 @@ def test_fp4_quantize_zero_rows(sf_use_ue8m0, is_swizzled, device):
     assert torch.ones(4, device=device).sum().item() == 4.0
 
 
+@pytest.mark.parametrize("is_swizzled", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_fp4_quantize_fp8_zero_rows(is_swizzled, device):
+    """FP8-to-FP4 empty-row inputs return empty outputs and leave no sticky error."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    n = 64
+    x = torch.empty((0, n), dtype=torch.float8_e4m3fn, device=device)
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    out, out_scale = fp4_quantize(
+        x, global_scale, 16, False, is_swizzled, backend="cuda"
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (0, n // 2)
+    assert out_scale.dtype == torch.uint8 and out_scale.device == out.device
+    assert torch.ones(4, device=device).sum().item() == 4.0
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_nvfp4_batched_quantize_zero_batch(device):
+    """Zero-batch batched quantization returns empty outputs without launching."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    x = torch.empty((0, 16, 64), dtype=torch.bfloat16, device=device)
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    out, out_scale = nvfp4_batched_quantize(x, global_scale)
+    torch.cuda.synchronize()
+    assert out.shape == (0, 16, 32)
+    assert out_scale.shape[0] == 0 and out_scale.dtype == torch.uint8
+    assert torch.ones(4, device=device).sum().item() == 4.0
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_fp4_quantize_rejects_dims_above_int_max(device):
+    """Dimensions above INT_MAX must raise at the thop boundary instead of wrapping."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    over_int_max = 1 << 31
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    x_k = torch.empty((0, over_int_max), dtype=torch.bfloat16, device=device)
+    with pytest.raises(Exception, match="k must fit in int"):
+        fp4_quantize(x_k, global_scale, 16, backend="cuda")
+
+    x_b = torch.empty_strided(
+        (over_int_max, 0, 16), (0, 16, 1), dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(Exception, match="b must fit in int"):
+        nvfp4_batched_quantize(x_b, global_scale)
+
+    x_m = torch.empty((0, over_int_max, 16), dtype=torch.bfloat16, device=device)
+    with pytest.raises(Exception, match="m must fit in int"):
+        nvfp4_batched_quantize(x_m, global_scale)
+
+    torch.cuda.synchronize()
+    assert torch.ones(4, device=device).sum().item() == 4.0
+
+
 @pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
