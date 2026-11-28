@@ -1610,7 +1610,12 @@ def cutlass_fused_moe(
         GEMM2 weights for each expert.
 
     output_dtype : torch.dtype
-        Desired output data type.
+        Dtype of ``output`` after finalization: ``torch.bfloat16``, ``torch.float16``, or
+        ``torch.float32`` for the finalize's fp32 accumulation without the final rounding.
+        fp32 is supported for bfloat16/float16 activations with weights of the same dtype,
+        bfloat16 activations with float8_e4m3fn weights, and float8_e4m3fn activations with
+        ``use_mxfp8_act_scaling=True``; it forces the unfused finalize (see ``use_fused_finalize``)
+        and leaves the biases in the GEMM dtype.
 
     quant_scales : List[torch.Tensor]
         Quantization scales for the operation.
@@ -1637,10 +1642,12 @@ def cutlass_fused_moe(
             - gemm2 per-local-expert residual scale, including the fixed ``2^6`` compensation
 
     fc1_expert_biases : Optional[torch.Tensor]
-        GEMM1 biases for each expert.
+        GEMM1 biases for each expert. Same dtype as the GEMM output: ``output_dtype``, except
+        under ``output_dtype=torch.float32``, where the GEMMs keep their native dtype.
 
     fc2_expert_biases : Optional[torch.Tensor]
-        GEMM2 biases for each expert.
+        GEMM2 biases for each expert. Same dtype as the GEMM output: ``output_dtype``, except
+        under ``output_dtype=torch.float32``, where the GEMMs keep their native dtype.
 
     input_sf : Optional[torch.Tensor]
         Input scaling factor for quantization.
@@ -2076,7 +2083,8 @@ def cutlass_fused_moe_workspace_size(
     x_dtype, weight_dtype : torch.dtype
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
-        Output dtype (default: ``torch.bfloat16``).
+        Output dtype (default: ``torch.bfloat16``). ``torch.float32`` selects the
+        unfused finalize; see :func:`cutlass_fused_moe`.
     use_fused_finalize : Optional[bool]
         Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
         (default) follows the same rule: fused unless
