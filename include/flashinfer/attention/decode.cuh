@@ -691,6 +691,10 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
+  FLASHINFER_CHECK(num_qo_heads > 0, "num_qo_heads must be greater than 0");
+  FLASHINFER_CHECK(num_kv_heads > 0, "num_kv_heads must be greater than 0");
+  FLASHINFER_CHECK(num_qo_heads % num_kv_heads == 0,
+                   "num_qo_heads must be divisible by num_kv_heads");
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads =
@@ -783,6 +787,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
+  FLASHINFER_CHECK(num_qo_heads > 0, "num_qo_heads must be greater than 0");
+  FLASHINFER_CHECK(num_kv_heads > 0, "num_kv_heads must be greater than 0");
+  FLASHINFER_CHECK(num_qo_heads % num_kv_heads == 0,
+                   "num_qo_heads must be divisible by num_kv_heads");
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);

@@ -103,6 +103,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_head_dim,
     _check_kv_layout,
+    _check_num_heads,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     _get_cache_alibi_slopes_buf,
@@ -1271,6 +1272,10 @@ def single_prefill_with_kv_cache_with_jit_module(
         ``(output, lse)`` pair, where ``lse`` has shape
         ``[qo_len, num_qo_heads]`` and dtype ``float32``.
     """
+    _check_kv_layout(kv_layout)
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
+    _check_num_heads(num_qo_heads, num_kv_heads)
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
@@ -1517,6 +1522,9 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
+    _check_num_heads(num_qo_heads, num_kv_heads)
     # FP8 per-(token, head) scale: derived from the KV dtype (float8, not NVFP4's uint8)
     # plus a scale-factor tensor, mirroring the NVFP4 `is_nvfp4_kvcache` derivation. The
     # scale is a separate float32 tensor whose layout mirrors the KV layout minus
@@ -3781,6 +3789,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         if self._batch_invariant is not None:
             return self._batch_invariant.workspace_bytes(
                 qo_indptr,
@@ -4168,6 +4177,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -6586,6 +6596,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type

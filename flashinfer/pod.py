@@ -36,6 +36,7 @@ from .utils import (
     TensorLayout,
     _check_cached_qkv_data_type,
     _check_kv_layout,
+    _check_num_heads,
     _check_pos_encoding_mode,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
@@ -344,6 +345,7 @@ class PODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         # Logits soft cap is not supported currently
         batch_size = len(last_page_len)
         logits_soft_cap = 0.0
@@ -992,6 +994,7 @@ class BatchPODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         # Logits soft cap is not supported currently
         logits_soft_cap = 0.0
 

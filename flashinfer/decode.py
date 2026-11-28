@@ -72,6 +72,7 @@ from .utils import (
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_kv_layout,
+    _check_num_heads,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
@@ -1070,6 +1071,10 @@ def single_decode_with_kv_cache_with_jit_module(
         Output tensor with shape matching ``q``.  The LSE buffer (when
         ``return_lse=True``) is discarded; see the parameter note.
     """
+    _check_kv_layout(kv_layout)
+    num_qo_heads = q.shape[0]
+    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
+    _check_num_heads(num_qo_heads, num_kv_heads)
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
@@ -1229,6 +1234,9 @@ def single_decode_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    num_qo_heads = q.shape[0]
+    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
+    _check_num_heads(num_qo_heads, num_kv_heads)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
     if logits_soft_cap is None:
@@ -1243,7 +1251,6 @@ def single_decode_with_kv_cache(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    num_qo_heads = q.shape[0]
 
     lse = None
     if return_lse:
@@ -1931,6 +1938,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_num_heads(num_qo_heads, num_kv_heads)
         if self._batch_invariant is not None:
             return self._batch_invariant.workspace_bytes(
                 None,
@@ -2383,6 +2391,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        _check_num_heads(num_qo_heads, num_kv_heads)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )

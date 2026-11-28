@@ -3118,6 +3118,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  FLASHINFER_CHECK(num_qo_heads > 0, "num_qo_heads must be greater than 0");
+  FLASHINFER_CHECK(num_kv_heads > 0, "num_kv_heads must be greater than 0");
+  FLASHINFER_CHECK(num_qo_heads % num_kv_heads == 0,
+                   "num_qo_heads must be divisible by num_kv_heads");
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;

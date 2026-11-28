@@ -51,6 +51,12 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
 
   DecodePlanInfo plan_info;
 
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
+
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
          "cores template for different head dim";
@@ -90,6 +96,12 @@ Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSize(
   (void)empty_q_data;
   (void)empty_kv_data;
   CHECK_INPUT_TYPE(indptr, dl_int32);
+
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
@@ -154,6 +166,12 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   }
   uint32_t head_dim_qk = q.size(2);
   uint32_t head_dim_vo = paged_v_cache.size(3);
+
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "

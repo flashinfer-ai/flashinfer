@@ -566,6 +566,10 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
 
+  FLASHINFER_CHECK(num_qo_heads > 0, "num_qo_heads must be greater than 0");
+  FLASHINFER_CHECK(num_kv_heads > 0, "num_kv_heads must be greater than 0");
+  FLASHINFER_CHECK(num_qo_heads % num_kv_heads == 0,
+                   "num_qo_heads must be divisible by num_kv_heads");
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
 
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
@@ -793,7 +797,7 @@ inline cudaError_t PrefillPlanImpl(
     int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
     uint32_t kv_dtype_bytes = 2) {
   (void)sizeof_dtype_o;
-  if (num_qo_heads % num_kv_heads != 0) {
+  if (num_qo_heads == 0 || num_kv_heads == 0 || num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
             << num_kv_heads;
@@ -1068,7 +1072,7 @@ inline cudaError_t PrefillSM90Plan(
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
-  if (num_qo_heads % num_kv_heads != 0) {
+  if (num_qo_heads == 0 || num_kv_heads == 0 || num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
             << num_kv_heads;
@@ -1307,6 +1311,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   int num_sm = 0;
   int dev_id = 0;
 
+  FLASHINFER_CHECK(num_qo_heads > 0, "num_qo_heads must be greater than 0");
+  FLASHINFER_CHECK(num_kv_heads > 0, "num_kv_heads must be greater than 0");
+  FLASHINFER_CHECK(num_qo_heads % num_kv_heads == 0,
+                   "num_qo_heads must be divisible by num_kv_heads");
   uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));

@@ -60,6 +60,11 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
     v_stride_h = v.stride(0);
     v_stride_n = v.stride(1);
   }
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be greater than 0";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be greater than 0";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
+      << ")";
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
     TVM_FFI_ICHECK_EQ(lse.size(0), qo_len);
