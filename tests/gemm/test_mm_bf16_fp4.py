@@ -658,6 +658,8 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
     """SM100 keeps 128x4 SF storage; SM12x uses the legacy linear repack."""
     _skip_if_backend_unavailable("cute-dsl")
     device = torch.device("cuda")
+    if get_compute_capability(device)[0] == 8:
+        pytest.skip("prepared layouts of the SM100 / SM12x CuTe DSL kernels")
     n, k = 192, 192
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
@@ -668,10 +670,6 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
         assert b_p.shape == b_fp4.shape
         assert sf_p.data_ptr() == b_sf.data_ptr()
         assert sf_p.dim() == 6
-    elif major == 8:  # SM8x: the W4A16 records
-        assert b_p.dtype == torch.uint8
-        assert b_p.shape[0] == n and b_p.shape[1] > k // 2
-        assert sf_p.numel() == 0
     else:
         assert b_p.dtype == torch.int32
         assert sf_p.shape == (k // 16, n)

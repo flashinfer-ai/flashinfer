@@ -9898,7 +9898,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 120, 121])
+@supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -14972,7 +14972,7 @@ def _check_bmm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 120, 121])
+@supported_compute_capability([120, 121])
 def _cutlass_bmm_mxfp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -15138,9 +15138,6 @@ def bmm_mxfp8(
 
     if resolved_backend == "cutlass":
         _check_mxfp8_gemm_strides(A, B, "CUTLASS")
-        if get_compute_capability(A.device)[0] == 8:  # the SM8x dense GEMM
-            mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cutlass"])
-            return out
         # SM120/121 CUTLASS path.
         # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
         # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]

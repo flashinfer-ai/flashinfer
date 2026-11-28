@@ -41,8 +41,8 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     compute_capability = get_compute_capability(torch.device("cuda"))
     if backend == "cudnn" and compute_capability[0] not in (8, 10):
         pytest.skip("bmm_mxfp8 cudnn backend requires SM8x or SM10x.")
-    if backend == "cutlass" and compute_capability[0] not in (8, 12):
-        pytest.skip("bmm_mxfp8 cutlass backend requires SM8x or SM12x.")
+    if backend == "cutlass" and compute_capability[0] != 12:
+        pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
     if backend == "cute-dsl" and tuple(compute_capability) != (10, 7):
         pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
     torch.manual_seed(42)

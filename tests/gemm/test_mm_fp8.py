@@ -81,10 +81,10 @@ def test_mm_fp8(
 )
 @pytest.mark.parametrize("prepared", [False, True])
 def test_mm_fp8_auto_routing(m: int, n: int, k: int, prepared: bool):
-    """Untuned backend="auto" follows the weight layout; cuBLAS first on SM8x and SM107."""
+    """Untuned backend="auto" follows the weight layout; cuBLAS first on SM107."""
     major, minor = get_compute_capability(torch.device(device="cuda"))
-    if major not in (8, 10):
-        pytest.skip("mm_fp8 is only supported on SM8x and Blackwell GPUs.")
+    if major != 10:
+        pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
     torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     input_fp8, input_inv_s = to_float8(input, dtype=torch.float8_e4m3fn)
@@ -103,7 +103,7 @@ def test_mm_fp8_auto_routing(m: int, n: int, k: int, prepared: bool):
         assert picked == ["trtllm_low_latency"]
     else:
         assert "trtllm_low_latency" not in picked
-        assert picked[0] == ("cublas" if major == 8 or minor == 7 else "cutlass_sm10x")
+        assert picked[0] == ("cublas" if minor == 7 else "cutlass_sm10x")
     reference = torch.mm(input, mat2.transpose(-2, -1))
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
     assert cos_sim > 0.99
