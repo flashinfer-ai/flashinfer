@@ -420,7 +420,10 @@ def _page_view(pool, page_bytes, name):
         if shape[axis] != 1 and strides[axis] != expected:
             raise ValueError(f"{name}: a page is not contiguous ({tuple(strides)})")
         expected *= shape[axis]
-    stride = strides[0]
+    # A pool of one page never steps to a second page, so its page stride is
+    # free: a DLPack exporter may report any value for it (PyTorch 2.8 reports
+    # 1). It reads as the page size.
+    stride = strides[0] if shape[0] != 1 else page_bytes
     if stride < page_bytes:
         raise ValueError(f"{name}: page stride {stride} B overlaps the pages")
     return shape[0], stride
@@ -483,7 +486,15 @@ class Fp4MlaDecodeRunner:
     ``runner(...)`` decodes one step: TensorRT-LLM's per-layer ``fp4_mla``
     cache views, the step's prequantized query, the page table and the KV
     lengths in, the caller-owned BF16 ``out`` written.  The split partials
-    belong to the runner, so two runners never share them.
+    belong to the runner, so two runners never share them.  The split count
+    is the plan's (``plan.num_split``); ``kv_lens`` never changes it.  With
+    more than one split, every call of the runner (and every replay of a
+    CUDA graph that captured it) writes and reads the same partials, so
+    these calls must run in order: issue them on one stream, or make each
+    stream wait for the other's call (for example through a CUDA event).
+    With one split, the decode writes ``out`` directly and does not touch
+    the partials.  Concurrent decode on several streams is always safe with
+    one runner per stream.
     """
 
     def __init__(self, plan: Fp4MlaDecodePlan, device: torch.device):
@@ -664,7 +675,11 @@ class Fp4MlaDecodeRunner:
         self._device_check(q_fp4)
 
     def _q(self, q_fp4, derived):
-        words = q_fp4.view(torch.uint8)[: self.plan.rows].view(torch.uint32)
+        # Flattened first: a contiguous query of one row may carry any stride
+        # on its row axis, which a reinterpretation as words would refuse.
+        rows = self.plan.rows
+        flat = q_fp4.view(torch.uint8).view(-1)[: rows * TOKEN_BYTES]
+        words = flat.view(torch.uint32).view(rows, TOKEN_BYTES // 4)
         return tvm_ffi.from_dlpack(words)
 
     def _check_q_sf(self, q_scale):
@@ -759,7 +774,11 @@ class Fp4MlaDecodeRunner:
         ``[rows_cap, 320]`` contiguous, rows ``(b q_len + t) H + h``;
         ``q_scale``: its swizzled E4M3 scales, contiguous, at least
         ``ceil(rows / 128) * 5120`` bytes.  ``page_table``: int32 ``[B, W]``
-        contiguous (``W`` the plan's width); ``kv_lens``: int32 ``[>= B]``
+        contiguous (``W`` the plan's width), page ids of ``kv_cache``; a
+        request whose ``kv_lens`` value is 0 gets zero output rows, but the
+        decode still reads column 0 of its row and the scales of that page,
+        so that entry must hold a page id of ``kv_cache`` or -1 (the decode
+        reads page 0 for -1).  ``kv_lens``: int32 ``[>= B]``
         contiguous, each request's KV length including this step's tokens
         (at most the plan's ``max_kv`` when it was given one: the decode build
         without long rows does not dither longer rows).

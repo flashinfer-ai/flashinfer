@@ -37,8 +37,15 @@ host, so one runner serves every CUDA Graph replay of its bucket while
 `kv_lens` changes. CUDA Graph capture belongs to the caller: run one eager
 call of the runner before the capture (the first call loads the libraries,
 JIT-building them when no prebuilt library exists), and keep the runner (it
-owns the split partials a replay writes and reads) and every tensor a
-captured call reads or writes alive until the last replay.
+owns the split partials) and every tensor a captured call reads or writes
+alive until the last replay. The split count is fixed when the runner is
+prepared (`runner.plan.num_split`); `kv_lens` never changes it. A runner
+with more than one split writes and reads the same split partials on every
+call, and on every replay of a graph that captured it, so its calls must
+run in order: on one stream, or with each stream waiting for the other's
+call (for example through a CUDA event). A runner with one split writes
+`out` directly and does not touch the partials. Concurrent decode on
+several streams is always safe with one runner per stream.
 
 The runner takes TensorRT-LLM's per-layer views as they are: `kv_cache`
 (`[pages, ...]`, 40,960 bytes per page), `kv_scale_cache` (`[pages, ...]`,
@@ -56,7 +63,10 @@ them from `kv_scale_cache`), so the pool must hold the V scales TensorRT-LLM
 writes with the cache. `out` must be 32-byte aligned and `q_fp4` and the
 scale pools 16-byte aligned, `sm_scale` finite and positive, and `kv_cache`
 at most 1,677,721 pages; the runner refuses anything else with a
-`ValueError` before a launch. The split-KV reducer
+`ValueError` before a launch. A request whose KV length is 0 gets zero
+output rows, but the decode still reads column 0 of its page-table row and
+the scales of that page, so that entry must hold a page id of `kv_cache`
+or -1 (the decode reads page 0 for -1). The split-KV reducer
 launches with programmatic dependent launch: its blocks start while the
 decode finishes and wait for the decode's results.
 

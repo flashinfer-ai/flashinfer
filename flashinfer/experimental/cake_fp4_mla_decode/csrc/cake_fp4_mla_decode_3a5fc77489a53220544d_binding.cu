@@ -76,6 +76,12 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
                             << " has no int64 value in a host check";
 }
 
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
 int64_t CDiv(int64_t a, int64_t b) {
   if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
   return a / b;
@@ -104,12 +110,13 @@ CUtensorMap EncodeTma_kv_k(const TensorView& t) {
   CheckUnitInnerStride(t, "kv_k");
   int64_t d1 = t.size(-1);
   int64_t d2 = t.size(-2);
+  int64_t d3 = t.size(-3);
   int64_t outer2 = NumelAbove(t, 2);
   check_dense_leading_dims(t, 2, "kv_k");
   int64_t s2 = t.stride(-2) * 1;
   int64_t s3 = t.stride(-3) * 1;
   cuuint64_t global_dim[3] = {Extent(d1, "kv_k"), Extent(d2, "kv_k"), Extent(outer2, "kv_k")};
-  cuuint64_t global_strides[2] = {Stride(s2, "kv_k"), Stride(s3, "kv_k")};
+  cuuint64_t global_strides[2] = {Stride(s2, "kv_k"), Stride(((d3 != 1LL) ? s3 : CheckedMul(s2, d2)), "kv_k")};
   cuuint32_t box_dim[3] = {64u, 64u, 1u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   const bool allow_oob_box[3] = {false, false, false};
@@ -138,12 +145,13 @@ CUtensorMap EncodeTma_kv_v(const TensorView& t) {
   CheckUnitInnerStride(t, "kv_v");
   int64_t d1 = t.size(-1);
   int64_t d2 = t.size(-2);
+  int64_t d3 = t.size(-3);
   int64_t outer2 = NumelAbove(t, 2);
   check_dense_leading_dims(t, 2, "kv_v");
   int64_t s2 = t.stride(-2) * 1;
   int64_t s3 = t.stride(-3) * 1;
   cuuint64_t global_dim[3] = {Extent(d1, "kv_v"), Extent(d2, "kv_v"), Extent(outer2, "kv_v")};
-  cuuint64_t global_strides[2] = {Stride(s2, "kv_v"), Stride(s3, "kv_v")};
+  cuuint64_t global_strides[2] = {Stride(s2, "kv_v"), Stride(((d3 != 1LL) ? s3 : CheckedMul(s2, d2)), "kv_v")};
   cuuint32_t box_dim[3] = {64u, 128u, 1u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   const bool allow_oob_box[3] = {false, false, false};

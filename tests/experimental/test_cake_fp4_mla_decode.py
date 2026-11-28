@@ -631,6 +631,158 @@ def test_the_runner_keeps_no_reference_to_the_callers_tensors():
     assert all(ref() is None for ref in refs)
 
 
+def _unit_strides_on_size1_axes(x):
+    """``x`` with stride 1 on every axis of extent 1, as PyTorch 2.8's DLPack
+    export reports it: the same elements, still contiguous."""
+    strides = tuple(
+        1 if n == 1 else s for n, s in zip(x.shape, x.stride(), strict=True)
+    )
+    return x.as_strided(tuple(x.shape), strides, x.storage_offset())
+
+
+def test_axes_of_extent_one_take_any_stride(monkeypatch):
+    """An axis of extent 1 is never stepped, so its stride is free.  With
+    stride 1 on every such axis of the caller's tensors and of every tensor the
+    runner hands to tvm-ffi (as PyTorch 2.8's DLPack export reports them), every
+    decode build gives the bits of dense strides with one split, for requests
+    of 16 rows, a one-row request and a one-page pool."""
+    device = _device_or_skip()
+    arch = registry.device_arch(device.index)
+    keys = ("long_rows", "persistent", "early_exp", "epi_x", "tma_o")
+    builds = sorted(
+        {
+            tuple(record["build"][key] for key in keys)
+            for record in registry.MODULES.values()
+            if record["stage"] == "decode" and arch in record["arches"]
+        }
+    )
+    assert len(builds) == 6
+    sm_scale = 1.0 / math.sqrt(192.0)
+    to_ffi = backend.tvm_ffi.from_dlpack
+
+    def unit_strides_to_ffi(x, *args, **kwargs):
+        if isinstance(x, torch.Tensor):
+            x = _unit_strides_on_size1_axes(x)
+        return to_ffi(x, *args, **kwargs)
+
+    for heads, kv_lens, width, one_page in (
+        (16, (300, 1500), 13, False),
+        (1, (700,), 8, False),
+        (128, (100,), 2, True),
+    ):
+        case = _write_case(heads + width, heads, 1, kv_lens, width, device)
+        if one_page:
+            page = int(case["page_table"][0, 0])
+            for name in ("kv", "sf", "vsf"):
+                case[name] = case[name][page : page + 1].clone()
+            case["page_table"] = torch.zeros_like(case["page_table"])
+        strided = {
+            name: _unit_strides_on_size1_axes(value)
+            if isinstance(value, torch.Tensor)
+            else value
+            for name, value in case.items()
+        }
+        base = pkg.plan_fp4_mla_decode(
+            batch=len(kv_lens),
+            q_len=1,
+            num_heads=heads,
+            page_table_width=width,
+            device=device,
+            max_splits=1,
+        )
+        rows = len(kv_lens) * heads
+        for build in builds:
+            plan = dataclasses.replace(
+                base.plan, num_split=1, **dict(zip(keys, build, strict=True))
+            )
+            want = torch.full(
+                (rows, 512), float("nan"), dtype=torch.bfloat16, device=device
+            )
+            _run(backend.Fp4MlaDecodeRunner(plan, device), case, want, sm_scale)
+            got = _unit_strides_on_size1_axes(torch.full_like(want, float("nan")))
+            with monkeypatch.context() as patch:
+                patch.setattr(backend.tvm_ffi, "from_dlpack", unit_strides_to_ffi)
+                runner = backend.Fp4MlaDecodeRunner(plan, device)
+                _run(runner, strided, got, sm_scale)
+            torch.cuda.synchronize()
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+                heads,
+                kv_lens,
+                build,
+            )
+
+
+@pytest.mark.parametrize("num_split", [1, 3])
+def test_zero_length_requests_take_minus_one_or_a_page_id(num_split):
+    """A request whose KV length is 0 gets zero output rows.  The decode
+    still reads column 0 of its page-table row (and the scales of that page),
+    which must hold -1 or a page id of the pool.  With either in the whole
+    row, every decode build gives zeros on those rows and, on the other
+    rows, the bits of the same batch without the zero-length requests."""
+    device = _device_or_skip()
+    arch = registry.device_arch(device.index)
+    keys = ("long_rows", "persistent", "early_exp", "epi_x", "tma_o")
+    builds = sorted(
+        {
+            tuple(record["build"][key] for key in keys)
+            for record in registry.MODULES.values()
+            if record["stage"] == "decode" and arch in record["arches"]
+        }
+    )
+    assert len(builds) == 6
+    heads, kv_lens, width = 128, (900, 0, 300, 0, 1500), 13
+    sm_scale = 1.0 / math.sqrt(192.0)
+    case = _write_case(7, heads, 1, kv_lens, width, device)
+    keep = [b for b, n in enumerate(kv_lens) if n > 0]
+    empty = [b for b, n in enumerate(kv_lens) if n == 0]
+    # 128 rows per request: one row block of q_fp4 and one 128-row block of
+    # its swizzled scales per request, so a request's query drops out whole.
+    blocks = case["q_sf"].view(len(kv_lens), 128 * SF_COLS)
+    rows_of = torch.arange(len(kv_lens) * heads, device=device).view(-1, heads)
+    kept = dict(
+        case,
+        q_fp4=case["q_fp4"][rows_of[keep].flatten()].contiguous(),
+        q_sf=blocks[keep].flatten().contiguous(),
+        page_table=case["page_table"][keep].contiguous(),
+        kv_lens=case["kv_lens"][keep].contiguous(),
+    )
+    base = {
+        batch: pkg.plan_fp4_mla_decode(
+            batch=batch, q_len=1, num_heads=heads, page_table_width=width, device=device
+        ).plan
+        for batch in (len(kv_lens), len(keep))
+    }
+    for build in builds:
+        plans = {
+            batch: dataclasses.replace(
+                plan, num_split=num_split, **dict(zip(keys, build, strict=True))
+            )
+            for batch, plan in base.items()
+        }
+        want = torch.full(
+            (len(keep) * heads, 512), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        _run(backend.Fp4MlaDecodeRunner(plans[len(keep)], device), kept, want, sm_scale)
+        for entry in (-1, int(case["page_table"][keep[-1], 0])):
+            page_table = case["page_table"].clone()
+            page_table[empty] = entry
+            out = torch.full(
+                (len(kv_lens) * heads, 512),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            runner = backend.Fp4MlaDecodeRunner(plans[len(kv_lens)], device)
+            _run(runner, dict(case, page_table=page_table), out, sm_scale)
+            torch.cuda.synchronize()
+            bits = out.view(torch.int16)
+            assert not bool(bits[rows_of[empty].flatten()].any()), (build, entry)
+            assert torch.equal(bits[rows_of[keep].flatten()], want.view(torch.int16)), (
+                build,
+                entry,
+            )
+
+
 def test_plan_picks_the_builds_from_the_bucket():
     long_rows_for, merge_warps_per_row = pkg.long_rows_for, pkg.merge_warps_per_row
     assert not long_rows_for(page_table_width=255)
