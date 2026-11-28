@@ -193,6 +193,25 @@ def test_softmax_low_temperature_normalization(shape, per_row_temperature):
     torch.testing.assert_close(probs, expected, atol=1e-6, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "dtype,broadcast",
+    [(torch.float32, False), (torch.float32, True), (torch.float16, False)],
+)
+def test_softmax_strided_per_row_temperature(dtype, broadcast):
+    logits = torch.tensor([[0.0, 1.0, 2.0]], device="cuda").repeat(3, 1)
+    if broadcast:
+        temperature = torch.tensor([0.7], device="cuda").expand(3)
+    else:
+        params = torch.tensor(
+            [[0.5, 8.0], [1.0, 8.0], [2.0, 8.0]], device="cuda", dtype=dtype
+        )
+        temperature = params[:, 0]
+    expected = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    actual = flashinfer.sampling.softmax(logits, temperature=temperature)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_softmax_rejects_cpu_before_cuda_state(monkeypatch):
     def fail_if_called(*args, **kwargs):
         pytest.fail("CUDA workspace or capability state was accessed for CPU logits")
