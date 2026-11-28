@@ -52,6 +52,7 @@ from flashinfer.gemm.gemm_svdquant import (  # noqa: E402
     _svdquant_kernel_source_files,
 )
 
+from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl  # noqa: E402
 from flashinfer.quantization.kernels.nvfp4_quantize import (  # noqa: E402
     SF_LAYOUT_8x4,
     SF_LAYOUT_128x4,
@@ -975,3 +976,59 @@ def test_sm107_fp8_groupwise_kernel_name_varies_with_every_argument(param):
     assert perturbed_name != baseline_name, param
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+# ---------------------------------------------------------------------------
+# Explicit compile target
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_only
+def test_explicit_arch_names_the_module_and_meta():
+    """An adopter compiling for a fixed target labels the artifact with it.
+
+    Otherwise the module directory and meta.json would carry whatever
+    ``CUTE_DSL_ARCH`` or the current device resolves to, which need not be the
+    target the object file was actually built for.
+    """
+    spec = JitSpecCuteDsl("some_op", "k", lambda: None, "sha", arch="sm_120a")
+    assert spec.module_dir_name == "some_op_sm120a_cute_dsl"
+    assert spec.expected_meta["arch"] == "sm120a"
+
+
+@pytest.mark.cpu_only
+def test_wrapper_forwards_explicit_arch(monkeypatch):
+    """``build_and_load_cute_dsl_kernel`` hands its ``arch`` to the spec.
+
+    The spec-level test above builds ``JitSpecCuteDsl`` directly, so it would
+    still pass if the wrapper dropped the argument.
+    """
+    from flashinfer.jit import cute_dsl_core
+
+    captured = {}
+
+    class RecordingSpec:
+        def __init__(
+            self,
+            module_name,
+            kernel_name,
+            compile_fn,
+            source_sha256,
+            *,
+            arch=None,
+            **_options,
+        ):
+            captured["arch"] = arch
+
+        def build_and_load(self):
+            return "loaded"
+
+    monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", RecordingSpec)
+    monkeypatch.setattr(cute_dsl_core, "cute_dsl_cache_disabled", lambda: False)
+    monkeypatch.setattr(cute_dsl_core, "_hash_source_files", lambda files: "sha")
+
+    result = cute_dsl_core.build_and_load_cute_dsl_kernel(
+        "some_op", "k", lambda: None, arch="sm_120a"
+    )
+    assert result == "loaded"
+    assert captured["arch"] == "sm_120a"

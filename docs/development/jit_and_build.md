@@ -62,7 +62,9 @@ wraps `JitSpecCuteDsl`, exporting kernels with
 `cute.runtime.load_module(..., enable_tvm_ffi=True)`. Each
 `cached_ops/<module>_<arch>_cute_dsl/` contains `meta.json` and one `.o` per
 specialization. These are single-architecture artifacts: the target comes from
-`CUTE_DSL_ARCH` or the current device, rather than an nvcc fatbin.
+`CUTE_DSL_ARCH` or the current device, rather than an nvcc fatbin. An op family
+that compiles for a fixed target passes `arch=` so the artifact is labelled for
+the target it was built with.
 
 Changes to DSL/Torch/TVM-FFI distributions, Python ABI, or kernel-source SHA256
 invalidate the module, which rebuilds lazily. See

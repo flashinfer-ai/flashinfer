@@ -700,12 +700,21 @@ table keyed on the device's SM count — not on its name, which is not a stable
 unique selector.
 
 Thresholds exist for the 110-SM, 156-SM and 188-SM parts, measured on each.
-They do not agree: the 110-SM part switches to the fused kernel at CTA 128 and
-the other two at 144, because at CTA 128 with short sequences the larger parts
-still prefer the decomposed kernel and the smallest one does not. Any other
-CC 12.0 device uses the 156-SM thresholds as a labelled fallback. A benchmark
-run reports which case applies, so a number taken on an unprofiled card cannot
-be read as tuned.
+Every row takes short sequences (T <= 130) fused. After re-fitting the optimized
+kernels, equal-length sequences (including equal-length packed batches) take
+CTA >= 96 fused, except that the 156-SM row uses CTA >= 128 for T > 8192:
+longer sequences can cross back to decomp on that part. Unequal-length
+batches use CTA >= 128 on those two parts: short sequences do not occupy
+the machine throughout a long sequence's recurrence. The 110-SM row uses
+CTA >= 96 for both layouts. Any other CC 12.0 device uses the
+156-SM thresholds as a labelled fallback, and a benchmark run reports which
+case applies, so a number taken on an unprofiled card cannot be read as tuned.
+
+A threshold is a fit keyed on the SM count, not a constant of the kernel, and
+it goes stale when either kernel changes. The benchmark's ``flashinfer-decomp``
+and ``flashinfer-fused`` backends pin one variant each so a re-fit can be
+checked rather than assumed: a row where ``flashinfer`` tracks the slower pin
+shows a threshold to re-fit.
 
 State and graph semantics
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -723,46 +732,92 @@ performs none of them and a cold capture is refused rather than silently
 degraded. Both offsets dtypes are accepted for packed capture; eager warmup
 populates a workspace-owned canonical int32 buffer. The offset *values* must
 stay fixed for the graph's lifetime. Changing them requires a fresh eager
-warmup and capture. Q, K, V, G, beta and state contents may change freely at
-unchanged addresses.
+warmup and capture. Q, K, V, G, beta, ``A_log``, ``dt_bias`` and state contents
+may change freely at unchanged addresses; each launch, replayed or eager, reads
+them again, including the decay derived from ``A_log``.
 
 The offsets contract is not only a capture one. Validating ``cu_seqlens``
 needs a device-to-host read, so what is derived from it — the sequence
 lengths, the canonical int32 copy, and the decomposed variant's chunk tables —
 is cached against the tensor's address and version counter rather than read
-again on every call. Under ``torch.inference_mode`` a tensor has no version
-counter, so refilling an offsets buffer in place with a different segmentation
-is not detectable and the stale tables are reused, silently computing against
-the previous sequence boundaries. Use a different tensor for a different
-segmentation, or call
+again on every call. The canonical copy is private to the backend, so
+refilling one offsets tensor never changes the boundaries of a call that
+passes another tensor with the old content. A refill the version counter does
+not see is not detectable, and the stale tables are reused, silently computing
+against the previous sequence boundaries for that same tensor. That covers
+every write to a tensor created under ``torch.inference_mode``, which has no
+version counter, and writes that bypass the counter on any tensor: through
+``.data``, a raw kernel or a collective. Use a different tensor for a different
+segmentation (with a workspace, a different workspace as well, since it is
+bound to one offsets tensor), or call
 ``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``
 after refilling one in place. This applies to eager calls as much as to
 captured ones.
 
 A workspace binds to one variant, one stream and one call signature on first
-use, and once it has participated in a capture it cannot be used again.
+use, and once it has participated in a capture it cannot be used again. It
+serves one plan at a time: every build for it rewrites the workspace's offsets
+and chunk tables, so a plan built earlier is rebuilt rather than replayed.
 
 What the caches hold
 ^^^^^^^^^^^^^^^^^^^^
 
-A warm call is a memo lookup, and the memo addresses the caller's buffers: the
-descriptors carry their base addresses and the flat views wrap them. Those
-buffers therefore stay allocated for as long as the entry lives, which is what
-makes reusing the entry safe — an allocator that had recycled the address would
-otherwise hand the kernel someone else's memory.
+A warm call is a memo lookup. A memoized plan reaches the caller's buffers by
+address, through its descriptors and raw pointer arguments, and a hit requires
+the same addresses and layouts, so the buffers a plan addresses are the ones
+the current call passed. What a plan keeps allocated is only what it wraps in
+a flat view or owns, as listed below.
 
+Plans shared by shape always rebind and launch under one lock. They do not
+populate the identity fast path, since another caller can change their buffer
+bindings. Workspace-bound plans retain identity-based replay.
+
+A plan shared by shape (the decomposed variant without a workspace) holds no
+caller buffer. It keeps its own descriptor table and chunk tables and the
+factor scratch it was built with, which plans with the same head and chunk
+counts on one stream share while the scratch cache
+(``PREPARE_WORKSPACE_MAX_ENTRIES``) still holds it. The facade's
+shape memo
+(``SHAPE_PLAN_MAX_ENTRIES``) and the variant's own call memo
+(``CALL_PLAN_MAX_ENTRIES``) bound how many stay alive.
+
+A fused identity entry is different: the plan's argument views keep its
+``output``, ``beta``, ``A_log`` and ``dt_bias`` buffers and the canonical
+offsets allocated. The memo ceilings (``RESOLVED_CALL_MAX_ENTRIES`` and
+``CALL_PLAN_MAX_ENTRIES``) bound the plans, and the flat-view cache
+(``FLAT_VIEW_MAX_ENTRIES``) can hold a buffer on its own until it evicts it.
+Packed offsets add one more holder: the identity cache that maps a caller's
+``cu_seqlens`` to its canonical copy keeps that tensor alive until it evicts
+it, at most 64 tensors per device.
 The retention scales with the number of *distinct buffer sets* a process
-rotates through, not with the number of calls. On a 110-SM part at
-``[1, 1024, 8, 128]`` one set holds about 14.5 MiB, and eight rotating sets
-about 73 MiB. Reuse one set and it stays at one set's worth forever.
+rotates through, not with the number of calls. Reuse one set and it stays at
+one set's worth.
+
+A warm call needs the memo to recognise the buffers it is handed, and it
+recognises a caller's tensor by object identity -- which is what stops an
+address the allocator recycled into a different tensor from becoming a stale
+plan hit. A buffer the call allocates for itself is exempt: it is verified by
+address and layout instead, because whatever lives at that address is by
+construction this call's own output. That exemption covers the final state a
+call without an ``initial_state`` allocates, which is otherwise a new object
+every call and would rebuild the plan every call.
+
+It does not cover ``output``. A live plan retains the buffer its descriptors
+address, so an ``output`` this backend allocated is still alive when the next
+call asks for one, and the allocator hands back a different block; an
+address-keyed check on a moving address can never hit. **Pass ``output`` to
+keep the memo warm.** Reusing one ``output`` buffer, or capturing the call in a
+CUDA graph, both avoid this; allocating a fresh one per call does not.
 
 The entry ceilings are not a memory budget and lowering them does not trade
 speed for memory: below the ceiling the retention is the same whatever the
-ceiling is, and above it every call rebuilds its plan — about 7.3 ms against a
-100 microsecond hit on that part. A deployment that needs the memory back
-should rotate fewer buffer sets, or call
+ceiling is, and above it every call rebuilds its plan. A deployment that needs
+the memory back should rotate fewer buffer sets, or call
 ``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``,
-which releases all of it.
+which releases all of it except what a ``RecurrentKDAPrefillWorkspace`` holds:
+the plan it serves and that plan's buffers live as long as the workspace, since
+a captured graph may still read them. A rebuild for the workspace replaces that
+plan rather than adding to it.
 
 Persistent CuTe DSL prefill with FP32 state
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -88,20 +88,14 @@ except (ImportError, RuntimeError):
     run_recurrent_kda = None  # type: ignore
     recurrent_kda = None  # type: ignore
 
-# SM120a ordinary multi-token prefill. Optional in exactly the same way as the
-# CuTe DSL decode backend above: a CPU-only import, an SM100 box, or a missing
-# CuTe DSL leaves the three symbols ``None`` and the dispatcher falls through to
-# the existing backends.
+# SM120a ordinary multi-token prefill.  Optional in the same way as the CuTe DSL
+# decode backend above: a CPU-only import, an SM100 box or a missing CuTe DSL
+# leaves the four symbols ``None`` and the dispatcher falls through.
 #
-# Only ImportError and RuntimeError are caught. A SyntaxError, AttributeError or
-# AssertionError from inside the package is a defect in this repository, and
-# swallowing it here would disguise a broken backend as an unavailable one --
-# the failure would then surface as "SM120 prefill silently never selected",
-# which is far harder to diagnose than the traceback.
-#
-# The original exception is kept: eligibility returns False without it, but a
-# caller who reaches ``_run_sm120_kda_prefill`` gets a clear error chained to
-# the real cause rather than a bare "unavailable".
+# Only ImportError and RuntimeError are caught: any other exception from inside
+# the package is a defect in this repository, and swallowing it would disguise
+# a broken backend as an unavailable one.  The exception is kept so that
+# ``_run_sm120_kda_prefill`` can chain it when the backend is asked for anyway.
 _kda_sm120_import_error: Optional[BaseException] = None
 
 try:
@@ -110,6 +104,7 @@ try:
         clear_kda_prefill_sm120_caches,
         run_kda_prefill_sm120,
     )
+    from .sm120_prefill import dt_bias_heads_view as sm120_dt_bias_heads_view
 
     _has_kda_prefill_sm120 = True
 except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
@@ -118,6 +113,7 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     can_implement_kda_prefill_sm120 = None  # type: ignore
     clear_kda_prefill_sm120_caches = None  # type: ignore
     run_kda_prefill_sm120 = None  # type: ignore
+    sm120_dt_bias_heads_view = None  # type: ignore
 
 __all__ = [
     "run_fused_kda_decode",

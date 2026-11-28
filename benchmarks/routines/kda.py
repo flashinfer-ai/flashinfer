@@ -41,13 +41,12 @@ HEAD_DIM = 128
 #: ``flashinfer-decomp`` and ``flashinfer-fused`` pin one variant each, so a
 #: report can show what the policy chose *and* what it declined.
 #:
-#: ``cutekda`` and ``flash-kda`` are external and optional. They are imported
-#: only when asked for and only if already installed, they are never a
-#: dependency of this file, and a missing one is an explicit skip rather than a
-#: silent omission -- a comparison table with a quietly absent baseline is
-#: worse than one with a gap in it.
+#: ``flash-kda`` is the external baseline (MoonshotAI/FlashKDA, built from
+#: source). It is imported only when asked for and only if installed, it is
+#: never a dependency of this file, and a missing one is an explicit skip
+#: rather than a silent omission.
 _FLASHINFER_BACKENDS = ("flashinfer", "flashinfer-decomp", "flashinfer-fused")
-_EXTERNAL_BACKENDS = ("cutekda", "flash-kda")
+_EXTERNAL_BACKENDS = ("flash-kda",)
 
 
 def run_kda_test(args):
@@ -141,8 +140,8 @@ def parse_kda_args(line, parser):
         choices=list(_FLASHINFER_BACKENDS) + list(_EXTERNAL_BACKENDS),
         help="Backends to benchmark. 'flashinfer' is the public entry point "
         "with its own variant policy; '-decomp'/'-fused' pin one variant each. "
-        "'cutekda' and 'flash-kda' are external baselines, benchmarked only "
-        "when already installed and never a dependency of this file.",
+        "'flash-kda' is an external baseline, benchmarked only when installed "
+        "and never a dependency of this file.",
     )
     return parser.parse_args(line)
 
@@ -355,41 +354,18 @@ def _flashinfer_runner(inputs, args, output, final_state, variant):
 def _external_runner(backend, inputs, args, output, final_state):
     """A callable for an external baseline, or ``None`` if it is not installed.
 
-    Both baselines write the caller's ``output`` and ``final_state`` in place,
-    exactly as the FlashInfer path does. A baseline timed without the state
+    The baseline writes the caller's ``output`` and ``final_state`` in place,
+    exactly as the FlashInfer path does: a baseline timed without the state
     store would not be measuring the same operation, and dividing by it would
     overstate the speedup by however much that store costs.
     """
     scale = args.head_size**-0.5
-    if backend == "cutekda":
-        try:
-            import cute_kda
-        except ImportError:
-            return None
-
-        def call():
-            cute_kda.fwd(
-                inputs["q"],
-                inputs["k"],
-                inputs["v"],
-                inputs["g"],
-                inputs["beta"],
-                scale,
-                output,
-                inputs["A_log"],
-                inputs["dt_bias"],
-                args.lower_bound,
-                inputs["initial_state"],
-                final_state,
-                inputs["cu_seqlens"],
-            )
-
-        return call
-
     if backend == "flash-kda":
         try:
             import flash_kda
-        except ImportError:
+        except (ImportError, OSError, RuntimeError):
+            # A source-built extension can fail to load for reasons other than
+            # a missing package; all of them mean "baseline unavailable" here.
             return None
 
         def call():
@@ -464,6 +440,11 @@ def testRecurrentKDAPrefill(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+    if not getattr(args, "no_cuda_graph", False):
+        print(
+            "[INFO] recurrent_kda_prefill times the eager path; CUDA-graph replay "
+            "timing is not supported by this routine."
+        )
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     total_tokens = num_seqs * seq_len
@@ -555,16 +536,9 @@ def testRecurrentKDAPrefill(args):
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
-            # CUDA-event timing, not graph-replay timing, and not because graphs
-            # do not work here -- they do, and the test suite captures every
-            # published combination. They need a protocol this harness cannot
-            # follow: a caller-owned RecurrentKDAPrefillWorkspace, warmed
-            # eagerly on the *capture* stream with the exact tensors, then a
-            # sync before capture. ``bench_gpu_time`` owns the stream and warms
-            # on its own, so a capture from here starts cold on a stream the
-            # backend has never seen, and the first thing it needs is an
-            # allocation. Timing the eager path is the honest measurement of
-            # what this harness is actually able to set up.
+            # Eager timing only.  Graph replay needs a caller-owned workspace
+            # warmed on the capture stream, and ``bench_gpu_time`` warms on a
+            # different stream from the one it captures on.
             use_cuda_graph=False,
         )
 
