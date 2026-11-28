@@ -23,6 +23,7 @@ from flashinfer.utils import (
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from tests.utils.test_helpers.pdl import late_store
+from tests.utils.test_helpers.alpha_cache import fill_alpha_one_late
 
 
 def _test_mm_fp4(
@@ -457,6 +458,98 @@ def test_mm_fp4_b12x_short_k_multi_wave():
             reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
         ).item()
         assert cos_sim > 0.97
+
+
+def _skip_unless_nvfp4_cute_dsl_backend(backend):
+    """Skip unless *backend* runs NVFP4 mm_fp4 on this GPU and CUDA."""
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} is not supported on SM{cc[0]}{cc[1]}")
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
+    from flashinfer.gemm.gemm_base import _MIN_B12X_CUDA_VERSION
+
+    # Both backends need the CuTe DSL; is_backend_supported checks only the
+    # compute capability.
+    if not is_cute_dsl_available():
+        pytest.skip(f"{backend} requires nvidia-cutlass-dsl")
+    if cc[0] == 12:
+        if backend == "cute-dsl":
+            min_cuda = "13.0"
+            supported = version_at_least(torch.version.cuda, min_cuda)
+        else:
+            min_cuda = str(_MIN_B12X_CUDA_VERSION)
+            supported = is_cuda_version_at_least(min_cuda)
+        if not supported:
+            pytest.skip(f"{backend} NVFP4 on SM12x requires CUDA {min_cuda}+.")
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "b12x"])
+def test_mm_fp4_cute_dsl_without_alpha_in_cuda_graph(backend, monkeypatch):
+    # alpha=None under CUDA graphs, captured before the cached 1.0 exists. The
+    # captures must leave the cache empty. Replayed in reverse order, each
+    # graph must match the eager reference, so neither reads a 1.0 that only
+    # the other fills.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    _skip_unless_nvfp4_cute_dsl_backend(backend)
+    m, n, k = 128, 512, 512
+    _, _, a_fp4, a_s, b_fp4, b_s, _ = _nvfp4_operands(m, n, k)
+
+    def run(out):
+        mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, None, torch.bfloat16, out, backend=backend)
+
+    # Running the reference eagerly also compiles the kernel, which cannot
+    # happen during capture. It passes alpha=None, like the captured calls, so
+    # the autotuner picks the same tactic for both.
+    ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    run(ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    outs, graphs = [], []
+    for _ in range(2):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(out)
+        outs.append(out)
+        graphs.append(graph)
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], ref) and torch.equal(outs[0], ref)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "b12x"])
+def test_mm_fp4_cute_dsl_without_alpha_on_two_streams(backend, monkeypatch):
+    # The cached 1.0 is filled on a private stream and read on the caller's.
+    # The test delays that fill, so a call that does not wait for it reads 0.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    _skip_unless_nvfp4_cute_dsl_backend(backend)
+    m, n, k = 128, 512, 512
+    _, _, a_fp4, a_s, b_fp4, b_s, _ = _nvfp4_operands(m, n, k)
+
+    def run(out):
+        mm_fp4(a_fp4, b_fp4.T, a_s, b_s.T, None, torch.bfloat16, out, backend=backend)
+
+    ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    run(ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    torch.cuda.synchronize()
+    # A non-default caller stream: the legacy default stream would wait for
+    # the private stream by itself.
+    caller = torch.cuda.Stream()
+    fills = fill_alpha_one_late(monkeypatch)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with torch.cuda.stream(caller):
+        run(out)
+    torch.cuda.synchronize()
+    assert len(fills) == 1
+    assert fills.synced >= 1  # the fill finished before the tensor was cached
+    assert torch.equal(out, ref)
+    # The kernels only read the shared 1.0; after the calls it still holds 1.0.
+    (one,) = gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE.values()
+    assert one.item() == 1.0
 
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():

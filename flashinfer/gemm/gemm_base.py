@@ -7075,10 +7075,12 @@ def _heuristic_func_mm_fp8(
     )
 
 
-@functools.cache
 def _fp8_unit_scale(device: torch.device) -> torch.Tensor:
-    # Device-resident 1.0 for the per-tensor FP8 runners' second scale.
-    return torch.ones(1, dtype=torch.float32, device=device)
+    # Device-resident 1.0 for the per-tensor FP8 runners' second scale. Outside
+    # CUDA graph capture it is the 1.0 cached for the CuTe DSL alpha; during a
+    # capture with that cache still empty, it is a new 1.0. Callers must not
+    # write it.
+    return _prepare_alpha_for_launch(None, device)
 
 
 @supported_compute_capability([100, 103, 107])

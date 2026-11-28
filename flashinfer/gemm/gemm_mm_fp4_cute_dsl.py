@@ -16,6 +16,7 @@ limitations under the License.
 
 import logging
 import os
+import threading
 from typing import Optional
 
 import torch
@@ -315,20 +316,55 @@ def _make_blockscaled_gemm_compile_fn(
 
 
 _CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
+_CUTE_DSL_ALPHA_ONE_LOCK = threading.Lock()
 
 
-def _prepare_alpha_for_launch(alpha_tensor, device):
+def _prepare_alpha_for_launch(
+    alpha_tensor: Optional[torch.Tensor], device: torch.device
+) -> torch.Tensor:
     """Prepare alpha as a 1-dim float32 device tensor with shape [1].
 
-    When *alpha_tensor* is ``None``, returns a cached ``tensor([1.0])``
-    on *device* (allocated once, reused forever).
+    When *alpha_tensor* is ``None``, returns a cached 1.0 on *device*. The
+    first such call outside CUDA graph capture creates it, and concurrent
+    first calls outside capture all return the one cached first. During
+    capture with the cache still empty, it returns a new 1.0 that is not
+    cached. A CUDA device without an index means the current device. Call
+    it on the stream the kernel launches on: the capture check reads the
+    current stream.
     """
     if alpha_tensor is None:
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         cached = _CUTE_DSL_ALPHA_ONE_CACHE.get(device)
         if cached is None:
-            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
-            _CUTE_DSL_ALPHA_ONE_CACHE[device] = cached
+            # During CUDA graph capture, do not create the cached 1.0. The
+            # private-stream fill and synchronize below are not allowed there,
+            # and a fill captured instead would run only when that graph
+            # replays. Each capture records its own fill instead.
+            capturing = False
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    capturing = torch.cuda.is_current_stream_capturing()
+            if capturing:
+                return torch.ones(1, dtype=torch.float32, device=device)
+            if device.type != "cuda":
+                fresh = torch.ones(1, dtype=torch.float32, device=device)
+                with _CUTE_DSL_ALPHA_ONE_LOCK:
+                    return _CUTE_DSL_ALPHA_ONE_CACHE.setdefault(device, fresh)
+            # Fill on a private stream and synchronize only that stream; the
+            # caller's stream is not synchronized. The fill completes before
+            # the tensor is cached, so a later caller that takes it from the
+            # cache sees 1.0.
+            stream = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(stream):
+                fresh = torch.ones(1, dtype=torch.float32, device=device)
+            stream.synchronize()
+            # Concurrent first calls may each fill one. All return the one
+            # cached first, so no launch uses a tensor that is not kept.
+            with _CUTE_DSL_ALPHA_ONE_LOCK:
+                cached = _CUTE_DSL_ALPHA_ONE_CACHE.setdefault(device, fresh)
         return cached
+    alpha_tensor = alpha_tensor.to(device=device, dtype=torch.float32)
     if alpha_tensor.dim() == 0:
         return alpha_tensor.unsqueeze(0)
     return alpha_tensor.reshape(1)

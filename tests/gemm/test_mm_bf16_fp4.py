@@ -14,6 +14,7 @@ from flashinfer.gemm.gemm_bf16_fp4 import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.utils.test_helpers.pdl import late_store
+from tests.utils.test_helpers.alpha_cache import fill_alpha_one_late
 from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     dense_w4a16_reference,
@@ -274,6 +275,226 @@ def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
         assert_w4a16_bits(out_one, ref)
     else:
         torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
+
+
+def _cute_dsl_operands_without_alpha():
+    """Operands for the cute-dsl backend; skips where it is unavailable."""
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+    _skip_if_backend_unavailable("cute-dsl")
+    if not is_cute_dsl_available():
+        pytest.skip("the cute-dsl backend requires nvidia-cutlass-dsl")
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    m, n, k = SMOKE_MNK
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, _ = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, None, backend="cute-dsl")
+    return a, b_p, sf_p, (m, n)
+
+
+def test_cute_dsl_without_alpha_in_cuda_graph(monkeypatch):
+    # alpha=None under CUDA graphs, captured before the cached 1.0 exists. The
+    # captures must leave the cache empty. Replayed in reverse order, each
+    # graph must match the eager reference, so neither reads a 1.0 that only
+    # the other fills.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    a, b_p, sf_p, shape = _cute_dsl_operands_without_alpha()
+    one = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    def run(alpha, out):
+        mm_bf16_fp4(a, b_p, sf_p, alpha, backend="cute-dsl", out=out)
+
+    # Running the reference eagerly also compiles the kernel, which cannot
+    # happen during capture. mm_bf16_fp4 turns alpha=None into a (1,) tensor
+    # before tuning, so the reference's 1.0 and the captured calls' None pick
+    # the same tactic.
+    ref = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    run(one, ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    outs, graphs = [], []
+    for _ in range(2):
+        out = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(None, out)
+        outs.append(out)
+        graphs.append(graph)
+    assert not gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], ref) and torch.equal(outs[0], ref)
+
+
+def test_cute_dsl_without_alpha_on_two_streams(monkeypatch):
+    # The cached 1.0 is filled on a private stream and read on the caller's.
+    # The test delays that fill, so a call that does not wait for it reads 0.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+
+    a, b_p, sf_p, shape = _cute_dsl_operands_without_alpha()
+
+    def run(out):
+        mm_bf16_fp4(a, b_p, sf_p, None, backend="cute-dsl", out=out)
+
+    ref = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    run(ref)
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    torch.cuda.synchronize()
+    # A non-default caller stream: the legacy default stream would wait for
+    # the private stream by itself.
+    caller = torch.cuda.Stream()
+    fills = fill_alpha_one_late(monkeypatch)
+    out = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    with torch.cuda.stream(caller):
+        run(out)
+    torch.cuda.synchronize()
+    assert len(fills) == 1
+    assert fills.synced >= 1  # the fill finished before the tensor was cached
+    assert torch.equal(out, ref)
+
+
+def test_default_alpha_on_cpu_device(monkeypatch):
+    # A CPU device gets a cached CPU 1.0; CUDA streams are not used for it.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _prepare_bf16_fp4_alpha
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+
+    device = torch.device("cpu")
+    one = _prepare_bf16_fp4_alpha(None, device)
+    assert one.device == device and one.item() == 1.0
+    assert _prepare_bf16_fp4_alpha(None, device) is one
+
+
+def test_given_alpha_becomes_float32_on_the_device():
+    # A given alpha is returned as a float32 tensor of shape (1,) on the
+    # device.
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
+
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda", torch.cuda.current_device()))
+    for device in devices:
+        for alpha in (
+            torch.tensor(2.0, dtype=torch.float16),
+            torch.tensor([2.0]),
+            torch.tensor([2.0], dtype=torch.bfloat16, device=devices[-1]),
+        ):
+            got = _prepare_alpha_for_launch(alpha, device)
+            assert got.shape == (1,) and got.dtype == torch.float32
+            assert got.device == device and got.item() == 2.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_default_alpha_concurrent_first_calls_share_one(monkeypatch):
+    # Concurrent first calls on an empty cache all return the same tensor.
+    import threading
+
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    device = torch.device("cuda", torch.cuda.current_device())
+    start = threading.Barrier(4)
+    got = []
+
+    def first_call():
+        start.wait()
+        got.append(_prepare_alpha_for_launch(None, device))
+
+    threads = [threading.Thread(target=first_call) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(got) == 4 and all(one is got[0] for one in got)
+    assert got[0].item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_default_alpha_first_call_does_not_wait_for_the_caller_stream(monkeypatch):
+    # The caller runs on a side stream. The first call then synchronizes only
+    # its own private stream. It does not synchronize the device, the
+    # caller's stream or the default stream. The test records synchronize
+    # calls, so it does not depend on timing. Waits inside the allocator are
+    # not synchronize calls and are not checked.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    device = torch.device("cuda", torch.cuda.current_device())
+    waited = []
+    real_stream_sync = torch.cuda.Stream.synchronize
+    real_device_sync = torch.cuda.synchronize
+
+    def stream_sync(stream):
+        waited.append(stream)
+        return real_stream_sync(stream)
+
+    def device_sync(*args, **kwargs):
+        waited.append("device")
+        return real_device_sync(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", stream_sync)
+    monkeypatch.setattr(torch.cuda, "synchronize", device_sync)
+    caller = torch.cuda.Stream()
+    with torch.cuda.stream(caller):
+        one = _prepare_alpha_for_launch(None, device)
+    assert waited, "the fill was not waited for"
+    for stream in waited:
+        assert isinstance(stream, torch.cuda.Stream)
+        assert stream != caller and stream != torch.cuda.default_stream(device)
+    real_device_sync()
+    assert one.item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_default_alpha_capture_on_a_caller_stream(monkeypatch):
+    # A capture on a stream the caller picks is seen as a capture: nothing is
+    # cached, and the 1.0 the graph records holds 1.0 when it replays.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    # A device without an index means the current device.
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    out = torch.zeros(1, device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out.copy_(_prepare_alpha_for_launch(None, device))
+    assert gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE == {}
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out.item() == 1.0
+    # The first call outside capture caches the 1.0 under the indexed device.
+    one = _prepare_alpha_for_launch(None, device)
+    indexed = torch.device("cuda", torch.cuda.current_device())
+    cache = gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE
+    assert list(cache) == [indexed] and cache[indexed] is one
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_default_alpha_capture_on_a_non_current_device(monkeypatch):
+    # Capture on device 1 while device 0 is current: the helper switches to
+    # device 1 before it checks for a capture, so it caches nothing there.
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _prepare_alpha_for_launch
+
+    monkeypatch.setattr(gemm_mm_fp4_cute_dsl, "_CUTE_DSL_ALPHA_ONE_CACHE", {})
+    device = torch.device("cuda", 1)
+    with torch.cuda.device(0):
+        stream = torch.cuda.Stream(device=device)
+        out = torch.zeros(1, device=device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.device(device), torch.cuda.graph(graph, stream=stream):
+            out.copy_(_prepare_alpha_for_launch(None, device))
+        assert gemm_mm_fp4_cute_dsl._CUTE_DSL_ALPHA_ONE_CACHE == {}
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert out.item() == 1.0
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
