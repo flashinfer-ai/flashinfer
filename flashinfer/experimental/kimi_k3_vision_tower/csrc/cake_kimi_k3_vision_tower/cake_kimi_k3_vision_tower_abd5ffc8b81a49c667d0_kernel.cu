@@ -19,9 +19,6 @@
 #define CAKE_NEED_MAKE_WARP_UNIFORM_15c3664d
 #include "cake_kimi_k3_vision_tower_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
 #define WIDTH 7168
 #define ROWS_PER_CTA 4
 #define VECS_PER_LANE 14
@@ -48,31 +45,32 @@ kernel_cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0(__nv_bfloat16* __restrict_
     // === Task calls (declaration order) ===
     int row = bid * ROWS_PER_CTA + warp;
     const int lane_0 = lane;
-    int safe_row = ((row < M) ? row : M - 1);
-    unsigned long long row_off = (unsigned long long)safe_row * (unsigned long long)WIDTH + (unsigned long long)(lane_0 * 16);
+    unsigned long long row_off = (unsigned long long)row * (unsigned long long)WIDTH + (unsigned long long)(lane_0 * 16);
     float vals[224];
     float partial = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < VECS_PER_LANE; i++) {
-        float _vec_load_0[16];
-        {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(y + (row_off + (unsigned long long)(i * 512)) + 0);
-            uint4 _vld_0[2];
-            #pragma unroll
-            for (int _blk = 0; _blk < 2; _blk++) {
-                _vld_0[_blk] = _vptr_0[_blk];
-                uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+    if (row < M) {
+        #pragma unroll
+        for (int i = 0; i < VECS_PER_LANE; i++) {
+            float _vec_load_0[16];
+            {
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(y + (row_off + (unsigned long long)(i * 512)) + 0);
+                uint4 _vld_0[2];
                 #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-                    (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                for (int _blk = 0; _blk < 2; _blk++) {
+                    _vld_0[_blk] = _vptr_0[_blk];
+                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                    }
                 }
             }
-        }
-        #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            vals[i * 16 + j] = _vec_load_0[j];
-            partial = __fmaf_rn(_vec_load_0[j], _vec_load_0[j], partial);
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                vals[i * 16 + j] = _vec_load_0[j];
+                partial = __fmaf_rn(_vec_load_0[j], _vec_load_0[j], partial);
+            }
         }
     }
     float total = partial;
