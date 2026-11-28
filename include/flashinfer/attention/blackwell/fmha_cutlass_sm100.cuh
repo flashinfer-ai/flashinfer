@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include "../../allocator.h"
+#include "../head_count.h"
 #include "collective/fmha_fusion.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
@@ -81,6 +82,7 @@ struct FwdRunner {
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
+    const int h_r = GetGQAGroupSize(num_qo_heads, num_kv_heads);
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count =
@@ -92,8 +94,6 @@ struct FwdRunner {
     StrideO stride_O;
     StrideLSE stride_LSE;
 
-    int h_r = num_qo_heads / num_kv_heads;
-    assert(num_qo_heads % num_kv_heads == 0);
     ProblemShapeVarlen problem_shape = cute::make_tuple(
         VariableLength{qo_segment_offsets}, VariableLength{kv_segment_offsets}, head_dim_qk,
         cute::make_tuple(cute::make_tuple(h_r, num_kv_heads), batch_size));

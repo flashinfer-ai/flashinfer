@@ -63,6 +63,14 @@ constexpr int64_t float4_e2m1fn_code = encode_dlpack_dtype(dl_float4_e2m1fn);
 
 constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
+inline void check_attention_head_counts(int64_t num_qo_heads, int64_t num_kv_heads) {
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be positive";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads (" << num_qo_heads << ") must be divisible by num_kv_heads (" << num_kv_heads
+      << ")";
+}
+
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case float16_code: {                  \

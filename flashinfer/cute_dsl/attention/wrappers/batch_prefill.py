@@ -25,6 +25,7 @@ from flashinfer.api_logging import flashinfer_api
 
 from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.trace.templates.attention import cute_dsl_batch_prefill_run_trace
+from flashinfer.utils import _check_attention_head_counts
 
 from ..config import AttentionConfig, AttentionFusion
 from ..fusion.mask import MaskSpec
@@ -355,12 +356,12 @@ class BatchPrefillCuteDSLWrapper:
             ``"NHD"`` (default) or ``"HND"`` page layout.  Paged-only; the
             ragged path remains NHD.
         """
+        if num_qo_heads is None or num_kv_heads is None or head_dim_qk is None:
+            raise ValueError("num_qo_heads, num_kv_heads and head_dim_qk are required")
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
         _require_dsl_arch(qo_indptr.device)
-
-        if num_qo_heads is None or num_kv_heads is None or head_dim_qk is None:
-            raise ValueError("num_qo_heads, num_kv_heads and head_dim_qk are required")
 
         self._page_size = page_size
         self._paged_kv_layout = kv_layout
@@ -413,9 +414,6 @@ class BatchPrefillCuteDSLWrapper:
         self._batch_size = qo_indptr.shape[0] - 1
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
-        assert num_qo_heads % num_kv_heads == 0, (
-            "num_qo_heads must be divisible by num_kv_heads"
-        )
         self._head_dim = head_dim_qk
         assert head_dim_vo is None or head_dim_vo == head_dim_qk, (
             "head_dim_vo must be None or equal to head_dim_qk"

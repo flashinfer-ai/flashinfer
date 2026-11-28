@@ -59,6 +59,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
                  int64_t qSeqLen, Optional<TensorView> qCuSeqLens, Optional<TensorView> mask,
                  TensorView semaphores, TensorView scratch, bool enable_pdl) {
+  check_attention_head_counts(q.size(-2), nbKHeads);
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())

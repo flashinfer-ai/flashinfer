@@ -30,6 +30,7 @@ from flashinfer.api_logging import flashinfer_api
 
 from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.cute_dsl.utils import get_num_sm
+from flashinfer.utils import _check_attention_head_counts
 
 from ..fusion.mask import AttentionMask, DenseMask, CausalMask, SlidingWindowMask
 from ..gqa_decode import GroupedQueryAttentionDecode
@@ -192,11 +193,7 @@ def _pick_tile_shape(
     qkv_dtype_width: int,
 ) -> Tuple[int, int]:
     """Pick (grouped_head_tile, prediction_tile) matching ``gqa_decode.run`` logic."""
-    if num_qo_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads "
-            f"({num_kv_heads})"
-        )
+    _check_attention_head_counts(num_qo_heads, num_kv_heads)
     npo2 = lambda x: 1 if x <= 1 else 1 << (x - 1).bit_length()
     grouped_heads = num_qo_heads // num_kv_heads
     grouped_head_tile = min(32, npo2(grouped_heads))
@@ -798,15 +795,11 @@ class BatchDecodeCuteDSLWrapper:
         window_left: Optional[int] = None,
         window_right: Optional[int] = 0,
     ) -> None:
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         _require_dsl_arch(self.device)
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
                 "cute-dsl decode requires kv_data_type == q_data_type"
-            )
-        if num_qo_heads % num_kv_heads != 0:
-            raise ValueError(
-                f"num_qo_heads ({num_qo_heads}) must be a multiple of "
-                f"num_kv_heads ({num_kv_heads})"
             )
         if head_dim <= 0 or head_dim % 64 != 0:
             raise ValueError(f"head_dim ({head_dim}) must be a positive multiple of 64")
@@ -1280,15 +1273,11 @@ class BatchDecodePagedCuteDSLWrapper:
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
     ) -> None:
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         _require_dsl_arch(self.device)
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
                 f"cute-dsl paged decode supports page_size ∈ {{8,16,32,64}}, got {page_size}"
-            )
-        if num_qo_heads % num_kv_heads != 0:
-            raise ValueError(
-                f"num_qo_heads ({num_qo_heads}) must be a multiple of "
-                f"num_kv_heads ({num_kv_heads})"
             )
         if head_dim <= 0 or head_dim % 64 != 0:
             raise ValueError(f"head_dim ({head_dim}) must be a positive multiple of 64")

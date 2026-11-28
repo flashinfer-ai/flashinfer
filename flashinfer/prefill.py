@@ -99,6 +99,8 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_attention_head_counts,
+    _check_attention_tensor_head_counts,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_head_dim,
@@ -1271,6 +1273,8 @@ def single_prefill_with_kv_cache_with_jit_module(
         ``(output, lse)`` pair, where ``lse`` has shape
         ``[qo_len, num_qo_heads]`` and dtype ``float32``.
     """
+    _check_kv_layout(kv_layout)
+    _check_attention_tensor_head_counts(q, k, v, kv_layout)
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
@@ -1517,6 +1521,7 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    _check_attention_tensor_head_counts(q, k, v, kv_layout)
     # FP8 per-(token, head) scale: derived from the KV dtype (float8, not NVFP4's uint8)
     # plus a scale-factor tensor, mirroring the NVFP4 `is_nvfp4_kvcache` derivation. The
     # scale is a separate float32 tensor whose layout mirrors the KV layout minus
@@ -1630,12 +1635,17 @@ def single_prefill_with_kv_cache(
         assert window_left == -1
         assert q.dtype == k.dtype == v.dtype
         assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        kv_head_axis = 1 if kv_layout == "NHD" else 0
         if scale_q is None:
             scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
         if scale_k is None:
-            scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+            scale_k = torch.ones(
+                k.shape[kv_head_axis], dtype=torch.float32, device=q.device
+            )
         if scale_v is None:
-            scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+            scale_v = torch.ones(
+                v.shape[kv_head_axis], dtype=torch.float32, device=q.device
+            )
 
     # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
     # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
@@ -3781,6 +3791,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         if self._batch_invariant is not None:
             return self._batch_invariant.workspace_bytes(
                 qo_indptr,
@@ -4168,6 +4179,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -5308,9 +5320,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        _check_attention_tensor_head_counts(q, k_cache, v_cache, self._kv_layout)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         check_lse_base(lse_base)
         check_lse_layout(lse_layout)
         if self._batch_invariant is not None:
@@ -6586,6 +6599,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -7671,6 +7685,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
+        _check_attention_tensor_head_counts(q, k, v, self._kv_layout)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         check_lse_base(lse_base)
@@ -8374,6 +8389,8 @@ def fmha_varlen_plan(
     num_qo_heads: int,
     causal: bool,
 ):
+    if num_qo_heads <= 0:
+        raise ValueError(f"num_qo_heads must be positive, got {num_qo_heads}")
     num_ctas = torch.cuda.get_device_properties(
         qo_segment_offsets.device
     ).multi_processor_count
@@ -8469,6 +8486,7 @@ def fmha_varlen(
     o_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    _check_attention_tensor_head_counts(q, k, v, "NHD")
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
     )
@@ -8868,6 +8886,7 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
+    _check_attention_tensor_head_counts(query, key, value, "NHD")
     check_trtllm_gen_sm107_only_feature(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
@@ -9713,6 +9732,7 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    _check_attention_tensor_head_counts(query, k_cache, v_cache, kv_layout)
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
         if kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
@@ -10248,6 +10268,7 @@ def fmha_v2_prefill_deepseek(
         raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.shape[1] != seq_len:
         raise ValueError("query sequence length must match seq_len.")
+    _check_attention_tensor_head_counts(query, key, value, "NHD")
     if return_lse and lse is None:
         raise ValueError("lse must be provided when return_lse=True.")
     if query.shape[3] in (128, 256):
@@ -10544,6 +10565,9 @@ def trtllm_fmha_v2_prefill(
             f"Unsupported input_layout: {input_layout!r}. Expected one of: "
             "PACKED_QKV, CONTIGUOUS_Q_KV, Q_PAGED_KV_HND, Q_PAGED_KV_NHD, SEPARATE_Q_K_V."
         )
+
+    kv_layout = "HND" if input_layout == "Q_PAGED_KV_HND" else "NHD"
+    _check_attention_tensor_head_counts(query, k_cache, v_cache, kv_layout)
 
     if input_layout == "PACKED_QKV":
         # Packed QKV: query is [tokens, 3, H, D]

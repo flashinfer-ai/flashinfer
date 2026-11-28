@@ -46,10 +46,11 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
   CHECK_SHAPE(k, v);
   TVM_FFI_ICHECK_EQ(q.size(1), k.size(2));
   TVM_FFI_ICHECK_EQ(v.dtype(), k.dtype());
-  unsigned int num_qo_heads = q.size(0);
+  int64_t num_qo_heads = q.size(0);
   unsigned int head_dim_qk = q.size(1);
   unsigned int head_dim_vo = v.size(2);
-  unsigned int kv_len, num_kv_heads;
+  unsigned int kv_len;
+  int64_t num_kv_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
@@ -58,9 +59,7 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
-  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
-      << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
-      << ")";
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());

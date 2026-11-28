@@ -74,6 +74,7 @@ void batch_pod_with_kv_cache_tensor(
     page_size_p = paged_k_cache_p.size(1);
     num_kv_heads_p = paged_k_cache_p.size(2);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads_p);
 
   if (maybe_lse_p.has_value()) {
     const auto& lse = maybe_lse_p.value();
@@ -168,7 +169,7 @@ void batch_pod_with_kv_cache_tensor(
           params.lse = maybe_lse_p.has_value() ? static_cast<float*>(maybe_lse_p.value().data_ptr())
                                                : nullptr;
           params.num_qo_heads = num_qo_heads;
-          params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
+          params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads_p);
           params.q_stride_n = q_stride_n_p;
           params.q_stride_h = q_stride_h_p;
           params.window_left = window_left_p;
@@ -244,7 +245,7 @@ void batch_pod_with_kv_cache_tensor(
           params.lse = maybe_lse_d.has_value() ? static_cast<float*>(maybe_lse_d.value().data_ptr())
                                                : nullptr;
           params.num_qo_heads = num_qo_heads;
-          params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
+          params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads_d);
           params.q_stride_n = q_stride_n_d;
           params.q_stride_h = q_stride_h_d;
           params.window_left = window_left_d;

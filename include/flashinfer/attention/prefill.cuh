@@ -38,6 +38,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "cascade.cuh"
+#include "head_count.h"
 #include "mask.cuh"
 #include "variants.cuh"
 namespace flashinfer {
@@ -3118,7 +3119,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
+  const uint32_t group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
@@ -4974,6 +4975,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
+  CheckAttentionHeadCounts(num_qo_heads, num_kv_heads);
   // Large-head CTA_TILE_Q=32 uses a 2-Q x 2-KV-warp layout to keep the per-warp
   // output fragment bounded. FP8 must take it too: it stays on the split-D
   // merge path whose cta_sync_o_smem buffer (NUM_WARPS_KV x CTA_TILE_Q x 256
@@ -5215,6 +5217,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
+  CheckAttentionHeadCounts(num_qo_heads, num_kv_heads);
   // hd512 + 16-bit/NVFP4 KV uses the 2-Q x 2-KV-warp VO-split layout
   // (CTA_TILE_KV=32, 128-reg o_frag) so CTA_TILE_Q=32 fits 100KB; FP8 keeps the
   // default 1x4 layout.

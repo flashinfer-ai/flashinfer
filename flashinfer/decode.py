@@ -69,6 +69,8 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_attention_head_counts,
+    _check_attention_tensor_head_counts,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_kv_layout,
@@ -1070,6 +1072,8 @@ def single_decode_with_kv_cache_with_jit_module(
         Output tensor with shape matching ``q``.  The LSE buffer (when
         ``return_lse=True``) is discarded; see the parameter note.
     """
+    _check_kv_layout(kv_layout)
+    _check_attention_tensor_head_counts(q, k, v, kv_layout)
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
@@ -1229,6 +1233,7 @@ def single_decode_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    _check_attention_tensor_head_counts(q, k, v, kv_layout)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
     if logits_soft_cap is None:
@@ -1931,6 +1936,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         if self._batch_invariant is not None:
             return self._batch_invariant.workspace_bytes(
                 None,
@@ -2383,6 +2389,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        _check_attention_head_counts(num_qo_heads, num_kv_heads)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -3416,9 +3423,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * logsumexp of attention scores, shape:
               ``[batch_size * q_len_per_req, num_qo_heads]``.
         """
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        _check_attention_tensor_head_counts(q, k_cache, v_cache, self._kv_layout)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._batch_invariant is not None:
             self._batch_invariant.refuse(positional_arguments=args or None)
             if q_len_per_req is not None:
@@ -4771,7 +4779,6 @@ def trtllm_batch_decode_with_kv_cache(
         raise ValueError("request_order is not supported by DCP speculative decode")
     if causal_seqlens_kv_global is not None and enable_pdl is True:
         raise ValueError("DCP speculative decode does not support enable_pdl=True")
-    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -4785,6 +4792,9 @@ def trtllm_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    _check_attention_tensor_head_counts(query, k_cache, v_cache, kv_layout)
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if sparse_top_k:
         if q_len_per_req != 1 or cum_seq_lens_q is not None:
@@ -5636,8 +5646,6 @@ def xqa_batch_decode_with_kv_cache(
     out : torch.Tensor
         output torch.Tensor.
     """
-    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
     else:
@@ -5650,6 +5658,9 @@ def xqa_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    _check_attention_tensor_head_counts(query, k_cache, v_cache, kv_layout)
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     k_cache_sf = None
     v_cache_sf = None
@@ -5670,13 +5681,13 @@ def xqa_batch_decode_with_kv_cache(
     if kv_layout == "NHD":
         # NHD: [num_pages, page_size, num_kv_heads, head_dim] for ordinary KV cache
         # or [num_pages, page_size, num_kv_heads, head_dim// 2] for NVFP4 KV cache with packed head dim
-        page_size = k_cache.shape[1]
-        num_kv_heads = k_cache.shape[2]
+        page_size = k_cache.shape[-3]
+        num_kv_heads = k_cache.shape[-2]
     else:  # HND
         # HND: [num_pages, num_kv_heads, page_size, head_dim] for ordinary KV cache
         # or [num_pages, num_kv_heads, page_size, head_dim// 2] for NVFP4 KV cache with packed head dim
-        num_kv_heads = k_cache.shape[1]
-        page_size = k_cache.shape[2]
+        num_kv_heads = k_cache.shape[-3]
+        page_size = k_cache.shape[-2]
 
     # query shape: [num_tokens, num_heads, head_dim]
     head_dim = query.shape[-1]
@@ -5779,6 +5790,7 @@ def fast_decode_plan(
     device; a ``ValueError`` is raised otherwise. Use
     :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
+    _check_attention_head_counts(num_qo_heads, num_kv_heads)
     # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
     indptr = indptr.contiguous()
     indices = indices.contiguous()

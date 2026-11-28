@@ -217,7 +217,6 @@ static inline void set_params(
 
   // attention type, h_kv < h if MQA or GQA
   params.h_kv = h_kv;
-  assert(h % h_kv == 0 && "MQA/GQA needs h to be divisible by h_kv!");
   params.h_q_per_kv = h / h_kv;
   params.has_alibi = has_alibi;
   params.alibi_params = fmha::AlibiParams(h);
@@ -385,7 +384,8 @@ void fmha_v2_run(
   // - SEPARATE_Q_K_V: q/k/v are all 3D [total_tokens, num_heads, head_dim]
   // - CONTIGUOUS_Q_KV: q is 3D [total_tokens, H, D], k is 4D [total_tokens, 2, H_kv, D]
   const size_t b = batch_size;
-  size_t h, h_kv, d, dv;
+  int64_t h, h_kv;
+  size_t d, dv;
   if (input_layout == Attention_input_layout::PACKED_QKV) {
     // q is 4D: [total_tokens, 3, H, D]
     h = q.shape()[2];     // num_heads
@@ -415,6 +415,7 @@ void fmha_v2_run(
     d = q.shape()[2];
     dv = v.shape()[2];
   }
+  check_attention_head_counts(h, h_kv);
 
   const size_t s_q = max_q_len;
   const size_t s_kv = max_kv_len;

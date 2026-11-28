@@ -29,6 +29,7 @@
 #include "../exception.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
+#include "head_count.h"
 #include "heap.h"
 
 namespace flashinfer {
@@ -152,6 +153,10 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
     typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream) {
+  static_assert(GROUP_SIZE > 0);
+  FLASHINFER_CHECK(num_qo_heads > 0 && num_qo_heads % GROUP_SIZE == 0,
+                   "num_qo_heads must be positive and divisible by the GQA group size", GROUP_SIZE);
+  const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
   using DTypeKV = typename Params::DTypeKV;
   using IdType = typename Params::IdType;
 #ifdef _WIN32
@@ -168,7 +173,6 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
-    const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
     const uint32_t smem_size =
         2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
@@ -566,7 +570,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
 
-  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  const uint32_t gqa_group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
 
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
@@ -793,12 +797,7 @@ inline cudaError_t PrefillPlanImpl(
     int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
     uint32_t kv_dtype_bytes = 2) {
   (void)sizeof_dtype_o;
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
-            << num_kv_heads;
-    FLASHINFER_ERROR(err_msg.str());
-  }
+  const uint32_t gqa_group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
 
   // step 0: get the number of SMs
   int num_sm = 0;
@@ -892,7 +891,6 @@ inline cudaError_t PrefillPlanImpl(
     // new_batch_size, which PrefillSplitQOKVIndptr bounds by padded_batch_size.
     // It is built from the same plan-time constants as the old expression, so
     // it is exactly as stable across CUDA-graph replans.
-    const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     const size_t max_partial_rows =
         ceil_div(static_cast<size_t>(padded_batch_size) * cta_tile_q, gqa_group_size);
     // plan() runs before every launch, replays included, so this covers each
@@ -1068,12 +1066,7 @@ inline cudaError_t PrefillSM90Plan(
     uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
-            << num_kv_heads;
-    FLASHINFER_ERROR(err_msg.str());
-  }
+  CheckAttentionHeadCounts(num_qo_heads, num_kv_heads);
 
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec;
   for (uint32_t i = 0; i < batch_size; ++i) {
@@ -1307,7 +1300,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   int num_sm = 0;
   int dev_id = 0;
 
-  uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  const uint32_t gqa_group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 

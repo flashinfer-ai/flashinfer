@@ -29,6 +29,7 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
+#include "head_count.h"
 #include "state.cuh"
 
 namespace flashinfer {
@@ -680,6 +681,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
+  const uint32_t group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
   const uint32_t seq_len = params.kv_len;
 
 #ifdef _WIN32
@@ -691,7 +693,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
-  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+  DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads =
         std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
@@ -772,6 +774,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   using IdType = typename Params::IdType;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
+  const uint32_t group_size = GetGQAGroupSize(num_qo_heads, num_kv_heads);
   const uint32_t padded_batch_size = params.padded_batch_size;
 
 #ifdef _WIN32
@@ -783,7 +786,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
-  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+  DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);

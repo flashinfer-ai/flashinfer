@@ -234,7 +234,6 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 
   // attention type, h_kv < h if MQA or GQA
   params.h_kv = h_kv;
-  assert(h % h_kv == 0 && "MQA/GQA needs h to be divisible by h_kv!");
   params.h_q_per_kv = h / h_kv;
   params.has_alibi = has_alibi;
   params.alibi_params = fmha::AlibiParams(h);
@@ -339,9 +338,10 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   const int q_seqlen = q.shape()[1];
   const int kv_seqlen = k.shape()[1];
   // num_heads
-  assert(num_heads == q.shape()[2] &&
-         "num_heads must be equal to the number of heads in the query tensor");
-  const int num_kv_heads = k.shape()[2];
+  TVM_FFI_ICHECK_EQ(num_heads, q.shape()[2])
+      << "num_heads must be equal to the number of heads in the query tensor";
+  const int64_t num_kv_heads = k.shape()[2];
+  check_attention_head_counts(num_heads, num_kv_heads);
 
   // head_dim_qk
   TVM_FFI_ICHECK_EQ(head_dim, q.shape()[3])

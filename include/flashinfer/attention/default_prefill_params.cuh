@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "../page.cuh"
+#include "head_count.h"
 
 namespace flashinfer {
 
@@ -99,7 +100,7 @@ struct SinglePrefillParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
-        group_size(num_qo_heads / num_kv_heads),
+        group_size(GetGQAGroupSize(num_qo_heads, num_kv_heads)),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         qo_len(qo_len),
@@ -253,7 +254,7 @@ struct BatchPrefillRaggedParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
-        group_size(num_qo_heads / num_kv_heads),
+        group_size(GetGQAGroupSize(num_qo_heads, num_kv_heads)),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         q_stride_n(q_stride_n),
@@ -403,7 +404,7 @@ struct BatchPrefillPagedParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
-        group_size(num_qo_heads / paged_kv.num_heads),
+        group_size(GetGQAGroupSize(num_qo_heads, paged_kv.num_heads)),
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),

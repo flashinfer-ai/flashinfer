@@ -42,6 +42,7 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
     TensorView empty_q_data, TensorView empty_kv_data) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   CHECK_INPUT_TYPE(indptr, dl_int32);
 
   size_t float_workspace_size_in_bytes =
@@ -85,6 +86,7 @@ Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSize(
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t window_left,
     double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo, TensorView empty_q_data,
     TensorView empty_kv_data) {
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   (void)window_left;
   (void)logits_soft_cap;
   (void)empty_q_data;
@@ -152,6 +154,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
     page_size = paged_k_cache.size(1);
     num_kv_heads = paged_k_cache.size(2);
   }
+  check_attention_head_counts(num_qo_heads, num_kv_heads);
   uint32_t head_dim_qk = q.size(2);
   uint32_t head_dim_vo = paged_v_cache.size(3);
 
