@@ -25,6 +25,10 @@ was listed.
 When no blocklist is loaded or no entry exists for a given operation,
 all tactics pass through unchanged (zero regression risk).
 
+The runner default tactic ``-1`` cannot be blocklisted: it is what every
+cache miss falls back to and what profiling races against the listed
+candidates, so a ``-1`` entry is dropped at load time with a warning.
+
 Run ``flashinfer generate-tactics-blocklist`` (see
 ``flashinfer/tactics_blocklist_gen.py``) to produce the JSON files consumed
 here.
@@ -42,6 +46,9 @@ from .autotuner import (
     _tactic_to_json_hashable,
 )
 from .jit.core import logger
+
+# The runner default; see the module docstring.
+_DEFAULT_TACTIC = -1
 
 
 def _is_listed(invalid_set: Set[Any], tactic: Any) -> bool:
@@ -83,6 +90,10 @@ class TacticsBlocklist:
         Returns:
             True if loaded successfully, False if the file's GPU metadata
             does not match the current device (the file is silently skipped).
+
+        A listed ``-1`` (the runner default) is dropped with a warning: it is
+        the fallback of every miss and is re-added to every profiling
+        candidate list, so listing it cannot take effect.
         """
         with open(path, "r") as f:
             data = json.load(f)
@@ -107,8 +118,21 @@ class TacticsBlocklist:
                 return False
 
         invalid_tactics = data.get("invalid_tactics", {})
+        default_listed: List[str] = []
         for key, tactics_list in invalid_tactics.items():
-            self._invalid[key] = {_tactic_to_json_hashable(t) for t in tactics_list}
+            listed = {_tactic_to_json_hashable(t) for t in tactics_list}
+            if _DEFAULT_TACTIC in listed:
+                listed.discard(_DEFAULT_TACTIC)
+                default_listed.append(key)
+            if listed:
+                self._invalid[key] = listed
+        if default_listed:
+            logger.warning(
+                f"[TacticsBlocklist]: {path} lists the default tactic "
+                f"{_DEFAULT_TACTIC} for {', '.join(sorted(default_listed))}; "
+                "the runner default cannot be blocklisted (every cache miss "
+                "falls back to it) and the entry is ignored."
+            )
 
         self._loaded_path = path
         total = sum(len(v) for v in self._invalid.values())

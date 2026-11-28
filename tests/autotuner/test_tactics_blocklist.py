@@ -233,6 +233,38 @@ class TestBlocklistLoad:
         finally:
             os.unlink(path)
 
+    def test_load_drops_the_default_tactic_with_a_warning(self, monkeypatch):
+        """-1 is the fallback of every miss, so listing it cannot take effect."""
+        monkeypatch.setattr(
+            "flashinfer.tactics_blocklist._collect_metadata",
+            lambda: {"gpu": "NVIDIA B200"},
+        )
+        warnings = []
+        monkeypatch.setattr(
+            "flashinfer.tactics_blocklist.logger.warning",
+            lambda msg, *args, **kwargs: warnings.append(msg),
+        )
+        data = _make_blocklist_json(
+            {"op::StubRunnerA": [-1, 1], "op::StubRunnerB": [-1]}, gpu="NVIDIA B200"
+        )
+        path = _write_json(data)
+        try:
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            # The other entries of the key survive; a key listing only -1
+            # is not an entry at all.
+            assert bl.summary() == {"op::StubRunnerA": 1}
+            assert bl.is_blocked("op", "StubRunnerA", 1)
+            assert not bl.is_blocked("op", "StubRunnerA", -1)
+            assert not bl.is_blocked("op", "StubRunnerB", -1)
+            assert bl.filter("op", StubRunnerA(), [-1, 0, 1]) == [-1, 0]
+            assert bl.filter("op", StubRunnerB(), [-1, 0]) == [-1, 0]
+            assert len(warnings) == 1
+            assert "op::StubRunnerA, op::StubRunnerB" in warnings[0]
+            assert "default tactic -1" in warnings[0]
+        finally:
+            os.unlink(path)
+
     def test_load_multiple_files_accumulates(self, monkeypatch):
         """Loading two blocklist files should merge their entries."""
         monkeypatch.setattr(
