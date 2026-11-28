@@ -239,8 +239,8 @@ class BlockSparsePersistentTileScheduler:
 
     def consumer_advance(self, *, loc=None, ip=None):
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
-            # All warps must converge before consuming the next CLC response.
-            cute.arch.sync_threads()
+            # Warp-specialized roles arrive independently. The CLC pipeline
+            # orders response reuse; a CTA-aligned barrier here is divergent.
             self._clc_pipeline.consumer_wait(self._clc_consumer_state)
             work_tile = self.get_current_work()
             self._clc_pipeline.consumer_release(self._clc_consumer_state)

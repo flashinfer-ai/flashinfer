@@ -181,9 +181,11 @@ def dynamic_tensors_compile_key(
         namespace,
         *config,
         *(
-            _tensor_dynamic_layout_compile_key(tensor, leading_dim)
-            if tensor is not None
-            else None
+            (
+                _tensor_dynamic_layout_compile_key(tensor, leading_dim)
+                if tensor is not None
+                else None
+            )
             for tensor, leading_dim in zip(tensors, leading_dims, strict=False)
         ),
     )
@@ -261,42 +263,23 @@ def sm100_blk64_auto_kv_splits(
 
 
 def sm100_blk64_auto_fp8_kv_splits(
-    topk_num: int,
-    heads: int = 4,
-    seqlen_q: int = 64,
+    topk_num: int, heads: int, seqlen_q: int, *, batch: int = 1, num_sms: int
 ) -> int:
-    """Choose KV splits for the Sage-FP8 blk64 path.
-
-    Ported from upstream Block-Sparse-Attention/bsa_attn_interface.py's
-    ``_sm100_blk64_auto_fp8_kv_splits``, which the port previously dropped:
-    Sage-FP8's ``kv_splits="auto"`` was silently falling back to
-    ``sm100_blk64_auto_kv_splits``/``sm100_blk64_kv_splits_from_count``, a
-    heuristic tuned on BF16 shapes with no FP8 validation. Thresholds below
-    are upstream's, tuned separately on FP8 shapes ("SLA 0709") -- not
-    re-derived here. ``batch`` is intentionally not a parameter: Sage-FP8
-    blk64 requires batch_size == 1 (enforced by
-    ``validate_sm100_blk64_fp8_sage``), matching upstream's omission of it
-    from this formula.
-    """
-    topk_num = int(topk_num)
-    heads = int(heads)
-    q_tiles = heads * ceil_div_int(seqlen_q, 64)
-    if q_tiles >= 512:
-        # SLA-scale Q already exposes thousands of independent CTAs.
-        # Splitting medium top-k rows only adds FP32 partial workspace and a
-        # combine pass; a small split remains useful once each CTA traverses
-        # at least 900 KV blocks.
-        return 4 if topk_num >= 900 else 1
-    if topk_num < 128:
+    """BSA #9 policy: split only to fill idle SMs with enough KV work."""
+    q_tiles = int(batch) * int(heads) * ceil_div_int(seqlen_q, 64)
+    if q_tiles >= num_sms:
         return 1
-    if heads == 8:
-        if topk_num < 256:
-            return 4
-        if topk_num < 500:
-            return 8
-    elif 224 <= topk_num < 400:
-        return 8
-    return 16
+    splits = 1
+    while splits < 16 and splits * 2 * q_tiles <= num_sms:
+        splits *= 2
+    while splits > 1 and (topk_num < 8 * splits or (splits == 2 and topk_num < 128)):
+        splits //= 2
+    return splits
+
+
+@lru_cache(maxsize=None)
+def get_sm100_device_num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def build_sm100_blk64_kv_split_offsets(
@@ -525,17 +508,32 @@ def make_sm100_blk64_cute_args(
         to_cute_tensor(out, enable_tvm_ffi=enable_tvm_ffi),
         to_cute_tensor(lse, assumed_align=4, enable_tvm_ffi=enable_tvm_ffi),
         (
-            to_cute_tensor(q_scale, assumed_align=4, enable_tvm_ffi=enable_tvm_ffi)
+            to_cute_tensor(
+                q_scale,
+                assumed_align=4,
+                fully_dynamic=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
             if q_scale is not None
             else None
         ),
         (
-            to_cute_tensor(k_scale, assumed_align=4, enable_tvm_ffi=enable_tvm_ffi)
+            to_cute_tensor(
+                k_scale,
+                assumed_align=4,
+                fully_dynamic=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
             if k_scale is not None
             else None
         ),
         (
-            to_cute_tensor(v_scale, assumed_align=4, enable_tvm_ffi=enable_tvm_ffi)
+            to_cute_tensor(
+                v_scale,
+                assumed_align=4,
+                fully_dynamic=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+            )
             if v_scale is not None
             else None
         ),
@@ -669,6 +667,7 @@ def combine_blk64_kv_bucketed_partials(
     device_arch: int,
     output_dtype: Optional[torch.dtype] = None,
     use_fast_16_split: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel.
 
@@ -709,8 +708,12 @@ def combine_blk64_kv_bucketed_partials(
     )
     if output_dtype is None:
         output_dtype = q.dtype
-    out_bshd = torch.empty(
-        (batch, seqlen_q, num_heads, head_dim), dtype=output_dtype, device=q.device
+    out_bshd = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch, seqlen_q, num_heads, head_dim), dtype=output_dtype, device=q.device
+        )
     )
     lse_bsh = torch.empty(
         (batch, seqlen_q, num_heads), dtype=torch.float32, device=q.device
@@ -834,30 +837,12 @@ def validate_sm100_blk64_fp8_sage(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    """Enforce the Sage FP8 v1 contract's hard limits (fixed top-k, full blocks).
-
-    These limits come from the upstream kernel itself, not from this
-    integration -- surfaced early (at plan()/dispatch time) with a clear
-    message so they are not mistaken for a migration regression.
-    """
+    """Validate the MHA Sage FP8 scale contract, including sequence tails."""
     if batch_size != 1:
-        raise ValueError(
-            "Sage FP8 blk64 requires batch_size == 1 (upstream kernel limit)"
-        )
+        raise ValueError("CuTe Sage FP8 blk64 currently requires batch_size == 1")
     if num_head not in (4, 8):
         raise ValueError(
-            f"Sage FP8 blk64 requires num_head in (4, 8), got {num_head} "
-            "(upstream kernel limit)"
-        )
-    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
-        raise ValueError(
-            "Sage FP8 blk64 requires a uniform top-k (q2k_block_nums must be "
-            "None); variable per-row KV counts are not supported yet"
-        )
-    if block_sizes is not None and block_sizes.numel() > 0:
-        raise ValueError(
-            "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
-            "be None); partial/padded KV blocks are not supported yet"
+            f"CuTe Sage FP8 blk64 currently requires num_head in (4, 8), got {num_head}"
         )
     if (
         q_scale.dtype != torch.float32

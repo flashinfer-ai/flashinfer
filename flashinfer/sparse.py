@@ -227,7 +227,7 @@ def _vsa_common_checks(
         )
     if M % R != 0:
         raise ValueError(f"M={M} must be divisible by block size R={R}")
-    if N % C != 0:
+    if N % C != 0 and backend != "vsa_sm100_blk64":
         raise ValueError(f"N={N} must be divisible by block size C={C}")
     if mask is not None or packed_mask is not None:
         raise ValueError(
@@ -336,11 +336,8 @@ def _vsa_run_core_blk64(
     q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
 
     is_sage_fp8 = q_scale is not None
-    if is_sage_fp8:
-        # Sage FP8 requires a uniform (dense) top-k: the underlying kernel
-        # only accepts q2k_block_nums=None with a fixed block_sparse_num.
-        # The uniform value is validated and cached in plan() (which already
-        # syncs on vsa_q2k_num once) so run() never has to sync on it.
+    if is_sage_fp8 and sage_fp8_block_sparse_num is not None:
+        # plan() caches the uniform-count fast path without a run-time readback.
         block_nums_arg = None
         block_sparse_num_arg = sage_fp8_block_sparse_num
     else:
@@ -559,7 +556,9 @@ class BlockSparseAttentionWrapper:
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
-            The number of columns of the block-sparse matrix, ``NB = N // C``, ``N`` should be divisible by ``C``.
+            The number of columns of the block-sparse matrix. For ``vsa_sm100_blk64``,
+            ``NB = ceil_div(N, C)`` and a partial final KV block is supported.
+            Other backends require ``N`` divisible by ``C`` and use ``NB = N // C``.
         R : int
             The number of rows in each block.
         C : int
@@ -1028,7 +1027,7 @@ class BlockSparseAttentionWrapper:
             )
 
             MB = M // R
-            NB = N // C
+            NB = (N + C - 1) // C
             H = num_qo_heads
 
             if block_mask is not None:
@@ -1062,22 +1061,12 @@ class BlockSparseAttentionWrapper:
             # restriction only requires removing the check above and passing
             # allow_empty_block_nums=True through to the kernel.
 
-            # Sage FP8 requires a uniform (dense) top-k across the whole
-            # sparsity pattern. Validate and cache the uniform value here
-            # (plan()-time, already synchronizing above on the same tensor)
-            # so run() doesn't need to sync on vsa_q2k_num on every call.
+            # Retain the fixed-count fast path when metadata is uniform.
             self._vsa_sage_fp8_block_sparse_num = None
             if is_sage_fp8:
                 uniform_num = int(self._vsa_q2k_num[0, 0, 0].item())
-                if not torch.all(self._vsa_q2k_num == uniform_num):
-                    raise ValueError(
-                        "vsa_sm100_blk64 Sage FP8 requires a uniform number of "
-                        "KV blocks per Q-block across the whole sparsity "
-                        "pattern (upstream kernel limit: only a fixed "
-                        "block_sparse_num is supported, not per-row "
-                        "q2k_block_nums)."
-                    )
-                self._vsa_sage_fp8_block_sparse_num = uniform_num
+                if torch.all(self._vsa_q2k_num == uniform_num):
+                    self._vsa_sage_fp8_block_sparse_num = uniform_num
 
             self.M = M
             self.N = N

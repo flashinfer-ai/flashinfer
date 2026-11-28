@@ -1,20 +1,53 @@
 # Copyright (c) 2025, Tri Dao.
 """Device helpers for the SM100 block-64 forward kernel."""
+# Sage FP8 helpers ported from Block-Sparse-Attention 9698fce (#9).
 
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import tcgen05
 from cutlass import Float32, Int32, Uint32, Boolean, const_expr
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from . import mma_sm100_desc as sm100_desc
+from .kernel_utils import fmax
 from .tcgen05_mma_helpers import (
     _tcgen05_mma_kind,
     i64_to_i32x2,
 )
+
+
+@cute.jit
+def named_barrier_arrive_unaligned(
+    barrier: pipeline.NamedBarrier, index: Int32
+) -> None:
+    """Signal a warp-pair barrier from independently executing warp roles."""
+    pipeline.NamedBarrier(
+        barrier_id=barrier.barrier_id + index,
+        num_threads=barrier.num_threads,
+    ).arrive_unaligned()
+
+
+@cute.jit
+def named_barrier_wait_unaligned(barrier: pipeline.NamedBarrier, index: Int32) -> None:
+    """Arrive and wait without requiring CTA-uniform control flow."""
+    # CuTe 4.8's wait_unaligned lowers through nvvm.barrier (bar.sync), whose
+    # implicit .aligned contract rejects warp roles waiting at different PCs.
+    llvm.inline_asm(
+        None,
+        [
+            Int32(barrier.barrier_id + index).ir_value(),
+            Int32(barrier.num_threads).ir_value(),
+        ],
+        "barrier.cta.sync $0, $1;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 @cute.jit
@@ -211,6 +244,36 @@ def shr_u32(x: Uint32, shift: Uint32) -> Uint32:
 
 
 @cute.jit
+def select_i32_if_equal(
+    lhs: Int32,
+    rhs: Int32,
+    if_equal: Int32,
+    otherwise: Int32,
+) -> Int32:
+    """Return one of two i32 values without creating DSL control flow."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(lhs).ir_value(),
+                Int32(rhs).ir_value(),
+                Int32(if_equal).ir_value(),
+                Int32(otherwise).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.eq.s32 p, $1, $2;\n\t"
+            "selp.b32 $0, $3, $4, p;\n\t"
+            "}",
+            "=r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
 def mask_f32x32_by_u32_branch(
     acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]
 ) -> Tuple[Float32, ...]:
@@ -248,6 +311,66 @@ def mask_f32x32_by_u32_branch(
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def mask_f32x32_by_u32_select(
+    acc_s: cute.Tensor, mask: Uint32, base: cutlass.Constexpr[int]
+) -> Tuple[Float32, ...]:
+    """Set element i to -inf where bit i of mask is clear.
+
+    Unlike the branch form, every lane takes the same bit-test/select path, so
+    no control-flow join is created around the score registers.
+    """
+    mask_ops = "\n\t".join(
+        f"and.b32 tmp, $64, {hex(1 << i)};\n\t"
+        "setp.eq.u32 p, tmp, 0;\n\t"
+        f"selp.f32 ${i}, neg_inf, ${i}, p;"
+        for i in range(32)
+    )
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Float32(acc_s[base + i]).ir_value() for i in range(32)]
+        + [Uint32(mask).ir_value()],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .u32 tmp;\n\t"
+        ".reg .f32 neg_inf;\n\t"
+        "mov.f32 neg_inf, 0fFF800000;\n\t"
+        f"{mask_ops}\n\t"
+        "}\n",
+        ",".join(["=f"] * 32 + [str(i) for i in range(32)] + ["r"]),
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def apply_block_size_mask_64_select(acc_s: cute.Tensor, block_size: Int32) -> None:
+    """Select-only variant of apply_block_size_mask_64 for the FP8 softmax."""
+    if block_size < 64:
+        for s in cutlass.range_constexpr(2):
+            shift = cutlass.max((s + 1) * 32 - block_size, 0)
+            mask = shr_u32(Uint32(0xFFFFFFFF), Uint32(shift))
+            if mask != Uint32(0xFFFFFFFF):
+                vals = mask_f32x32_by_u32_select(acc_s, mask, s * 32)
+                for i in cutlass.range_constexpr(32):
+                    acc_s[s * 32 + i] = vals[i]
+
+
+@cute.jit
+def max16_tree(v: cute.Tensor, base: cutlass.Constexpr[int]) -> Float32:
+    """Maximum of 16 consecutive register values with three-input max."""
+    a = fmax(v[base + 0], v[base + 1], v[base + 2])
+    b = fmax(v[base + 3], v[base + 4], v[base + 5])
+    c = fmax(v[base + 6], v[base + 7], v[base + 8])
+    d = fmax(v[base + 9], v[base + 10], v[base + 11])
+    e = fmax(v[base + 12], v[base + 13], v[base + 14])
+    f = fmax(a, b, c)
+    g = fmax(d, e, v[base + 15])
+    return fmax(f, g)
 
 
 @cute.jit
@@ -639,9 +762,11 @@ def gemm_ptx_partial(
             sm100_desc.make_smem_desc_base(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
-                sm100_desc.Major.K
-                if const_expr(op.a_major_mode == tcgen05.OperandMajorMode.K)
-                else sm100_desc.Major.MN,
+                (
+                    sm100_desc.Major.K
+                    if const_expr(op.a_major_mode == tcgen05.OperandMajorMode.K)
+                    else sm100_desc.Major.MN
+                ),
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -655,9 +780,11 @@ def gemm_ptx_partial(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            sm100_desc.Major.K
-            if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K)
-            else sm100_desc.Major.MN,
+            (
+                sm100_desc.Major.K
+                if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K)
+                else sm100_desc.Major.MN
+            ),
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
@@ -824,9 +951,11 @@ def gemm_ptx_partial(
                 )
                 for k in range(
                     1,
-                    cute.size(tCrA.shape[2])
-                    if const_expr(mbar_ptr is None)
-                    else split_arrive_idx,
+                    (
+                        cute.size(tCrA.shape[2])
+                        if const_expr(mbar_ptr is None)
+                        else split_arrive_idx
+                    ),
                 )
             )
             + mbar_wait_str
