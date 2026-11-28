@@ -2636,12 +2636,51 @@ def test_public_cake_gdn_prefill_invalid_cuda_slots_fail_in_isolated_process(
     assert device_asserted, combined
 
 
-if (
-    __name__ == "__main__"
-    and len(sys.argv) == 3
-    and sys.argv[1] == "--cake-gdn-invalid-slot"
-):
-    _run_public_prefill_invalid_slot_child(sys.argv[2])
+def _run_cake_gdn_int64_overflow_child() -> None:
+    values = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
+    prefill_mod._cake_gdn_prefill_i32(values)
+    torch.cuda.synchronize()
+
+
+def test_public_cake_gdn_prefill_int64_overflow_cuda_assert_in_isolated_process():
+    repo_root = str(Path(__file__).resolve().parents[2])
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    new_pythonpath = f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else repo_root
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--cake-gdn-int64-overflow",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "PYTHONPATH": new_pythonpath,
+            "FLASHINFER_CAKE_GDN_VALIDATE_SLOTS": "1",
+        },
+    )
+    combined = completed.stdout + completed.stderr
+    exact_async_assertion = (
+        "_assert_async_cuda_kernel" in combined
+        and "GDN metadata values exceed int32 range" in combined
+    )
+    device_asserted = any(
+        marker in combined
+        for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
+    )
+    assert completed.returncode != 0 or exact_async_assertion, combined
+    assert device_asserted or "GDN metadata values exceed int32 range" in combined, (
+        combined
+    )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--cake-gdn-invalid-slot":
+        _run_public_prefill_invalid_slot_child(sys.argv[2])
+    elif len(sys.argv) == 2 and sys.argv[1] == "--cake-gdn-int64-overflow":
+        _run_cake_gdn_int64_overflow_child()
 
 
 @pytest.mark.parametrize(
