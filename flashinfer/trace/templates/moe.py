@@ -3291,10 +3291,13 @@ cutlass_fused_moe_trace = TraceTemplate(
             ["num_local_experts", "hidden_size", "intermediate_size"],
             description="FC2 weights per expert.",
         ),
+        "do_finalize": Scalar("bool", optional=True),
     },
     outputs={
         "output": Tensor(["seq_len", "hidden_size"], dtype="bfloat16"),
     },
+    # The output and reference describe the finalized path only.
+    constraints=["do_finalize == True"],
     tags=["status:verified", "backend:cutlass"],
     reference=_cutlass_fused_moe_reference,
 )
