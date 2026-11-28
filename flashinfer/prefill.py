@@ -9979,6 +9979,160 @@ def trtllm_batch_context_with_kv_cache(
     return result_out
 
 
+# Backends of the generalized batch-context front. Every name is a real
+# implementation ("trtllm" = the trtllm-gen cubin path behind
+# trtllm_batch_context_with_kv_cache, "cake" = its cake path,
+# "specialized" = the agent-generated SM103 CUDA kernel, linked directly);
+# "auto" only SELECTS among the named backends and carries no behavior of
+# its own.
+BATCH_CONTEXT_BACKENDS = ("auto", "specialized", "trtllm", "cake")
+
+# Defaults of trtllm_batch_context_with_kv_cache's optional parameters, for
+# the front's keyword fast path (kept in sync with the entry's signature;
+# the positional slow path binds the real signature).
+_BATCH_CONTEXT_DEFAULTS = dict(
+    window_left=-1,
+    out=None,
+    out_dtype=None,
+    o_sf_scale=None,
+    o_sf_vec_size=None,
+    kv_layout="HND",
+    enable_pdl=None,
+    sinks=None,
+    kv_cache_sf=None,
+    skip_softmax_threshold_scale_factor=None,
+    uses_shared_paged_kv_idx=True,
+    causal=True,
+    lse=None,
+    return_lse=False,
+    multi_ctas_kv_counter_buffer=None,
+    use_fp16_softmax=None,
+    uses_spcompress=None,
+    window_right=-1,
+    variable_window_token_starts=None,
+    variable_window_token_ends=None,
+)
+
+
+@functools.cache
+def _batch_context_param_info():
+    """Stock-signature metadata for the generic front: (all parameter
+    names, required parameter names, positional index of ``backend``)."""
+    import inspect
+
+    params = inspect.signature(trtllm_batch_context_with_kv_cache).parameters
+    names = frozenset(params)
+    required = frozenset(
+        n for n, p in params.items() if p.default is inspect.Parameter.empty
+    )
+    return names, required, list(params).index("backend")
+
+
+def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
+    """Generalized batch-context (chunked-prefill) attention over paged KV.
+
+    Vendor-neutral front over the batch-context contract. Parameters are
+    those of :func:`trtllm_batch_context_with_kv_cache` (which stays
+    unchanged), except ``backend``, which names a real implementation from
+    ``BATCH_CONTEXT_BACKENDS``:
+
+    - ``"specialized"``: the agent-generated SM103 CUDA kernel, called
+      directly at this front (not through the trtllm-named entry). Raises
+      a ``ValueError`` listing ``fallback_reasons`` for calls outside its
+      strict allowlist — an explicitly selected backend is never silently
+      swapped.
+    - ``"trtllm"`` / ``"cake"``: the corresponding paths of the
+      trtllm-named entry.
+    - ``"auto"`` (default): selection only, no behavior of its own —
+      routes to ``"specialized"`` when its allowlist serves the call,
+      otherwise to ``"trtllm"``.
+    """
+    if backend not in BATCH_CONTEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {BATCH_CONTEXT_BACKENDS}, got {backend!r}"
+        )
+    param_names, required, backend_pos = _batch_context_param_info()
+    if len(args) > backend_pos:
+        # The stock signature's positional backend slot would be silently
+        # overridden by this front's own (keyword-only) ``backend`` and then
+        # passed twice on the fallback call.
+        raise TypeError(
+            "batch_context_with_kv_cache() takes backend by keyword only; "
+            "do not pass it (or later parameters) positionally"
+        )
+    if backend in ("auto", "specialized"):
+        from .gqa_ctx_fp8_ikv_cuda import maybe_dispatch_specialized as _mds
+
+        if args:
+            # positional usage: full signature bind (slow path)
+            import inspect as _inspect
+
+            bound = _inspect.signature(trtllm_batch_context_with_kv_cache).bind(
+                *args, **kwargs
+            )
+            bound.apply_defaults()
+            a = dict(bound.arguments)
+        else:
+            # keyword usage (the serving call form): defaults + kwargs,
+            # no inspect machinery on the hot path.  Reject calls the stock
+            # entry would reject, so dispatch never changes error behavior.
+            unknown = kwargs.keys() - param_names
+            if unknown:
+                raise TypeError(
+                    "batch_context_with_kv_cache() got unexpected keyword "
+                    f"argument(s): {sorted(unknown)}"
+                )
+            missing = required - kwargs.keys()
+            if missing:
+                raise TypeError(
+                    "batch_context_with_kv_cache() missing required "
+                    f"argument(s): {sorted(missing)}"
+                )
+            a = dict(_BATCH_CONTEXT_DEFAULTS)
+            a.update(kwargs)
+        served = _mds(
+            backend=backend,
+            query=a["query"],
+            kv_cache=a["kv_cache"],
+            block_tables=a["block_tables"],
+            seq_lens=a["seq_lens"],
+            max_q_len=a["max_q_len"],
+            max_kv_len=a["max_kv_len"],
+            bmm1_scale=a["bmm1_scale"],
+            bmm2_scale=a["bmm2_scale"],
+            batch_size=a["batch_size"],
+            cum_seq_lens_q=a["cum_seq_lens_q"],
+            cum_seq_lens_kv=a["cum_seq_lens_kv"],
+            out=a["out"],
+            extras=dict(
+                out_dtype=a["out_dtype"],
+                lse=a["lse"],
+                return_lse=a["return_lse"],
+                sinks=a["sinks"],
+                kv_cache_sf=a["kv_cache_sf"],
+                o_sf_scale=a["o_sf_scale"],
+                o_sf_vec_size=a["o_sf_vec_size"],
+                skip_softmax=a["skip_softmax_threshold_scale_factor"],
+                uses_shared_paged_kv_idx=a["uses_shared_paged_kv_idx"],
+                multi_ctas=a["multi_ctas_kv_counter_buffer"],
+                causal=a["causal"],
+                kv_layout=a["kv_layout"],
+                window_left=a["window_left"],
+                window_right=a["window_right"],
+                use_fp16_softmax=a["use_fp16_softmax"],
+                uses_spcompress=a["uses_spcompress"],
+                vw_starts=a["variable_window_token_starts"],
+                vw_ends=a["variable_window_token_ends"],
+            ),
+        )
+        if served is not None:
+            return served
+        # backend == "auto": the specialized allowlist cannot serve; route
+        # to the named "trtllm" backend (explicit "specialized" raised).
+    kwargs["backend"] = "cake" if backend == "cake" else "trtllm-gen"
+    return trtllm_batch_context_with_kv_cache(*args, **kwargs)
+
+
 @functools.cache
 def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
