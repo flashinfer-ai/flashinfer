@@ -145,8 +145,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                       qSeqLen, qCuSeqLensPtr, maskPtr,
 #endif
                       reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-                      reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,
-                      kv_stride_token, kv_stride_head,
+                      reinterpret_cast<void*>(scratch.data_ptr()),
+                      uint64_t(scratch.numel()) * scratch.dtype().bits / 8, enable_pdl,
+                      kv_stride_page, kv_stride_token, kv_stride_head,
 #if ENABLE_4BIT_KV_CACHE
                       sf_stride_page, sf_stride_token, sf_stride_head,
 #endif
