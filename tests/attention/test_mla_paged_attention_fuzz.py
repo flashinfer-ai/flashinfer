@@ -46,12 +46,6 @@ LEDGER = FuzzLedger(
         ),
         Finding(
             match=lambda phase: phase == "poisoned_padding",
-            backend="cutlass",
-            reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
-            quarantine=True,
-        ),
-        Finding(
-            match=lambda phase: phase == "poisoned_padding",
             backend="cute-dsl-monolithic",
             reason="#6861: CuTe DSL monolithic MLA propagates padding NaNs into valid output",
             quarantine=True,
@@ -836,3 +830,73 @@ def test_mla_problem_seed_and_padding():
     assert all(first.nan_page not in ids for ids in first.pages)
     for ids, length in zip(first.pages, cfg.kv_lengths, strict=True):
         assert torch.isnan(first.cache[ids[-1], length % cfg.page_size :]).all()
+
+
+@pytest.mark.parametrize(
+    "dtype,page_size,metadata_form",
+    [
+        (torch.float16, 16, "csr"),
+        (torch.bfloat16, 64, "dense"),
+        (torch.float16, 128, "dense"),
+    ],
+)
+def test_mla_cutlass_padding_graph(dtype, page_size, metadata_form, workspace):
+    _require_backend("cutlass")
+    cfg = Config(
+        0,
+        (1,) * 8,
+        (1, page_size - 1, page_size, page_size + 1, 127, 128, 129, 1025),
+        heads=128,
+        page_size=page_size,
+        dtype=dtype,
+        metadata_form=metadata_form,
+        query_layout="packed",
+        kv_layout="packed",
+        lse_mode="none",
+    )
+    p = make_problem(cfg)
+    wrapper = _wrapper(p, "cutlass", workspace)
+    out = torch.empty_like(p.q[..., :CKV])
+    wrapper.run(query=p.query, kv_cache=p.kv_cache, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(query=p.query, kv_cache=p.kv_cache, out=out)
+    p.q.mul_(-0.5)
+    out.fill_(float("nan"))
+    graph.replay()
+    _check_numeric(out, None, p, reference_mla(p))
+
+
+@pytest.mark.parametrize(
+    "name,dtype",
+    [("query", torch.float16), ("kv_cache", torch.bfloat16), ("out", torch.bfloat16)],
+)
+def test_mla_cutlass_input_alignment(dtype, name, workspace):
+    _require_backend("cutlass")
+    cfg = Config(
+        0,
+        (1,),
+        (63,),
+        heads=128,
+        page_size=64,
+        dtype=dtype,
+        query_layout="packed",
+        kv_layout="packed",
+        lse_mode="none",
+    )
+    p = make_problem(cfg, poison_padding=False)
+    wrapper = _wrapper(p, "cutlass", workspace)
+    inputs = {"query": p.query, "kv_cache": p.kv_cache}
+    if name == "out":
+        inputs[name] = torch.empty_like(
+            p.q[..., :CKV], memory_format=torch.contiguous_format
+        )
+    original = inputs[name]
+    backing = torch.empty(original.numel() + 1, dtype=dtype, device="cuda")
+    misaligned = backing[1:].view_as(original)
+    misaligned.copy_(original)
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+    inputs[name] = misaligned
+    field = {"query": "q_nope_pe", "kv_cache": "ckv_kpe_cache", "out": "out"}[name]
+    with pytest.raises(ValueError, match=field + ".*16-byte aligned"):
+        wrapper.run(**inputs)

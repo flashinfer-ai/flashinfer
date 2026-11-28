@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cmath>
+#include <cstdint>
 #include <flashinfer/attention/cutlass_mla.cuh>
 #include <limits>
 
@@ -41,6 +42,13 @@ void RunCutlassMLAPagedAttention(ffi::TensorView& workspace, ffi::TensorView& ou
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
                               ffi::TensorView kv_lens, ffi::TensorView page_table, double o_scale) {
+  // The input copies and the epilogue output stores use 16-byte vectors.
+  TVM_FFI_CHECK(reinterpret_cast<std::uintptr_t>(q_nope_pe.data_ptr()) % 16 == 0, ValueError)
+      << "q_nope_pe must be 16-byte aligned";
+  TVM_FFI_CHECK(reinterpret_cast<std::uintptr_t>(ckv_kpe_cache.data_ptr()) % 16 == 0, ValueError)
+      << "ckv_kpe_cache must be 16-byte aligned";
+  TVM_FFI_CHECK(reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16 == 0, ValueError)
+      << "out must be 16-byte aligned";
   TVM_FFI_ICHECK(std::isfinite(o_scale) && o_scale > 0.0 &&
                  o_scale <= static_cast<double>(std::numeric_limits<float>::max()) &&
                  o_scale >= static_cast<double>(std::numeric_limits<float>::denorm_min()))

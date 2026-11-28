@@ -299,13 +299,16 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
   using TmaLoadKRope = typename CollectiveMmaQK::Params::TMA_B;
   using TmaLoadCLatentTranspose = typename CollectiveMmaPV::Params::TMA_B;
 
-  struct MainloopParams {
+  struct TmaMainloopParams {
     TmaLoadQLatent tma_load_q_latent;
     TmaLoadQRope tma_load_q_rope;
     TmaLoadCLatent tma_load_c_latent;
     TmaLoadKRope tma_load_k_rope;
     TmaLoadCLatentTranspose tma_load_c_latent_transpose;
   };
+
+  struct EmptyMainloopParams {};
+  using MainloopParams = cute::conditional_t<kIsCpAsync, EmptyMainloopParams, TmaMainloopParams>;
 
   struct EpilogueParams {
     ElementOut* ptr_o = nullptr;
@@ -335,67 +338,70 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     auto [H, K, D, B] = args.problem_shape;
     auto [L, R] = D;
 
-    int paged_B = B;
-    int paged_K = K;
-    if (args.mainloop.ptr_page_table != nullptr) {
-      paged_B = args.mainloop.page_count;
-      paged_K = args.mainloop.page_size;
+    MainloopParams mainloop_params{};
+    if constexpr (!kIsCpAsync) {
+      int paged_B = B;
+      int paged_K = K;
+      if (args.mainloop.ptr_page_table != nullptr) {
+        paged_B = args.mainloop.page_count;
+        paged_K = args.mainloop.page_size;
+      }
+
+      auto params_qk_latent =
+          CollectiveMmaQK::to_underlying_arguments(make_shape(H, K, L, B),
+                                                   typename CollectiveMmaQK::Arguments{
+                                                       args.mainloop.ptr_q_latent,
+                                                       args.mainloop.stride_q_latent,
+                                                       args.mainloop.ptr_c_latent,
+                                                       args.mainloop.stride_c_latent,
+                                                   },
+                                                   nullptr);
+
+      auto params_qk_latent_paged =
+          CollectiveMmaQK::to_underlying_arguments(make_shape(H, paged_K, L, paged_B),
+                                                   typename CollectiveMmaQK::Arguments{
+                                                       args.mainloop.ptr_q_latent,
+                                                       args.mainloop.stride_q_latent,
+                                                       args.mainloop.ptr_c_latent,
+                                                       args.mainloop.stride_c_latent,
+                                                   },
+                                                   nullptr);
+
+      auto params_qk_rope =
+          CollectiveMmaQK::to_underlying_arguments(make_shape(H, K, R, B),
+                                                   typename CollectiveMmaQK::Arguments{
+                                                       args.mainloop.ptr_q_rope,
+                                                       args.mainloop.stride_q_rope,
+                                                       args.mainloop.ptr_k_rope,
+                                                       args.mainloop.stride_k_rope,
+                                                   },
+                                                   nullptr);
+
+      auto params_qk_rope_paged =
+          CollectiveMmaQK::to_underlying_arguments(make_shape(H, paged_K, R, paged_B),
+                                                   typename CollectiveMmaQK::Arguments{
+                                                       args.mainloop.ptr_q_rope,
+                                                       args.mainloop.stride_q_rope,
+                                                       args.mainloop.ptr_k_rope,
+                                                       args.mainloop.stride_k_rope,
+                                                   },
+                                                   nullptr);
+
+      auto stride_c_latent_transpose = select<1, 0, 2>(args.mainloop.stride_c_latent);
+      auto params_pv_latent = CollectiveMmaPV::to_underlying_arguments(
+          make_shape(H, L, paged_K, paged_B),
+          typename CollectiveMmaPV::Arguments{
+              args.mainloop.ptr_q_latent,
+              args.mainloop.stride_q_latent,  // dummy, never used
+              args.mainloop.ptr_c_latent,
+              stride_c_latent_transpose,
+          },
+          nullptr);
+
+      mainloop_params = {params_qk_latent.tma_load_a, params_qk_rope.tma_load_a,
+                         params_qk_latent_paged.tma_load_b, params_qk_rope_paged.tma_load_b,
+                         params_pv_latent.tma_load_b};
     }
-
-    auto params_qk_latent =
-        CollectiveMmaQK::to_underlying_arguments(make_shape(H, K, L, B),
-                                                 typename CollectiveMmaQK::Arguments{
-                                                     args.mainloop.ptr_q_latent,
-                                                     args.mainloop.stride_q_latent,
-                                                     args.mainloop.ptr_c_latent,
-                                                     args.mainloop.stride_c_latent,
-                                                 },
-                                                 nullptr);
-
-    auto params_qk_latent_paged =
-        CollectiveMmaQK::to_underlying_arguments(make_shape(H, paged_K, L, paged_B),
-                                                 typename CollectiveMmaQK::Arguments{
-                                                     args.mainloop.ptr_q_latent,
-                                                     args.mainloop.stride_q_latent,
-                                                     args.mainloop.ptr_c_latent,
-                                                     args.mainloop.stride_c_latent,
-                                                 },
-                                                 nullptr);
-
-    auto params_qk_rope =
-        CollectiveMmaQK::to_underlying_arguments(make_shape(H, K, R, B),
-                                                 typename CollectiveMmaQK::Arguments{
-                                                     args.mainloop.ptr_q_rope,
-                                                     args.mainloop.stride_q_rope,
-                                                     args.mainloop.ptr_k_rope,
-                                                     args.mainloop.stride_k_rope,
-                                                 },
-                                                 nullptr);
-
-    auto params_qk_rope_paged =
-        CollectiveMmaQK::to_underlying_arguments(make_shape(H, paged_K, R, paged_B),
-                                                 typename CollectiveMmaQK::Arguments{
-                                                     args.mainloop.ptr_q_rope,
-                                                     args.mainloop.stride_q_rope,
-                                                     args.mainloop.ptr_k_rope,
-                                                     args.mainloop.stride_k_rope,
-                                                 },
-                                                 nullptr);
-
-    auto stride_c_latent_transpose = select<1, 0, 2>(args.mainloop.stride_c_latent);
-    auto params_pv_latent = CollectiveMmaPV::to_underlying_arguments(
-        make_shape(H, L, paged_K, paged_B),
-        typename CollectiveMmaPV::Arguments{
-            args.mainloop.ptr_q_latent,
-            args.mainloop.stride_q_latent,  // dummy, never used
-            args.mainloop.ptr_c_latent,
-            stride_c_latent_transpose,
-        },
-        nullptr);
-
-    MainloopParams mainloop_params{params_qk_latent.tma_load_a, params_qk_rope.tma_load_a,
-                                   params_qk_latent_paged.tma_load_b,
-                                   params_qk_rope_paged.tma_load_b, params_pv_latent.tma_load_b};
 
     EpilogueParams epilogue_params;
 
@@ -449,7 +455,21 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
   }
 
   static bool can_implement(Arguments const& args) {
-    if (kIsCpAsync) {
+    auto aligned = [](auto const* ptr, TensorStride const& stride) {
+      constexpr int elements_per_copy = sizeof(uint128_t) / sizeof(*ptr);
+      return reinterpret_cast<uintptr_t>(ptr) % sizeof(uint128_t) == 0 &&
+             get<0>(stride) % elements_per_copy == 0 && get<2>(stride) % elements_per_copy == 0;
+    };
+    if (!aligned(args.epilogue.ptr_o, args.epilogue.stride_o)) {
+      return false;
+    }
+    if constexpr (kIsCpAsync) {
+      if (!aligned(args.mainloop.ptr_q_latent, args.mainloop.stride_q_latent) ||
+          !aligned(args.mainloop.ptr_q_rope, args.mainloop.stride_q_rope) ||
+          !aligned(args.mainloop.ptr_c_latent, args.mainloop.stride_c_latent) ||
+          !aligned(args.mainloop.ptr_k_rope, args.mainloop.stride_k_rope)) {
+        return false;
+      }
       if ((args.mainloop.page_size & (args.mainloop.page_size - 1)) != 0) {
         return false;
       }
@@ -484,13 +504,15 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     int cta_coord_v = cta_rank_in_cluster % size<0>(AtomThrShapeMNK{});
     bool is_mma_leader_cta = cta_coord_v == 0;
 
-    if (role == WarpRole::kLoad && lane_predicate && !kIsCpAsync) {
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_q_latent.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_c_latent.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_q_rope.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_k_rope.get_tma_descriptor());
-      prefetch_tma_descriptor(
-          params.mainloop_params.tma_load_c_latent_transpose.get_tma_descriptor());
+    if constexpr (!kIsCpAsync) {
+      if (role == WarpRole::kLoad && lane_predicate) {
+        prefetch_tma_descriptor(params.mainloop_params.tma_load_q_latent.get_tma_descriptor());
+        prefetch_tma_descriptor(params.mainloop_params.tma_load_c_latent.get_tma_descriptor());
+        prefetch_tma_descriptor(params.mainloop_params.tma_load_q_rope.get_tma_descriptor());
+        prefetch_tma_descriptor(params.mainloop_params.tma_load_k_rope.get_tma_descriptor());
+        prefetch_tma_descriptor(
+            params.mainloop_params.tma_load_c_latent_transpose.get_tma_descriptor());
+      }
     }
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_raw);
 
@@ -629,9 +651,8 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
             }
           }
           if (local_split_kv <= get<3>(blk_coord)) continue;
-          load_cpasync(blk_coord, problem_shape, params.mainloop, params.mainloop_params,
-                       shared_storage.tensors, pipeline_load_qk, pipeline_load_qk_producer_state,
-                       local_split_kv,
+          load_cpasync(blk_coord, problem_shape, params.mainloop, shared_storage.tensors,
+                       pipeline_load_qk, pipeline_load_qk_producer_state, local_split_kv,
                        /* must be shared pipe */
                        pipeline_page_table, pipeline_pt_consumer_state);
           cutlass::arch::NamedBarrier((kNumComputeWarps + kNumLoadWarps) * NumThreadsPerWarp,
@@ -786,7 +807,8 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < TileShapeS{}; i += cutlass::NumThreadsPerWarp) {
         int idx = i + thread_idx;
-        bool guard = idx < pages_per_tile;
+        bool guard =
+            idx < pages_per_tile && pages_per_tile * k_index + idx < (K - 1) / page_size + 1;
         int smem_idx = pipeline_pt_producer_state.index() * TileShapeS::value + idx;
         int pt_idx = pages_per_tile * k_index + idx;
 
@@ -816,8 +838,8 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
   template <class BlkCoord>
   CUTLASS_DEVICE void load_cpasync(
       BlkCoord const& blk_coord, ProblemShape const& problem_shape,
-      MainloopArguments const& mainloop_args, MainloopParams const& mainloop_params,
-      TensorStorage& shared_tensors, PipelineLoadQK& pipeline_load,
+      MainloopArguments const& mainloop_args, TensorStorage& shared_tensors,
+      PipelineLoadQK& pipeline_load,
       typename PipelineLoadQK::PipelineState& pipeline_load_producer_state, int const& split_kv,
       PipelinePT& pipeline_page_table,
       typename PipelinePT::PipelineState& pipeline_pt_consumer_state) {
@@ -861,13 +883,13 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     Tensor sKC = make_tensor(make_smem_ptr(shared_tensors.smem_kc.begin()), SmemLayoutKC{});
     Tensor sVC = make_tensor(make_smem_ptr(shared_tensors.smem_vc.begin()), SmemLayoutVC{});
 
-    auto make_copy_for = [](auto sT) {
+    auto make_copy_for = [](auto sT, auto copy_op) {
       auto rT_a = sT.layout()(_, _, _, _0{});
       auto rT = make_ordered_layout(shape(rT_a), stride(rT_a));
       auto threads = Int<kNumLoadWarps * cutlass::NumThreadsPerWarp>{};
       auto values = Int<sizeof(uint128_t) / sizeof(Element)>{};
       return make_cotiled_copy(
-          Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
+          Copy_Atom<decltype(copy_op), Element>{},
           make_ordered_layout(make_shape(threads, values), make_stride(_1{}, _0{})), rT);
     };
 
@@ -875,22 +897,19 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     auto copy_split = [](auto atom, auto src, auto dst) {
       auto src_v = group_modes<1, rank_v<decltype(src)>>(src);
       auto dst_v = group_modes<1, rank_v<decltype(dst)>>(dst);
-
       auto src_v_ptrs = make_tensor<Element*>(size<1>(src_v));
       for (int i = 0; i < size<1>(src_v); i++) {
         src_v_ptrs(i) = &src_v(_0{}, i);
       }
-
       for (int i = 0; i < size<1>(src_v); i++) {
         auto src_v_i = make_tensor(make_gmem_ptr(src_v_ptrs(i)), make_shape(shape<0>(src_v)),
                                    make_stride(make_stride(_1{}, _0{})));
         atom.call(src_v_i, dst_v(_, i));
       }
     };
-
-    auto tiled_copy_q = make_copy_for(sQ);
-    auto tiled_copy_kc = make_copy_for(sKC);
-    auto tiled_copy_vc = make_copy_for(sVC);
+    auto tiled_copy_q = make_copy_for(sQ, SM80_CP_ASYNC_CACHEALWAYS<uint128_t>{});
+    auto tiled_copy_kc = make_copy_for(sKC, SM80_CP_ASYNC_CACHEALWAYS<uint128_t>{});
+    auto tiled_copy_vc = make_copy_for(sVC, SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>{});
 
     auto thr_copy_q =
         tiled_copy_q.get_thread_slice(threadIdx.x % (kNumLoadWarps * cutlass::NumThreadsPerWarp));
@@ -955,6 +974,26 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     auto tKCgCL = thr_copy_kc.partition_S(tSgCL);
     auto tKCgKR = thr_copy_kc.partition_S(tSgKR);
     auto tVCgCLT = thr_copy_vc.partition_S(tOgCLT);
+
+    auto cCLT = make_identity_tensor(shape(mCLT));
+    auto gCCLT = local_tile(cCLT, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{});
+    auto tVCcCLT = thr_copy_vc.partition_S(cta_mma_pv.partition_B(gCCLT));
+
+    auto copy_v = [&](auto src, auto dst, auto coords) {
+      auto src_v = group_modes<1, rank_v<decltype(src)>>(src);
+      auto dst_v = group_modes<1, rank_v<decltype(dst)>>(dst);
+      auto coord_v = group_modes<1, rank_v<decltype(coords)>>(coords);
+      auto src_v_ptrs = make_tensor<Element*>(size<1>(src_v));
+      for (int i = 0; i < size<1>(src_v); i++) {
+        src_v_ptrs(i) = &src_v(_0{}, i);
+      }
+      for (int i = 0; i < size<1>(src_v); i++) {
+        auto src_v_i = make_tensor(make_gmem_ptr(src_v_ptrs(i)), make_shape(shape<0>(src_v)),
+                                   make_stride(make_stride(_1{}, _0{})));
+        bool valid = get<1>(coord_v(_0{}, i)) < K;
+        tiled_copy_vc.with(valid).call(src_v_i, dst_v(_, i));
+      }
+    };
 
     // latent is first in memory, so let's load it first always
     // startup: alternate Q and K, set tx count appropriately, for k_idx = 0
@@ -1030,8 +1069,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
       for (int i = 0; i < IterationsPV_K; i++) {
         for (int j = 0; j < IterationsPV_N; j++) {
           load_stage([&](int index) {
-            copy_split(tiled_copy_vc, tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
-                       tVCsVC(_, _, _, _, index));
+            copy_v(tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
+                   tVCsVC(_, _, _, _, index),
+                   tVCcCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i));
           });
         }
       }
@@ -1045,11 +1085,13 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
 
     page_table_stage = pipeline_pt_release_state.index();
 
-    for (int i = 0; i < IterationsPV_K; i++) {
+    const int stages = last_pv_stages(K, k_index - 1);
+    for (int i = 0; i < stages; i++) {
       for (int j = 0; j < IterationsPV_N; j++) {
         load_stage([&](int index) {
-          copy_split(tiled_copy_vc, tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
-                     tVCsVC(_, _, _, _, index));
+          copy_v(tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
+                 tVCsVC(_, _, _, _, index),
+                 tVCcCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i));
         });
       }
     }
@@ -1355,6 +1397,15 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     }
   }
 
+  CUTLASS_DEVICE static int last_pv_stages(int length, int tile) {
+    if constexpr (kIsCpAsync) {
+      int rows = min(length - tile * int(TileShapeS{}), int(TileShapeS{}));
+      return ceil_div(rows, int(size<2>(TileShapePV{})));
+    } else {
+      return IterationsPV_K;
+    }
+  }
+
   template <class BlkCoord>
   CUTLASS_DEVICE void mma(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                           TensorStorage& shared_tensors, PipelineLoadQK& pipeline_load_qk,
@@ -1377,6 +1428,8 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     if (k_tile_count == 0) {
       return;
     }
+
+    const int last_stages = last_pv_stages(K, k_index + (k_tile_count - 1));
 
     // mma init
     Tensor sQ = make_tensor(make_smem_ptr(shared_tensors.smem_q.begin()), SmemLayoutQ{});
@@ -1488,7 +1541,7 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     pipeline_mma_o.producer_acquire(pipeline_mma_o_producer_state);
     pipeline_p_mma.consumer_wait(pipeline_p_mma_consumer_state);
 
-    for (int i = 0; i < IterationsPV_K; i++) {
+    for (int i = 0; i < last_stages; i++) {
       auto acc_flag = tiled_mma_pv.accumulate_;
       for (int j = 0; j < IterationsPV_N; j++) {
         pipeline_load_pv.consumer_wait(pipeline_load_pv_consumer_state);
