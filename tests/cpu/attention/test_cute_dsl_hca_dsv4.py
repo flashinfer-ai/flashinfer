@@ -46,6 +46,10 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
     with pytest.raises(ValueError, match="requires SM100/SM103/SM107, got SM101"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+    with pytest.raises(
+        ValueError, match="requires SM100/SM103/SM107 or SM120/SM121, got SM101"
+    ):
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
 
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
     sm107_default = mla_core._resolve_dsv4_sparse_mla_backend(
