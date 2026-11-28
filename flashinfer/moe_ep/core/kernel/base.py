@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ....fused_moe.api import QuantFormat
 
     from ...config import BootstrapConfig, FleetParams
-    from ...tensors import MoEEpTensors
+    from ...tensors import EplbRouting, MoEEpTensors
     from ...weights import MoEWeightPack
 
 
@@ -469,6 +469,28 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
+
+    def validate_eplb_routing(
+        self,
+        t: MoEEpTensors,
+        fleet_params: FleetParams,
+        eplb_routing: EplbRouting,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        from ..validation.common import MoEEpConfigError
+
+        raise MoEEpConfigError(
+            "This MegaMoE backend does not support logical EPLB routes"
+        )
+
+    def stage_inputs_with_eplb(
+        self,
+        t: MoEEpTensors,
+        workspace: Any,
+        eplb_routing: EplbRouting,
+    ) -> None:
+        raise NotImplementedError
 
     def workspace_output(self, workspace: Any) -> "torch.Tensor":
         """Return the stable output tensor owned by ``workspace``.

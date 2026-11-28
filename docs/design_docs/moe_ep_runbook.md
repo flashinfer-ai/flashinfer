@@ -952,6 +952,18 @@ The raw megakernel config must be wrapped in `MegaConfig` — `MoEEpLayer` route
 `MegaConfig` → `MoEEpMegaLayer` → `create_mega_kernel(cfg)`, which looks up
 `cfg.kernel_name` in `_MEGA_KERNEL_REGISTRY`.
 
+## Logical routes for Rubin MegaMoE
+
+For the fixed SM107 MXFP8-activation, MXFP4-weight backend, pass
+`EplbRouting` as `eplb_routing` to `warmup()` and `forward()` to map logical
+top-k IDs during fused BF16 input staging. Keep route-value checks and batch
+invariance disabled for this mode. Warm up with recording disabled if those
+calls should leave expert loads alone.
+
+The caller owns the replica tables and load counters. Keep their allocations
+alive across graph replay. Copy weights into their prepared physical slots
+before publishing updated logical maps on the execution stream.
+
 ## CUDA graphs (split layer)
 
 `MoEEpSplitLayer.forward()` on its own is **not** capturable, by construction:

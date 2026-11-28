@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from ..mxfp4_mxfp4_bf16_cutedsl.config import (
         Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
-    from ......tensors import MoEEpTensors
+    from ......tensors import EplbRouting, MoEEpTensors
     from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
     )
@@ -356,7 +356,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         )
 
     def stage_inputs(
-        self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
+        self,
+        t: "MoEEpTensors",
+        workspace: Any,
+        *,
+        quantize_input: bool,
+        eplb_routing: EplbRouting | None = None,
     ) -> None:
         """Stage validated MXFP8 activations and routes, masking unused rows.
 
@@ -378,6 +383,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 kind=self._kernel_config.kind,
                 num_experts=workspace.config.num_total_experts,
                 workspace=workspace,
+                eplb_tables=eplb_routing._tensors()
+                if eplb_routing is not None
+                else None,
                 **(
                     {"batch_invariant": True}
                     if getattr(self._kernel_config, "batch_invariant", False)

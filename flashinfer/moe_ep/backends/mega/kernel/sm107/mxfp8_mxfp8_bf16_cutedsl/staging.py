@@ -30,6 +30,7 @@ def stage_mega_moe_inputs(
     batch_invariant: bool = False,
     num_experts: int | None = None,
     workspace=None,
+    eplb_tables: tuple[torch.Tensor, ...] | None = None,
 ) -> int:
     """bf16 ``hidden_states`` -> MXFP4 or MXFP8 with per-32 E8M0 scales.
 
@@ -82,6 +83,8 @@ def stage_mega_moe_inputs(
         num_experts is not None
         and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") != "0"
     )
+    if eplb_tables is not None and (check_routes or not fused_stage):
+        raise ValueError("Logical EPLB routes require trusted fused input staging")
     fused_check = (
         check_routes
         and fused_stage
@@ -117,6 +120,7 @@ def stage_mega_moe_inputs(
             fuse_tail_mask=os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1")
             != "0",
             zero_masked_scores=False,
+            eplb_tables=eplb_tables,
             batch_invariant=batch_invariant,
             batch_invariant_quant_kind=(
                 kind
