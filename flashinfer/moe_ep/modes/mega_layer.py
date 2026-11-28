@@ -29,7 +29,7 @@ from .config import MegaConfig
 
 if TYPE_CHECKING:
     from ..core.kernel.base import MegaKernelBackend
-    from ..tensors import MoEEpTensors
+    from ..tensors import MegaMoeLoraOutput, MoEEpTensors
 
 
 class MoEEpMegaWorkspace:
@@ -503,6 +503,17 @@ class MoEEpMegaLayer(nn.Module):
                     dtype=torch.float32,
                     device=device,
                 ),
+                gemm1_lora_delta=(
+                    torch.zeros(
+                        num_tokens,
+                        top_k,
+                        2 * int(self._megakernel_config.intermediate_size),  # type: ignore[attr-defined]
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    if getattr(self._megakernel_config, "enable_fc1_lora_delta", False)
+                    else None
+                ),
             )
         if self._kernel.supports_unfinalized_output:
             self.forward_unfinalized(t, workspace=workspace)
@@ -577,7 +588,7 @@ class MoEEpMegaLayer(nn.Module):
 
     @staticmethod
     def _input_signature(t: "MoEEpTensors") -> tuple[Any, ...]:
-        signature = (
+        signature: tuple[Any, ...] = (
             t.hidden_states.device,
             t.hidden_states.dtype,
             t.hidden_states.ndim,
@@ -592,6 +603,11 @@ class MoEEpMegaLayer(nn.Module):
             t.topk_weights.shape[1] if t.topk_weights.ndim > 1 else None,
         )
 
+        delta = getattr(t, "gemm1_lora_delta", None)
+        if delta is not None:
+            signature += (
+                (delta.device, delta.dtype, delta.ndim, tuple(delta.shape[1:])),
+            )
         if (
             getattr(t, "shared_hidden_states", None) is not None
             or getattr(t, "shared_scales", None) is not None
@@ -748,8 +764,18 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
 
-    def compute_staged(self, *, output: torch.Tensor | None) -> torch.Tensor:
-        """Launch the kernel using inputs staged by :meth:`stage_inputs`."""
+    def compute_staged(
+        self, *, output: torch.Tensor | None
+    ) -> torch.Tensor | MegaMoeLoraOutput:
+        """Launch the kernel using inputs staged by :meth:`stage_inputs`.
+
+        Returns a plain :class:`torch.Tensor` when FC1 LoRA delta is disabled,
+        or a :class:`MegaMoeLoraOutput` when ``enable_fc1_lora_delta=True``.
+        With ``output=None``, the returned output tensor and any LoRA snapshot
+        and metadata tensors borrow pooled workspace storage until the next
+        launch reuses that workspace; passing ``output`` returns owned clones
+        for the LoRA snapshot and metadata buffers.
+        """
 
         if (
             self._staged_kernel is None
@@ -771,14 +797,19 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         return_workspace_view: bool = False,
-    ) -> torch.Tensor:
-        """Run MegaMoE and return either an owned tensor or a workspace view.
+    ) -> torch.Tensor | MegaMoeLoraOutput:
+        """Run MegaMoE and return either an owned result or a workspace view.
+
+        Returns a plain :class:`torch.Tensor` for standard configurations and a
+        :class:`MegaMoeLoraOutput` when ``enable_fc1_lora_delta=True``.
 
         Passing ``workspace`` selects its capacity and fixed knobs; it does not
-        change output ownership. The default always returns an owned output.
-        ``return_workspace_view=True`` explicitly opts into a borrowed view on
-        backends that support one. A view remains valid under stream ordering
-        until the next launch reuses the pooled physical workspace.
+        change output ownership. The default always returns owned tensors
+        (including cloned LoRA snapshot and routing-metadata buffers).
+        ``return_workspace_view=True`` explicitly opts into borrowed views on
+        backends that support one, in which case both ``output`` and the LoRA
+        snapshot/metadata fields borrow pooled workspace storage and remain
+        valid under stream ordering until the next launch reuses that workspace.
         """
         if self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")

@@ -81,6 +81,8 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # dequantized fc1 output before the clamp / gated activation, so callers
     # that quantize ``x_t / s_t`` to NVFP4 recover the per-token range in-kernel.
     enable_fc1_activation_per_token_scale: bool = False
+    # Per-(token, top_k) bf16 FC1 LoRA delta (Mn-bias) + bf16 post-SwiGLU activation snapshot.
+    enable_fc1_lora_delta: bool = field(default=False, kw_only=True)
     # None looks up compatible offline tuning, then falls back to the capacity
     # heuristic; a dictionary supplies explicit knobs.
     # "auto" searches inside autotune_v2() for the sources-backed implementation
@@ -103,6 +105,25 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     def __post_init__(self) -> None:
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool.")
+        if type(self.enable_fc1_lora_delta) is not bool:
+            raise ValueError("enable_fc1_lora_delta must be a bool.")
+        if self.enable_fc1_lora_delta:
+            if self.kernel_variant != "inference":
+                raise ValueError(
+                    "enable_fc1_lora_delta requires kernel_variant='inference'."
+                )
+            if self.kernel_name != "sm100_nvfp4_nvfp4_bf16_cutedsl":
+                raise ValueError(
+                    "enable_fc1_lora_delta requires the standard provider export."
+                )
+            if self.batch_invariant:
+                raise ValueError(
+                    "enable_fc1_lora_delta is not supported with batch_invariant=True."
+                )
+            if self.finalize_mode is FinalizeMode.NONE:
+                raise ValueError(
+                    "enable_fc1_lora_delta is not supported with finalize_mode=NONE."
+                )
         if self.batch_invariant:
             from ..common.nvfp4_batch_invariant import validate_nvfp4_batch_invariant
 

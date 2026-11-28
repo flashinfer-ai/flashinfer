@@ -82,6 +82,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     swiglu_alpha: float | None = field(default=None, kw_only=True)
     swiglu_beta: float | None = field(default=None, kw_only=True)
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
+    # Per-(token, top_k) bf16 FC1 LoRA delta (Mn-bias) + bf16 post-SwiGLU activation snapshot.
+    enable_fc1_lora_delta: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
@@ -92,6 +94,21 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
             )
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool")
+        if type(self.enable_fc1_lora_delta) is not bool:
+            raise ValueError("enable_fc1_lora_delta must be a bool")
+        if self.enable_fc1_lora_delta:
+            if self.kernel_variant != "inference":
+                raise ValueError(
+                    "enable_fc1_lora_delta requires kernel_variant='inference'."
+                )
+            if self.batch_invariant:
+                raise ValueError(
+                    "enable_fc1_lora_delta is not supported with batch_invariant=True."
+                )
+            if self.finalize_mode is FinalizeMode.NONE:
+                raise ValueError(
+                    "enable_fc1_lora_delta is not supported with finalize_mode=NONE."
+                )
         if self.batch_invariant:
             from ..common.block_scaled_batch_invariant import (
                 validate_block_scaled_batch_invariant,

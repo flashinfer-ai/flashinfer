@@ -99,6 +99,7 @@ def _signature(t, row_bound=None):
                 "fc2_alpha",
                 "fc1_norm_const",
                 "fc1_activation_per_token_scale",
+                "gemm1_lora_delta",
                 "recv_count",
                 "num_tokens_per_expert",
             )
@@ -425,6 +426,7 @@ class MoEEpAutoLayer(nn.Module):
             "fc2_alpha",
             "fc1_norm_const",
             "fc1_activation_per_token_scale",
+            "gemm1_lora_delta",
             "recv_count",
             "num_tokens_per_expert",
         ):

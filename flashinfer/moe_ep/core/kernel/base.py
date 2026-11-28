@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ....fused_moe.api import QuantFormat
 
     from ...config import BootstrapConfig, FleetParams
-    from ...tensors import MoEEpTensors
+    from ...tensors import MegaMoeLoraOutput, MoEEpTensors
     from ...weights import MoEWeightPack
 
 
@@ -488,10 +488,11 @@ class MegaKernelBackend(ABC):
         transformed_weights: Any,
         *,
         output: "torch.Tensor | None",
-    ) -> "torch.Tensor":
+    ) -> "torch.Tensor | MegaMoeLoraOutput":
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
-        zero-copy view of the workspace output, valid under stream ordering
-        until the next launch on this session's buffers."""
+        zero-copy view of the workspace output (and borrowed LoRA snapshot and
+        metadata views when ``enable_fc1_lora_delta=True``), valid under stream
+        ordering until the next launch on this session's buffers."""
 
     def _compute_prepared(
         self,
@@ -499,11 +500,14 @@ class MegaKernelBackend(ABC):
         transformed_weights: Any,
         *,
         output: "torch.Tensor | None",
-    ) -> "torch.Tensor":
+    ) -> "torch.Tensor | MegaMoeLoraOutput":
         """Execute immediately after the layer validates and stages a forward.
 
-        Backends may omit checks already covered by that path. Public staged
-        execution continues through ``compute``.
+        Backends may omit checks already covered by that path. Returns a plain
+        :class:`torch.Tensor` when FC1 LoRA delta is disabled, or a
+        :class:`MegaMoeLoraOutput` when enabled (borrowing workspace snapshot
+        storage when ``output=None``). Public staged execution continues
+        through ``compute``.
         """
         return self.compute(workspace, transformed_weights, output=output)
 

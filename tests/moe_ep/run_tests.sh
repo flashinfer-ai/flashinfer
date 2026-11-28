@@ -351,6 +351,11 @@ run_mega() {
     -k "tail_reset_multirank_graph or sparse_dispatch_graph or sparse_to_dense_graph or blackwell_genphase_graph" \
     -m "gpu_2 and arch_blackwell" || rc=1
 
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm100_megamoe_lora_delta.py -v \
+    -m "gpu_2 and arch_blackwell" || rc=1
+
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \

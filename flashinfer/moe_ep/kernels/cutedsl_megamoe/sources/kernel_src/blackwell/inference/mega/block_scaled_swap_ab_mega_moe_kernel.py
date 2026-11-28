@@ -108,6 +108,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # multiplies s_t back before the gated activation. Optional so existing descriptors
             # stay valid; it keys the compiled kernel (workspace region + epilogue path).
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
+            # Per-(token, topk) bf16 FC1 LoRA delta (Mn-bias) + bf16 post-SwiGLU activation snapshot.
+            "fc1_lora_delta": OptionalRequirement(bool),
         }
 
     @classmethod
@@ -186,6 +188,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
         self.fc1_activation_per_token_scale = bool(problem_desc.get("fc1_activation_per_token_scale", False))
+        self.fc1_lora_delta = bool(problem_desc.get("fc1_lora_delta", False))
 
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
@@ -457,6 +460,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("skip_topk_reduce and topk_reduce_persistent are mutually exclusive.")
         if self.skip_topk_reduce and (self.reduce_topk_in_kernel or self.combine_format.is_quantized):
             raise ValueError("skip_topk_reduce requires BF16 combine and reduce_topk_in_kernel=False.")
+        if self.fc1_lora_delta:
+            if self.combine_dedup:
+                raise ValueError("fc1_lora_delta is not supported with combine_dedup.")
+            if self.internode:
+                raise ValueError("fc1_lora_delta is not supported with internode.")
+            if self.helper_expert_count > 0:
+                raise ValueError("fc1_lora_delta is not supported with helper_expert_count > 0.")
         static_expert_dimensions = (
             isinstance(self.expert_count, int),
             isinstance(self.intermediate_gateup_size, int),
@@ -468,6 +478,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise NotImplementedError("The MegaMoE Kernel currently requires static expert dimensions.")
         if self.expert_count <= 0 or self.intermediate_gateup_size <= 0 or self.hidden_size <= 0:
             raise ValueError("MegaMoE expert dimensions must be positive.")
+        if self.fc1_lora_delta and self.intermediate_gateup_size % 32 != 0:
+            raise ValueError(
+                "fc1_lora_delta requires intermediate_gateup_size to be a multiple of 32 "
+                f"(16-element warp loads/stores on intermediate_downproj), got {self.intermediate_gateup_size}."
+            )
         if self.world_size <= 0 or self.expert_count % self.world_size != 0:
             raise ValueError("expert_count must be divisible by a positive world_size.")
         if self.topk <= 0 or self.topk > self.expert_count:
@@ -746,6 +761,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             + "_dlb_v1"
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
+            + ("_fc1loradelta" if self.fc1_lora_delta else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
             # Every build takes the tmp_buffer operand (None with the internode component): an ABI change, so it
             # keys the compiled kernel and its AOT symbol.
@@ -791,12 +807,19 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         def fake_tensor(dtype, shape, stride_order, dynamic_axes, alignment):
             extents = tuple(
-                sym_int64(divisibility=math.gcd(int(extent), 128)) if axis in dynamic_axes else int(extent)
+                extent
+                if not isinstance(extent, int)
+                else (
+                    sym_int64(divisibility=math.gcd(int(extent), 128))
+                    if axis in dynamic_axes
+                    else int(extent)
+                )
                 for axis, extent in enumerate(shape)
             )
             return make_fake_compact_tensor(dtype, extents, stride_order=stride_order, assumed_align=alignment)
 
         tokens = self.max_tokens_per_rank
+        sym_tokens = sym_int64(divisibility=math.gcd(int(tokens), 128))
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
         intermediate_downproj = intermediate_gateup // 2
@@ -818,7 +841,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 {0},
                 16,
             ),
-            topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
+            topk_indices=fake_tensor(self.topk_index_dtype, (sym_tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
             fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
             fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
@@ -876,6 +899,20 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fake_arguments.update(
                 fc1_activation_per_token_scale=fake_tensor(cutlass.Float32, (tokens,), (0,), {0}, 4),
             )
+        if self.fc1_lora_delta:
+            # Share ``sym_tokens`` with ``topk_indices`` so TVM-FFI rejects a delta whose
+            # leading row count differs from ``topk_indices`` before kernel launch.
+            fake_arguments.update(
+                fc1_lora_delta=fake_tensor(
+                    cutlass.BFloat16, (sym_tokens, self.topk, intermediate_gateup), (2, 1, 0), {0}, 16
+                ),
+                fc1_post_act_snapshot=fake_tensor(
+                    cutlass.BFloat16, (self.max_tokens, intermediate_downproj), (1, 0), set(), 16
+                ),
+                fc1_snapshot_token_ids=fake_tensor(cutlass.Int32, (self.max_tokens,), (0,), set(), 4),
+                fc1_snapshot_src_ranks=fake_tensor(cutlass.Int32, (self.max_tokens,), (0,), set(), 4),
+                fc1_snapshot_expert_offsets=fake_tensor(cutlass.Int32, (experts + 1,), (0,), set(), 4),
+            )
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake_arguments)
         if out_path is None:
@@ -918,6 +955,115 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         smem_workspace.finalize(max_bytes=smem_limit)
         return mainloop, smem_workspace
 
+    def _validate_lora_operands(
+        self,
+        topk_indices: cute.Tensor,
+        fc1_lora_delta: cute.Tensor,
+        fc1_post_act_snapshot: cute.Tensor,
+        fc1_snapshot_token_ids: cute.Tensor,
+        fc1_snapshot_src_ranks: cute.Tensor,
+        fc1_snapshot_expert_offsets: cute.Tensor,
+    ) -> None:
+        """Validate dtype, rank, static capacity, strides, and 16 B alignment for FC1 LoRA operands."""
+        intermediate_downproj = self.intermediate_gateup_size // 2
+        for operand_name, operand, expected_dtype, expected_rank in (
+            ("fc1_lora_delta", fc1_lora_delta, cutlass.BFloat16, 3),
+            ("fc1_post_act_snapshot", fc1_post_act_snapshot, cutlass.BFloat16, 2),
+            ("fc1_snapshot_token_ids", fc1_snapshot_token_ids, cutlass.Int32, 1),
+            ("fc1_snapshot_src_ranks", fc1_snapshot_src_ranks, cutlass.Int32, 1),
+            ("fc1_snapshot_expert_offsets", fc1_snapshot_expert_offsets, cutlass.Int32, 1),
+        ):
+            if operand.element_type is not expected_dtype:
+                raise TypeError(f"{operand_name} must be {expected_dtype}, got {operand.element_type}.")
+            if len(operand.shape) != expected_rank:
+                raise ValueError(f"{operand_name} must be {expected_rank}D, got rank {len(operand.shape)}.")
+
+        delta_rows = fc1_lora_delta.shape[0]
+        token_rows = topk_indices.shape[0]
+        if isinstance(delta_rows, int) and isinstance(token_rows, int) and delta_rows < token_rows:
+            raise ValueError(f"fc1_lora_delta has {delta_rows} token rows but topk_indices has {token_rows}.")
+        if isinstance(delta_rows, int) and not isinstance(token_rows, int) and delta_rows < self.max_tokens_per_rank:
+            raise ValueError(
+                f"fc1_lora_delta has {delta_rows} token rows but max_tokens_per_rank is {self.max_tokens_per_rank}."
+            )
+        if isinstance(fc1_lora_delta.shape[1], int) and fc1_lora_delta.shape[1] != self.topk:
+            raise ValueError(f"fc1_lora_delta dim 1 must equal topk ({self.topk}), got {fc1_lora_delta.shape[1]}.")
+        if (
+            isinstance(fc1_lora_delta.shape[2], int)
+            and fc1_lora_delta.shape[2] != self.intermediate_gateup_size
+        ):
+            raise ValueError(
+                f"fc1_lora_delta dim 2 must equal {self.intermediate_gateup_size}, got {fc1_lora_delta.shape[2]}."
+            )
+        if fc1_lora_delta.stride[2] != 1:
+            raise ValueError(f"fc1_lora_delta must have unit inner stride, got {fc1_lora_delta.stride}.")
+        for dim in (0, 1):
+            stride = fc1_lora_delta.stride[dim]
+            if isinstance(stride, int):
+                if stride % 8 != 0:
+                    raise ValueError(
+                        f"fc1_lora_delta stride[{dim}] must be a multiple of 8 bf16 elements "
+                        f"(16 B aligned), got {stride}."
+                    )
+            else:
+                divisibility = getattr(stride, "divisibility", 1)
+                if not isinstance(divisibility, int) or divisibility % 8 != 0:
+                    raise ValueError(
+                        f"fc1_lora_delta dynamic stride[{dim}] must guarantee divisibility by 8 "
+                        f"bf16 elements (16 B aligned), got divisibility={divisibility}."
+                    )
+        if fc1_lora_delta.iterator.max_alignment < 16:
+            raise ValueError(
+                "fc1_lora_delta must be declared 16 B aligned (assumed_align=16), "
+                f"got {fc1_lora_delta.iterator.max_alignment}."
+            )
+
+        if (
+            not isinstance(fc1_post_act_snapshot.shape[0], int)
+            or fc1_post_act_snapshot.shape[0] < self.max_tokens
+        ):
+            raise ValueError(
+                f"fc1_post_act_snapshot dim 0 must be a static int >= max_tokens ({self.max_tokens}), "
+                f"got {fc1_post_act_snapshot.shape[0]}."
+            )
+        if (
+            not isinstance(fc1_post_act_snapshot.shape[1], int)
+            or fc1_post_act_snapshot.shape[1] != intermediate_downproj
+        ):
+            raise ValueError(
+                f"fc1_post_act_snapshot dim 1 must equal {intermediate_downproj}, "
+                f"got {fc1_post_act_snapshot.shape[1]}."
+            )
+        if fc1_post_act_snapshot.stride[1] != 1:
+            raise ValueError(
+                f"fc1_post_act_snapshot must have unit inner stride, got {fc1_post_act_snapshot.stride}."
+            )
+        if (
+            not isinstance(fc1_post_act_snapshot.stride[0], int)
+            or fc1_post_act_snapshot.stride[0] < intermediate_downproj
+            or fc1_post_act_snapshot.stride[0] % 8 != 0
+        ):
+            raise ValueError(
+                f"fc1_post_act_snapshot stride[0] must be a static multiple of 8 bf16 elements "
+                f">= {intermediate_downproj} (non-overlapping 16 B aligned rows), "
+                f"got {fc1_post_act_snapshot.stride[0]}."
+            )
+        if fc1_post_act_snapshot.iterator.max_alignment < 16:
+            raise ValueError(
+                "fc1_post_act_snapshot must be declared 16 B aligned (assumed_align=16), "
+                f"got {fc1_post_act_snapshot.iterator.max_alignment}."
+            )
+
+        for name, buf, min_len in (
+            ("fc1_snapshot_token_ids", fc1_snapshot_token_ids, self.max_tokens),
+            ("fc1_snapshot_src_ranks", fc1_snapshot_src_ranks, self.max_tokens),
+            ("fc1_snapshot_expert_offsets", fc1_snapshot_expert_offsets, self.local_expert_count + 1),
+        ):
+            if not isinstance(buf.shape[0], int) or buf.shape[0] < min_len:
+                raise ValueError(f"{name} length must be a static int >= {min_len}, got {buf.shape[0]}.")
+            if buf.stride[0] != 1:
+                raise ValueError(f"{name} must have unit stride, got {buf.stride}.")
+
     @cute.jit
     def __call__(
         self,
@@ -953,6 +1099,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
         # Caller-owned int32[1] live-token count for persistent finalization.
         num_valid_tokens: Optional[cute.Tensor] = None,
+        # Symmetric (tokens, topk, 2 * intermediate_downproj) bf16 FC1 LoRA delta (Mn-bias) and
+        # local post-SwiGLU snapshot outputs. Required iff the descriptor enables fc1_lora_delta.
+        fc1_lora_delta: Optional[cute.Tensor] = None,
+        fc1_post_act_snapshot: Optional[cute.Tensor] = None,
+        fc1_snapshot_token_ids: Optional[cute.Tensor] = None,
+        fc1_snapshot_src_ranks: Optional[cute.Tensor] = None,
+        fc1_snapshot_expert_offsets: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
         if cutlass.const_expr(self.combine_dedup):
@@ -1009,6 +1162,32 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise ValueError(
                     f"fc1_activation_per_token_scale has {scale_rows} entries but topk_indices has {token_rows} rows."
                 )
+
+        lora_bundle = (
+            fc1_lora_delta,
+            fc1_post_act_snapshot,
+            fc1_snapshot_token_ids,
+            fc1_snapshot_src_ranks,
+            fc1_snapshot_expert_offsets,
+        )
+        lora_bundle_mismatch: cutlass.Constexpr = (
+            self.fc1_lora_delta and not all(value is not None for value in lora_bundle)
+        ) or (not self.fc1_lora_delta and any(value is not None for value in lora_bundle))
+        if cutlass.const_expr(lora_bundle_mismatch):
+            raise ValueError(
+                "fc1_lora_delta, fc1_post_act_snapshot, fc1_snapshot_token_ids, fc1_snapshot_src_ranks, "
+                "and fc1_snapshot_expert_offsets must all be passed iff the descriptor enables "
+                f"fc1_lora_delta (enabled={self.fc1_lora_delta})."
+            )
+        if cutlass.const_expr(self.fc1_lora_delta):
+            self._validate_lora_operands(
+                topk_indices,
+                fc1_lora_delta,
+                fc1_post_act_snapshot,
+                fc1_snapshot_token_ids,
+                fc1_snapshot_src_ranks,
+                fc1_snapshot_expert_offsets,
+            )
 
         helper_ready_bundle = (
             hot_expert_weight_ready_flags,
@@ -1289,6 +1468,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             gin_dev_comm,
             gin_window,
             shared_window_offset,
+            fc1_lora_delta,
+            fc1_post_act_snapshot,
+            fc1_snapshot_token_ids,
+            fc1_snapshot_src_ranks,
+            fc1_snapshot_expert_offsets,
         )
         if cutlass.const_expr(self.mixed_cga_config.is_mixed):
             kernel.launch(
@@ -1385,6 +1569,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         gin_dev_comm,
         gin_window,
         gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
+        fc1_lora_delta: Optional[cute.Tensor],
+        fc1_post_act_snapshot: Optional[cute.Tensor],
+        fc1_snapshot_token_ids: Optional[cute.Tensor],
+        fc1_snapshot_src_ranks: Optional[cute.Tensor],
+        fc1_snapshot_expert_offsets: Optional[cute.Tensor],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
@@ -1506,6 +1695,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc1_norm_const=fc1_norm_const,
                 topk_scores=pool_topk_scores,
                 fc1_activation_per_token_scale=pool_activation_scales,
+                fc1_lora_delta=fc1_lora_delta,
+                fc1_post_act_snapshot=fc1_post_act_snapshot,
             )
 
         pipeline_init_arrive_mixed_cga(
@@ -1665,6 +1856,52 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                     iket.range_pop()
                 finalize_barrier.arrive_and_wait()
+                if cutlass.const_expr(self.fc1_lora_delta):
+                    # Populate packed snapshot routing metadata (expert_offsets [E+1], token_id [R] with -1 pad)
+                    # before reset_tail() clears sizes_region. reset_tail()'s leading grid sync guarantees every
+                    # CTA finishes reading expert_token_sizes before any CTA resets it.
+                    transfer_warp_idx = warp_idx - Int32(self.transfer_warp_idx_start)
+                    transfer_thread_idx = transfer_warp_idx * Int32(32) + (thread_idx % Int32(32))
+                    total_transfer_threads = Int32(self.mixed_cga_config.total_cta_cnt * 128)
+                    global_transfer_tid = linear_cta_idx * Int32(128) + transfer_thread_idx
+                    pool_expert_base = self.token_comm.pool_expert_base_tensor(self._device_workspace)
+                    pad_block = Int32(self.token_padding_block)
+                    last_e = Int32(self.local_expert_count - 1)
+                    last_padded = (
+                        (expert_token_sizes[last_e] + pad_block - Int32(1)) // pad_block
+                    ) * pad_block
+                    total_padded_rows = pool_expert_base[last_e] + last_padded
+                    if linear_cta_idx == Int32(0):
+                        e_idx = transfer_thread_idx
+                        while e_idx <= Int32(self.local_expert_count):
+                            if e_idx < Int32(self.local_expert_count):
+                                fc1_snapshot_expert_offsets[e_idx] = pool_expert_base[e_idx]
+                            else:
+                                fc1_snapshot_expert_offsets[e_idx] = total_padded_rows
+                            e_idx = e_idx + Int32(128)
+                    for local_e in cutlass.range(self.local_expert_count, unroll=1):
+                        slab_base = pool_expert_base[local_e]
+                        slab_valid = expert_token_sizes[local_e]
+                        slab_padded = ((slab_valid + pad_block - Int32(1)) // pad_block) * pad_block
+                        r_in_slab = global_transfer_tid
+                        while r_in_slab < slab_padded:
+                            row = slab_base + r_in_slab
+                            if r_in_slab < slab_valid:
+                                meta = TokenSrcMetadata.load(
+                                    token_src_metadata.iterator.toint()
+                                    + Int64(row) * Int64(TokenSrcMetadata.nbytes)
+                                )
+                                fc1_snapshot_token_ids[row] = meta.src_token
+                                fc1_snapshot_src_ranks[row] = meta.src_rank
+                            else:
+                                fc1_snapshot_token_ids[row] = Int32(-1)
+                                fc1_snapshot_src_ranks[row] = Int32(-1)
+                            r_in_slab = r_in_slab + total_transfer_threads
+                    tail_row = total_padded_rows + global_transfer_tid
+                    while tail_row < Int32(self.max_tokens):
+                        fc1_snapshot_token_ids[tail_row] = Int32(-1)
+                        fc1_snapshot_src_ranks[tail_row] = Int32(-1)
+                        tail_row = tail_row + total_transfer_threads
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()
                 iket.range_pop()

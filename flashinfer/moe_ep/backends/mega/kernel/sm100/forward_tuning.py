@@ -82,4 +82,5 @@ class _ForwardTrial:
             self.workspace,
             quantize_input=self.execution.quantize_input,
         )
-        self.backend.compute(self.workspace, (l1, l2), output=self.execution.output)
+        compute_fn = getattr(self.backend, "_compute_for_tuning", self.backend.compute)
+        compute_fn(self.workspace, (l1, l2), output=self.execution.output)

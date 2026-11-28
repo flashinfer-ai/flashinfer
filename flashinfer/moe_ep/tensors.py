@@ -6,11 +6,26 @@ optional outputs the backend may populate during dispatch/combine.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 if TYPE_CHECKING:
     import torch
+
+
+class MegaMoeLoraOutput(NamedTuple):
+    """Finalized MegaMoE hidden output plus unweighted post-SwiGLU snapshot for down-LoRA.
+
+    Returned by :meth:`MoEEpMegaLayer.forward` when ``enable_fc1_lora_delta=True``.
+    Unpacks as ``y, act, token_id, expert_offsets, src_rank``. Pad rows in ``act``
+    have ``token_id == -1`` and ``src_rank == -1``.
+    """
+
+    output: "torch.Tensor"
+    act: "torch.Tensor"
+    token_id: "torch.Tensor"
+    expert_offsets: "torch.Tensor"
+    src_rank: "torch.Tensor"
 
 
 @dataclass
@@ -34,6 +49,10 @@ class MoEEpTensors:
     # requires ``enable_fc1_activation_per_token_scale`` on the kernel config):
     # multiplied into the dequantized fc1 output before the clamp / activation.
     fc1_activation_per_token_scale: Optional["torch.Tensor"] = None
+    # ``(num_tokens, top_k, 2 * intermediate_size)`` bf16 unweighted FC1 LoRA
+    # delta (Mn-bias, ``[..., :I]`` gate and ``[..., I:]`` up), added in fp32
+    # before clamp / activation. Requires ``enable_fc1_lora_delta=True``.
+    gemm1_lora_delta: Optional["torch.Tensor"] = field(default=None, kw_only=True)
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
     output: Optional["torch.Tensor"] = None

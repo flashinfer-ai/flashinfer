@@ -987,6 +987,12 @@ class GatedActEpilogueArgs:
     # epilogue multiplies ``s_t`` back onto the raw accumulator before clamp / activation. It has
     # no other home: the e4m3 block scale cannot carry an fp32 factor and alpha is per-expert.
     fc1_activation_per_token_scale: Optional[cute.Tensor] = None
+    # Source-rank symmetric (tokens, topk, 2 * intermediate_downproj) bf16 FC1 LoRA delta
+    # (Mn-bias: [..., :I] gate, [..., I:] up), added in fp32 after dequant and before clamp/activation.
+    fc1_lora_delta: Optional[cute.Tensor] = None
+    # Pool-ordered (worst_case_token_count, intermediate_downproj) bf16 post-activation snapshot
+    # captured after gated activation and before top-k weighting and FC2 input quantization.
+    fc1_post_act_snapshot: Optional[cute.Tensor] = None
 
 
 class SwapABGatedActEpilogue(KernelComponent):
@@ -1049,6 +1055,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             # Whether run() will receive the per-token FC1 activation scale. Absent means False:
             # the SMEM scratch it needs is reserved only for descriptors that enable it.
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
+            # Whether run() applies per-(token, topk) FC1 LoRA delta and dumps the bf16 post-activation snapshot.
+            "fc1_lora_delta": OptionalRequirement(bool),
             "swiglu_alpha": OptionalRequirement(Optional[float]),
             "swiglu_beta": OptionalRequirement(Optional[float]),
         }
@@ -1131,6 +1139,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         # The scratch costs mainloop SMEM budget, so only a descriptor that enables the scale
         # reserves it; passing the tensor without the flag is rejected in run().
         self.act_scale_scratch_enabled = bool(problem_desc.get("fc1_activation_per_token_scale", False))
+        self.fc1_lora_delta_enabled = bool(problem_desc.get("fc1_lora_delta", False))
         self.swiglu_alpha = problem_desc.get("swiglu_alpha")
         self.swiglu_beta = problem_desc.get("swiglu_beta")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
@@ -1473,6 +1482,18 @@ class SwapABGatedActEpilogue(KernelComponent):
             raise ValueError("fc2_done publication requires an FC2 done counter.")
         if cutlass.const_expr(self.token_back_push_sf and fc2_output_sf is None):
             raise ValueError("Quantized token-back requires an FC2 output scale tensor.")
+        if cutlass.const_expr(self.fc1_lora_delta_enabled != (optional_epi_args.fc1_lora_delta is not None)):
+            raise ValueError(
+                "fc1_lora_delta must be passed iff problem_desc['fc1_lora_delta'] is True "
+                f"(enabled={self.fc1_lora_delta_enabled})."
+            )
+        if cutlass.const_expr(self.fc1_lora_delta_enabled != (optional_epi_args.fc1_post_act_snapshot is not None)):
+            raise ValueError(
+                "fc1_post_act_snapshot must be passed iff problem_desc['fc1_lora_delta'] is True "
+                f"(enabled={self.fc1_lora_delta_enabled})."
+            )
+        if cutlass.const_expr(self.fc1_lora_delta_enabled and token_src_metadata is None):
+            raise ValueError("fc1_lora_delta requires token_src_metadata.")
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
             cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride),
@@ -1489,6 +1510,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc1_output_sf,
             fc1_done_counter,
             optional_epi_args,
+            token_src_metadata=token_src_metadata,
+            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
         )
         fc2_epi = self._make_fc2_epilogue(
             tidx,
@@ -1669,6 +1692,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: GatedActEpilogueArgs,
+        token_src_metadata: Optional[cute.Tensor] = None,
+        peer_rank_ptr_mapper: Optional[SymmetricBufferDevice] = None,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -1705,6 +1730,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         self.fc1_output_sf = fc1_output_sf
         self.fc1_done_counter = fc1_done_counter
         self.optional_epi_args = optional_epi_args
+        self.token_src_metadata = token_src_metadata
+        self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self._freeze()
 
     def __getattr__(self, name):
@@ -2067,34 +2094,98 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
 
-        # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
-        token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
-            gate_token_0_32, up_token_0_32, activation_alpha, dequant_scales=dequant_scales_token_0_32
-        )
+        # Step 1: perform swiglu on both halves (transposing both before activation when FC1 LoRA delta is enabled).
+        intermediate_output_size = cute.size(fc1_output, 1)
+        if cutlass.const_expr(self.optional_epi_args.fc1_lora_delta is not None):
+            # When LoRA delta is active, both halves are transposed to (token_1, intermediate_16) per lane
+            # before dequant + delta add + clamp + activation so delta loads are 16-wide contiguous per lane.
+            if cutlass.const_expr(act_scale_tensor is not None):
+                dequant_scale_token_0_32 = cutlass.Float32(1.0)
+                first_half_token_in_tile = subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) + self.lane_idx
+                if first_half_token_in_tile < work_tile_info.valid_tokens_in_cta_tile:
+                    dequant_scale_token_0_32 = act_scale_tensor[current_two_token_idices[0]]
+                if cutlass.const_expr(alpha_val is not None):
+                    if cutlass.const_expr(self.batch_invariant):
+                        dequant_scale_token_0_32 = ScalarF32.mul(dequant_scale_token_0_32, alpha_val)
+                    else:
+                        dequant_scale_token_0_32 = dequant_scale_token_0_32 * alpha_val
+            else:
+                dequant_scale_token_0_32 = None
 
-        # gate_token_32_64 / up_token_32_64 are already in the transpose input
-        # distribution (see TmemTranspose16x32 / load_subtile_raw_acc).
-        token_32_64_tmem_trans = TmemTranspose32x32Inplace(
-            tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
-        )
+            token_32_64_tmem_trans = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+            )
+            gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
+                token_32_64_tmem_trans.from_r1_perm_until_last_store()
+            )
+            gate_delta_32_64, up_delta_32_64 = self._load_fc1_lora_delta_half(
+                work_tile_info, subtile_idx, 1, intermediate_output_size
+            )
+            token_32_64_pre_quant = self.alpha_swiglu_clamp(
+                gate_token_32_64_trans_pre_act,
+                up_token_32_64_trans_pre_act,
+                activation_alpha,
+                dequant_scale=dequant_scale_token_32_64,
+                gate_delta=gate_delta_32_64,
+                up_delta=up_delta_32_64,
+            )
 
-        # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
-        # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
-        gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
-            token_32_64_tmem_trans.from_r1_perm_until_last_store()
-        )
+            cute.arch.fence_view_async_tmem_load()
+            token_0_32_tmem_trans = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_0_32, reg_tensor_bot=up_token_0_32
+            )
+            gate_token_0_32_trans_pre_act, up_token_0_32_trans_pre_act = (
+                token_0_32_tmem_trans.from_r1_perm_until_last_store()
+            )
+            gate_delta_0_32, up_delta_0_32 = self._load_fc1_lora_delta_half(
+                work_tile_info, subtile_idx, 0, intermediate_output_size
+            )
+            token_0_32_pre_quant = self.alpha_swiglu_clamp(
+                gate_token_0_32_trans_pre_act,
+                up_token_0_32_trans_pre_act,
+                activation_alpha,
+                dequant_scale=dequant_scale_token_0_32,
+                gate_delta=gate_delta_0_32,
+                up_delta=up_delta_0_32,
+            )
+        else:
+            # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
+            token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
+                gate_token_0_32, up_token_0_32, activation_alpha, dequant_scales=dequant_scales_token_0_32
+            )
 
-        token_32_64_pre_quant = self.alpha_swiglu_clamp(
-            gate_token_32_64_trans_pre_act,
-            up_token_32_64_trans_pre_act,
-            activation_alpha,
-            dequant_scale=dequant_scale_token_32_64,
-        )
+            # gate_token_32_64 / up_token_32_64 are already in the transpose input
+            # distribution (see TmemTranspose16x32 / load_subtile_raw_acc).
+            token_32_64_tmem_trans = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+            )
 
-        token_0_32_tmem_trans = TmemTranspose16x32(
-            tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
-        )
-        token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+            # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
+            # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
+            gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
+                token_32_64_tmem_trans.from_r1_perm_until_last_store()
+            )
+
+            token_32_64_pre_quant = self.alpha_swiglu_clamp(
+                gate_token_32_64_trans_pre_act,
+                up_token_32_64_trans_pre_act,
+                activation_alpha,
+                dequant_scale=dequant_scale_token_32_64,
+            )
+
+            token_0_32_tmem_trans = TmemTranspose16x32(
+                tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
+            )
+            token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+
+        # Step 1.5: Optional bf16 post-SwiGLU activation snapshot (unweighted, before FC2 input quantization).
+        if cutlass.const_expr(self.optional_epi_args.fc1_post_act_snapshot is not None):
+            self._store_fc1_post_act_snapshot(
+                work_tile_info=work_tile_info,
+                subtile_idx=subtile_idx,
+                two_token=(token_0_32_pre_quant, token_32_64_pre_quant),
+                intermediate_output_size=intermediate_output_size,
+            )
 
         # Step 2: Quant
         self.fc1_quant(
@@ -2102,7 +2193,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             two_token=(token_0_32_pre_quant, token_32_64_pre_quant),
             topk_scores=topk_scores,
             norm_const=norm_const,
-            intermediate_output_size=cute.size(fc1_output, 1),
+            intermediate_output_size=intermediate_output_size,
             fc1_output_sf=fc1_output_sf,
             subtile_idx=subtile_idx,
         )
@@ -2141,6 +2232,121 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             tma_ready_to_read_smem_named_barrier.arrive()
 
     @cute.jit
+    def _load_fc1_lora_delta_half(
+        self,
+        work_tile_info: SwapAbFc12WorkTileInfo,
+        subtile_idx: cutlass.Int32,
+        half: int,
+        intermediate_output_size: cutlass.Int32,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """Load 16 gate and 16 up bf16 FC1 LoRA deltas for this lane's token, cast to fp32."""
+        gate_delta_f32 = cute.make_rmem_tensor((16,), cutlass.Float32)
+        up_delta_f32 = cute.make_rmem_tensor((16,), cutlass.Float32)
+        for i in cutlass.range_constexpr(16):
+            gate_delta_f32[i] = cutlass.Float32(0.0)
+            up_delta_f32[i] = cutlass.Float32(0.0)
+
+        token_in_tile = (
+            subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) + self.lane_idx + cutlass.Int32(32 * half)
+        )
+        intermediate_idx = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self.cta_tile_m // 2)
+            + self.warp_idx * cutlass.Int32(self._EpilogueFc1IntermediateDownPerWarp)
+        )
+        in_bound = token_in_tile < work_tile_info.valid_tokens_in_cta_tile
+        if cutlass.const_expr(self._needs_intermediate_guard()):
+            in_bound = in_bound and (intermediate_idx < intermediate_output_size)
+
+        if in_bound:
+            pool_row = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+                + token_in_tile
+            )
+            meta = TokenSrcMetadata.load(
+                self.token_src_metadata.iterator.toint() + Int64(pool_row) * Int64(TokenSrcMetadata.nbytes)
+            )
+            delta_tensor = self.optional_epi_args.fc1_lora_delta
+            row_elem_offset = (
+                Int64(meta.src_token) * Int64(delta_tensor.stride[0])
+                + Int64(meta.src_topk) * Int64(delta_tensor.stride[1])
+            )
+            base_addr = delta_tensor.iterator.toint()
+            if cutlass.const_expr(self.communication_enabled and self.peer_rank_ptr_mapper is not None):
+                base_addr = self.peer_rank_ptr_mapper.map(base_addr, meta.src_rank, Int64(0))
+            gate_addr = base_addr + (row_elem_offset + Int64(intermediate_idx)) * Int64(2)
+            up_addr = base_addr + (row_elem_offset + Int64(intermediate_output_size) + Int64(intermediate_idx)) * Int64(2)
+
+            gate_delta_bf16 = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+            up_delta_bf16 = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+            vec_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+            chunk_layout = cute.make_layout(((8, 1),), stride=((1, 0),))
+            for chunk in cutlass.range_constexpr(2):
+                g_ptr = cute.make_ptr(
+                    cutlass.BFloat16, gate_addr + Int64(chunk * 16), AddressSpace.gmem, assumed_align=16
+                )
+                u_ptr = cute.make_ptr(
+                    cutlass.BFloat16, up_addr + Int64(chunk * 16), AddressSpace.gmem, assumed_align=16
+                )
+                cute.copy(
+                    vec_atom,
+                    cute.make_tensor(g_ptr, chunk_layout),
+                    cute.make_tensor(gate_delta_bf16.iterator + chunk * 8, chunk_layout),
+                )
+                cute.copy(
+                    vec_atom,
+                    cute.make_tensor(u_ptr, chunk_layout),
+                    cute.make_tensor(up_delta_bf16.iterator + chunk * 8, chunk_layout),
+                )
+            gate_delta_f32.store(gate_delta_bf16.load().to(cutlass.Float32))
+            up_delta_f32.store(up_delta_bf16.load().to(cutlass.Float32))
+
+        return gate_delta_f32, up_delta_f32
+
+    @cute.jit
+    def _store_fc1_post_act_snapshot(
+        self,
+        work_tile_info: SwapAbFc12WorkTileInfo,
+        subtile_idx: cutlass.Int32,
+        two_token: Tuple[cute.Tensor, cute.Tensor],
+        intermediate_output_size: cutlass.Int32,
+    ) -> None:
+        """Store unweighted post-SwiGLU activations as bf16 before FC2 input quantization."""
+        snapshot = self.optional_epi_args.fc1_post_act_snapshot
+        intermediate_idx = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self.cta_tile_m // 2)
+            + self.warp_idx * cutlass.Int32(self._EpilogueFc1IntermediateDownPerWarp)
+        )
+        vec_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        chunk_layout = cute.make_layout(((8, 1),), stride=((1, 0),))
+        for half in cutlass.range_constexpr(2):
+            token_in_tile = (
+                subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) + self.lane_idx + cutlass.Int32(32 * half)
+            )
+            in_bound = token_in_tile < work_tile_info.valid_tokens_in_cta_tile
+            if cutlass.const_expr(self._needs_intermediate_guard()):
+                in_bound = in_bound and (intermediate_idx < intermediate_output_size)
+            if in_bound:
+                pool_row = (
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+                    + token_in_tile
+                )
+                bf16_vals = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+                bf16_vals.store(two_token[half].load().to(cutlass.BFloat16))
+                row_elem_offset = Int64(pool_row) * Int64(snapshot.stride[0]) + Int64(intermediate_idx)
+                dst_base = snapshot.iterator.toint() + row_elem_offset * Int64(2)
+                for chunk in cutlass.range_constexpr(2):
+                    dst_ptr = cute.make_ptr(
+                        cutlass.BFloat16, dst_base + Int64(chunk * 16), AddressSpace.gmem, assumed_align=16
+                    )
+                    cute.copy(
+                        vec_atom,
+                        cute.make_tensor(bf16_vals.iterator + chunk * 8, chunk_layout),
+                        cute.make_tensor(dst_ptr, chunk_layout),
+                    )
+
+    @cute.jit
     def alpha_swiglu_clamp(
         self,
         gate_rmem: cute.Tensor,  # Raw fc1 acc (pre-dequant); even-size 1D fp32 rmem
@@ -2153,9 +2359,13 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #   dequant_scales: (n,) rmem, one value per register (pre-transpose distribution).
         dequant_scale: Optional[cutlass.Float32] = None,
         dequant_scales: Optional[cute.Tensor] = None,
+        gate_delta: Optional[cute.Tensor] = None,
+        up_delta: Optional[cute.Tensor] = None,
     ) -> cute.Tensor:
         # The BI branch executes the same ordered scalar chain for every tile.
         if cutlass.const_expr(self.batch_invariant):
+            if cutlass.const_expr(gate_delta is not None or up_delta is not None):
+                raise ValueError("alpha_swiglu_clamp: batch_invariant does not support fc1_lora_delta.")
             out = cute.make_rmem_tensor((cute.size(gate_rmem),), cutlass.Float32)
             for i in cutlass.range_constexpr(0, cute.size(gate_rmem), 2):
                 alpha_pair = None
@@ -2183,7 +2393,15 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                     )
                 out[i], out[i + 1] = result
         else:
-            out = self._alpha_swiglu_clamp_regular(gate_rmem, up_rmem, alpha_val, dequant_scale=dequant_scale, dequant_scales=dequant_scales)
+            out = self._alpha_swiglu_clamp_regular(
+                gate_rmem,
+                up_rmem,
+                alpha_val,
+                dequant_scale=dequant_scale,
+                dequant_scales=dequant_scales,
+                gate_delta=gate_delta,
+                up_delta=up_delta,
+            )
         return out
 
     @cute.jit
@@ -2199,6 +2417,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #   dequant_scales: (n,) rmem, one value per register (pre-transpose distribution).
         dequant_scale: Optional[cutlass.Float32] = None,
         dequant_scales: Optional[cute.Tensor] = None,
+        gate_delta: Optional[cute.Tensor] = None,
+        up_delta: Optional[cute.Tensor] = None,
     ) -> cute.Tensor:
         # ── Input contract checks (compile-time): fp32, 1D, even-count, rmem ──
         # Wrapped in const_expr so the DSL evaluates them at trace time and the
@@ -2271,6 +2491,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             raise ValueError(
                 f"alpha_swiglu_clamp: dequant_scales must hold {n} values, got {cute.size(dequant_scales)}"
             )
+        if cutlass.const_expr((gate_delta is None) != (up_delta is None)):
+            raise ValueError("alpha_swiglu_clamp: gate_delta and up_delta must be provided or omitted together.")
 
         for i in cutlass.range_constexpr(0, n, 2):
             g0 = gate_rmem[i]
@@ -2290,6 +2512,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             if cutlass.const_expr(scale_pair is not None):
                 g0, g1 = cute.arch.mul_packed_f32x2((g0, g1), scale_pair)
                 u0, u1 = cute.arch.mul_packed_f32x2((u0, u1), scale_pair)
+
+            # 1.5) Add unweighted per-(token, topk) FC1 LoRA delta (Mn-bias) before clamp and activation.
+            if cutlass.const_expr(gate_delta is not None):
+                g0, g1 = cute.arch.add_packed_f32x2((g0, g1), (gate_delta[i], gate_delta[i + 1]))
+                u0, u1 = cute.arch.add_packed_f32x2((u0, u1), (up_delta[i], up_delta[i + 1]))
 
             # 2) clamp the real values (skip when no clamp configured).
             if cutlass.const_expr(self.gate_up_clamp is not None):

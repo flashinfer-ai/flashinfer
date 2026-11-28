@@ -103,6 +103,8 @@ class BlackwellEpTuningMixin:
             ),
             "combine_dtype": getattr(cfg, "combine_dtype", "bf16"),
         }
+        if getattr(cfg, "enable_fc1_lora_delta", False):
+            result["fc1_lora_delta"] = True
         if getattr(cfg, "batch_invariant", False):
             result["batch_invariant_fingerprint"] = self.batch_invariant_fingerprint(
                 fleet_params

@@ -219,6 +219,10 @@ def _sweep_sm100_mega_moe(
                 source = getattr(symm_buffer, name, None)
                 if source is not None:
                     getattr(trial, name).copy_(source)
+            delta_source = getattr(symm_buffer, "gemm1_lora_delta", None)
+            if delta_source is not None and num_tokens > 0:
+                # Copy only staged live token rows; topk_idx already masks unused rows.
+                trial.gemm1_lora_delta[:num_tokens].copy_(delta_source[:num_tokens])
             trial.note_staged_tokens(num_tokens)
             trial.prepare(transformed_l1, transformed_l2)
             return trial if make_trial is None else make_trial(trial)

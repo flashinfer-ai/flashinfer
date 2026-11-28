@@ -240,7 +240,7 @@ from .modes import (
     kernel_requires_weights,
     run_split_kernel,
 )
-from .tensors import MoEEpTensors
+from .tensors import MegaMoeLoraOutput, MoEEpTensors
 from .weights import (
     MoEWeightPack,
     PrequantizedMoEWeights,
@@ -300,6 +300,7 @@ __all__ = [
     "HandleParams",
     "IdentityConfig",
     "MegaConfig",
+    "MegaMoeLoraOutput",
     "MoEEpArchError",
     "MoEEpCommParams",
     "MoEEpCommunication",

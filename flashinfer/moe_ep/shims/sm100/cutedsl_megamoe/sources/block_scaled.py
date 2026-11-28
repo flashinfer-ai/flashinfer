@@ -556,6 +556,12 @@ class BlockScaledSymmBuffer:
         if self.fc1_activation_per_token_scale is not None:
             self.fc1_activation_per_token_scale.fill_(1)
 
+        self.gemm1_lora_delta = (
+            comm.sym_zeros((tokens, cfg.num_topk, 2 * cfg.intermediate), torch.bfloat16)
+            if getattr(cfg, "enable_fc1_lora_delta", False)
+            else None
+        )
+
         self._allocate_kernel_workspace(kernel, local_workspace=self.local_workspace)
 
         self._compiled: Optional[Any] = None
@@ -604,6 +610,44 @@ class BlockScaledSymmBuffer:
             ),
             local_workspace=self._prepare_kernel_workspace_local(kernel),
             tmp_workspace=self._prepare_kernel_tmp_local(kernel),
+            fc1_post_act_snapshot=(
+                torch.zeros(
+                    (int(kernel.max_tokens), cfg.intermediate),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                if getattr(cfg, "enable_fc1_lora_delta", False)
+                else None
+            ),
+            fc1_snapshot_token_ids=(
+                torch.full(
+                    (int(kernel.max_tokens),),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if getattr(cfg, "enable_fc1_lora_delta", False)
+                else None
+            ),
+            fc1_snapshot_src_ranks=(
+                torch.full(
+                    (int(kernel.max_tokens),),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if getattr(cfg, "enable_fc1_lora_delta", False)
+                else None
+            ),
+            fc1_snapshot_expert_offsets=(
+                torch.zeros(
+                    (cfg.experts_per_rank + 1,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if getattr(cfg, "enable_fc1_lora_delta", False)
+                else None
+            ),
         )
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             prepared[name] = (
@@ -868,6 +912,7 @@ class BlockScaledSymmBuffer:
             fields["fc1_activation_per_token_scale"] = getattr(
                 cfg, "enable_fc1_activation_per_token_scale", False
             )
+            fields["fc1_lora_delta"] = getattr(cfg, "enable_fc1_lora_delta", False)
             fields["swiglu_alpha"] = (
                 None
                 if activation_variant is not None
@@ -1044,8 +1089,40 @@ class BlockScaledSymmBuffer:
                         device=self.device,
                     )
                 )
+            snapshot = getattr(self, "fc1_post_act_snapshot", None)
+            snapshot_token_ids = getattr(self, "fc1_snapshot_token_ids", None)
+            snapshot_src_ranks = getattr(self, "fc1_snapshot_src_ranks", None)
+            if getattr(config, "enable_fc1_lora_delta", False) and int(
+                kernel.max_tokens
+            ) != int(self.kernel.max_tokens):
+                snapshot = torch.zeros(
+                    (int(kernel.max_tokens), config.intermediate),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                snapshot_token_ids = torch.full(
+                    (int(kernel.max_tokens),),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                snapshot_src_ranks = torch.full(
+                    (int(kernel.max_tokens),),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             torch.cuda.synchronize()
-            return config, kernel, local, tmp, output
+            return (
+                config,
+                kernel,
+                local,
+                tmp,
+                output,
+                snapshot,
+                snapshot_token_ids,
+                snapshot_src_ranks,
+            )
 
         prepared = comm.prepare_local(
             prepare_replacement,
@@ -1054,7 +1131,16 @@ class BlockScaledSymmBuffer:
             phase="winner local allocation",
         )
         if prepared is not None:
-            config, kernel, local, tmp, output = prepared
+            (
+                config,
+                kernel,
+                local,
+                tmp,
+                output,
+                snapshot,
+                snapshot_token_ids,
+                snapshot_src_ranks,
+            ) = prepared
             self._compiled = self._launch_key = self._launch_kwargs = None
             self._launch_weights = None
             self._pre_reduced_activation = self._pre_reduced_activation_sf = None
@@ -1072,6 +1158,9 @@ class BlockScaledSymmBuffer:
                 )
             self.config, self.kernel = config, kernel
             self.tmp_workspace = tmp
+            self.fc1_post_act_snapshot = snapshot
+            self.fc1_snapshot_token_ids = snapshot_token_ids
+            self.fc1_snapshot_src_ranks = snapshot_src_ranks
             self._allocate_kernel_workspace(kernel, local_workspace=local)
         comm.prepare_local(
             lambda: self.prepare(transformed_l1, transformed_l2),

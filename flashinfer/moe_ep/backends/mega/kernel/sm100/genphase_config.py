@@ -64,6 +64,10 @@ class GenphaseConfigMixin(BlackwellEpTuningMixin):
             raise MoEEpConfigError(
                 "Blackwell GenPhase does not support per-token FC1 scales."
             )
+        if getattr(k, "enable_fc1_lora_delta", False):
+            raise MoEEpConfigError(
+                "Blackwell GenPhase does not support FC1 LoRA delta."
+            )
         self._genphase_configs: dict[tuple, Any] = {}
         self._genphase_constraints()
 
