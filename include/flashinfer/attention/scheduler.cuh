@@ -682,8 +682,12 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
 
     int64_t qo_len = packed_qo_len / gqa_group_size;
-    for (uint32_t row = 0; row < qo_len; ++row) {
-      merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
+    // Fixed-size splitting can first become active in a later request, so
+    // retain earlier merge entries whenever that mode may need them.
+    if (split_kv || (!disable_split_kv && fixed_split_size > 0)) {
+      for (uint32_t row = 0; row < qo_len; ++row) {
+        merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
+      }
     }
     o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
   }
