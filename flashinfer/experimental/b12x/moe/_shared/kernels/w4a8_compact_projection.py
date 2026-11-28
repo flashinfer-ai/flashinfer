@@ -38,7 +38,15 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int, csf_inline: bool = False):
+    def __init__(
+        self,
+        k: int,
+        n: int,
+        num_topk: int,
+        csf_inline: bool = False,
+        *,
+        n64_repacked: bool = False,
+    ):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -50,11 +58,11 @@ class W4A8CompactMicroProjectionKernel:
         self.n = int(n)
         self.num_topk = int(num_topk)
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
-        self.n64_tail = self.n % self.tile_n == 64
+        self.n64_repacked = n64_repacked or self.n % self.tile_n == 64
         # The SFB operand is inline MXFP4-CSF storage (mxfp4_csf_inline): stages
         # copy compressed tile blocks and each thread rebuilds its scale words.
         self.csf_inline = bool(csf_inline)
-        if self.csf_inline and not self.n64_tail:
+        if self.csf_inline and not self.n64_repacked:
             raise ValueError("inline MXFP4-CSF scales require compact N64 W4A8 weights")
         self.b_payload_bytes = self.tile_n * self.tile_k // 2
         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
@@ -160,9 +168,7 @@ class W4A8CompactMicroProjectionKernel:
         k64_slice: Int32,
         tid: Int32,
     ):
-        n_rows = Int32(128)
-        if output_tile == Int32(self.n_tiles - 1):
-            n_rows = Int32(64)
+        n_rows = cutlass.min(Int32(128), Int32(self.n) - output_tile * Int32(128))
         for i in cutlass.range_constexpr(2):
             idx = tid + Int32(i * self.threads_per_cta)
             if idx < Int32(256):
@@ -203,9 +209,7 @@ class W4A8CompactMicroProjectionKernel:
         k128_slice: Int32,
         tid: Int32,
     ):
-        n_rows = Int32(128)
-        if output_tile == Int32(self.n_tiles - 1):
-            n_rows = Int32(64)
+        n_rows = cutlass.min(Int32(128), Int32(self.n) - output_tile * Int32(128))
         if tid < Int32(32):
             dst_addr = dst_base + (tid << Int32(4))
             if tid < n_rows // Int32(4):
@@ -262,7 +266,7 @@ class W4A8CompactMicroProjectionKernel:
         b_base = stage_base + Int32(self.b_offset)
         sfb_base = stage_base + Int32(self.sfb_offset)
         k128_slice = k64_slice >> Int32(1)
-        if cutlass.const_expr(self.n64_tail):
+        if cutlass.const_expr(self.n64_repacked):
             projection = projection_tile // Int32(self.n_tiles)
             output_tile = projection_tile % Int32(self.n_tiles)
             self._stage_n64_b_k64(
