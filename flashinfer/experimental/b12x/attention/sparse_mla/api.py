@@ -23,6 +23,12 @@ from .pooled_selection import (
     expand_pooled_topk_to_physical_slots,
     plan_pooled_selection,
 )
+from .._shared.mla.api import (
+    sparse_mla_decode_forward as run_decode,
+)
+from .._shared.mla.api import (
+    sparse_mla_extend_forward as run_extend,
+)
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
@@ -36,6 +42,7 @@ from ._scratch import (
 from ._preparation import plan as _plan
 from ._preparation import state as _state
 from ._preparation import plan_cache_writer
+from ._preparation import plan_cache_writer_fp8_tail
 from ._preparation import writer_state as _writer_state
 from . import META
 
@@ -162,6 +169,27 @@ def concat_and_cache_glm_next_mla_nvfp4(
     concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
 
+def concat_and_cache_glm_next_mla_kvarn(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
+
+
+def concat_and_cache_glm_next_mla_fp8_tail(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    """Write fp8 tail records into a kvarn pool through a prepared plan."""
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
+
+
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
     return default_is_supported(device, requires=META.requires)
@@ -180,10 +208,13 @@ __all__ = [
     "bind",
     "run",
     "plan_cache_writer",
+    "plan_cache_writer_fp8_tail",
     "plan_pooled_selection",
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
+    "concat_and_cache_glm_next_mla_kvarn",
+    "concat_and_cache_glm_next_mla_fp8_tail",
     "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",

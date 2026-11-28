@@ -16,7 +16,8 @@ from b12x.moe._shared.kernels.activations import (
 )
 
 
-_W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
+_W4A16_AUTO_ROUTED_SIZES = (8, 16, 32, 48, 64)
+_W4A16_ALLOWED_ROUTED_SIZES = (*_W4A16_AUTO_ROUTED_SIZES, 128)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
@@ -206,10 +207,10 @@ def reorder_w13_to_gate_up(
 
 def select_route_block_size_m(m: int, topk: int, num_experts: int) -> int:
     avg_routes_per_expert = (int(m) * int(topk)) / int(num_experts)
-    for routed_size in _W4A16_ALLOWED_ROUTED_SIZES:
+    for routed_size in _W4A16_AUTO_ROUTED_SIZES:
         if avg_routes_per_expert < _ROUTED_SIZE_TARGET_FILL * routed_size:
             return routed_size
-    return _W4A16_ALLOWED_ROUTED_SIZES[-1]
+    return _W4A16_AUTO_ROUTED_SIZES[-1]
 
 
 def route_block_sizes_for_capacity(
@@ -221,9 +222,9 @@ def route_block_sizes_for_capacity(
     max_tokens = max(int(max_tokens), 1)
     first = select_route_block_size_m(1, topk, num_experts)
     last = select_route_block_size_m(max_tokens, topk, num_experts)
-    first_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(first)
-    last_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(last)
-    return _W4A16_ALLOWED_ROUTED_SIZES[first_idx : last_idx + 1]
+    first_idx = _W4A16_AUTO_ROUTED_SIZES.index(first)
+    last_idx = _W4A16_AUTO_ROUTED_SIZES.index(last)
+    return _W4A16_AUTO_ROUTED_SIZES[first_idx : last_idx + 1]
 
 
 def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int:
