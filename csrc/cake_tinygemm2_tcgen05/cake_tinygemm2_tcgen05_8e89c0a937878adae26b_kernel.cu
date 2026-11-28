@@ -172,7 +172,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_tinygemm2_tcgen05_8e89c0a937878adae26b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
+kernel_cake_tinygemm2_tcgen05_8e89c0a937878adae26b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* out, __nv_bfloat16* bias, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -777,6 +777,7 @@ kernel_cake_tinygemm2_tcgen05_8e89c0a937878adae26b(const __grid_constant__ CUten
             int col_half = lane / 16;
             int bm0_1_0 = m0_e + epi_tid % 16;
             int _min_0_2 = ((bm0_1_0) < (M - 1) ? (bm0_1_0) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             float bv0_1_0 = bias[_min_0_2];
             unsigned int _phase_mma_epi_full_0 = 0;
             mbarrier_wait(mma_epi_full_addr, _phase_mma_epi_full_0);

@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K);
+extern "C" __global__ void kernel_cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* out, __nv_bfloat16* bias, int M, int N, int K);
 
 namespace cake_binding_kernel_cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d {
 

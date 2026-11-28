@@ -131,7 +131,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
-kernel_cake_tinygemm2_wgmma_04148d587a09906e3c39(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
+kernel_cake_tinygemm2_wgmma_04148d587a09906e3c39(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* out, __nv_bfloat16* bias, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -197,6 +197,7 @@ kernel_cake_tinygemm2_wgmma_04148d587a09906e3c39(const __grid_constant__ CUtenso
             int g = lane / 4;
             int t = lane % 4;
             int _min_0 = ((m0 + warp * 16 + g) < (M - 1) ? (m0 + warp * 16 + g) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             float bvr_0 = bias[_min_0];
             int _min_1 = ((m0 + warp * 16 + g + 8) < (M - 1) ? (m0 + warp * 16 + g + 8) : (M - 1));
             float bvr_1 = bias[_min_1];
