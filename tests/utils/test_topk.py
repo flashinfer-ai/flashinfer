@@ -2528,6 +2528,17 @@ def _run_transform(
     )
 
 
+@pytest.mark.parametrize("k", [-1, 0, 5])
+def test_top_k_invalid_k(k):
+    scores = torch.empty(1, 4, device="meta")
+    with pytest.raises(ValueError, match="k must be in"):
+        flashinfer.top_k(scores, k)
+    if k <= 0:
+        for mode in ("page_table", "ragged"):
+            with pytest.raises(ValueError, match="k must be positive"):
+                _run_transform(scores, k, mode)
+
+
 def _run_transform_with_identity_mapping(
     logits, k, transform_mode, deterministic: bool = False
 ):
