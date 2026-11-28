@@ -1,6 +1,10 @@
 """Real collectives and lifecycle checks for the prepared Sage2 QKV path."""
 
+import contextlib
 from dataclasses import replace
+import importlib
+import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,7 +12,10 @@ import torch.distributed as dist
 
 from flashinfer.comm import UlyssesCommunicator, UlyssesQKV, UlyssesQKVWorkspace
 import flashinfer.comm._ulysses_lowp as lowp
+from flashinfer.comm.ulysses import missing_ulysses_pcie_dependencies
+from flashinfer.comm.ulysses_topology import UlyssesBackendError
 from tests.comm.test_ulysses_communicator import (
+    _make_mock_pcie_comm,
     _ref_gather_heads,
     _run_multi_rank,
 )
@@ -475,13 +482,18 @@ def _non_nccl_group_body(rank, world, group, backend):
     metadata_group = dist.new_group(backend="gloo")
     try:
         x = torch.full((1, 4, world, 64), rank + 1, dtype=torch.bfloat16, device="cuda")
-        with pytest.raises((ValueError, RuntimeError), match="NCCL|nccl"):
+        with pytest.raises((ValueError, RuntimeError)) as rejected:
             UlyssesCommunicator(
                 metadata_group,
                 max_bytes=x.nbytes,
                 dtype=x.dtype,
                 backend=backend,
             )
+        if isinstance(rejected.value, UlyssesBackendError):
+            # Without NVLink the forced topology check rejects first; the
+            # runner reports that as a skip.
+            raise rejected.value
+        assert "nccl" in str(rejected.value).lower(), rejected.value
     finally:
         dist.destroy_process_group(metadata_group)
     return "ok", f"Gloo-only groups are rejected before {backend} resources are armed"
@@ -504,23 +516,701 @@ def test_qkv_workspace_cannot_be_constructed_directly():
         UlyssesQKVWorkspace()
 
 
-def test_qkv_rejects_pcie_collectively_before_preparation(monkeypatch):
-    comm = object.__new__(UlyssesCommunicator)
-    comm._state = "open"
-    comm.backend = "pcie"
-    comm.rank = 0
-    comm.world_size = 2
-    outcomes = []
+# ---- experimental PCIe backend ---------------------------------------------------
 
-    def gather(outcome):
-        outcomes.append(outcome)
-        return [outcome, outcome]
 
-    monkeypatch.setattr(comm, "_gather", gather)
+def _mock_pcie_qkv_comm(monkeypatch, transport, *, max_bytes=1 << 20):
+    """Two-rank host-only PCIe communicator with faked native transport and JIT.
+
+    Every rank-local outcome is mirrored by the fake peer, so a call either
+    succeeds or fails on both ranks, as under the SPMD contract.
+    """
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = transport
+    comm.dtype = torch.bfloat16
+    comm.max_bytes = max_bytes
+    comm._qkv_pcie_slot = None
+    comm._group_supports_cuda_alltoall = lambda: (True, "nccl")
+    native = SimpleNamespace(
+        calls=[],
+        storage=torch.zeros(max_bytes, dtype=torch.uint8),
+        landing=torch.zeros(max_bytes, dtype=torch.uint8),
+    )
+
+    def allocate_output(_handle, x, mode, capacity):
+        native.calls.append(("allocate", tuple(x.shape), mode, capacity))
+        return native.storage, [1, 2, 3]
+
+    def input_landing(_handle, out):
+        assert transport != "p2p", "the all-P2P route has no landing buffer"
+        assert out.data_ptr() == native.storage.data_ptr()
+        return native.landing
+
+    native.module = SimpleNamespace(
+        allocate_output=allocate_output,
+        connect_output=lambda *_args: None,
+        input_landing=input_landing,
+        exchange=lambda *_args: pytest.fail("native exchange must not run"),
+        teardown_safe=lambda *_args: True,
+        disconnect_output_ptr=lambda *_args: None,
+        dispose_output_ptr=lambda *_args: None,
+        dispose=lambda *_args: None,
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: native.module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: "caller")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(
+        torch.cuda.nvtx, "range", lambda _name: contextlib.nullcontext()
+    )
+    native.stream_waits = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda device=None: SimpleNamespace(wait_stream=native.stream_waits.append),
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
+    monkeypatch.setattr(
+        lowp,
+        "capability",
+        lambda _device: {
+            "device_capability": (12, 0),
+            "supported": True,
+            "supported_head_dims": (64, 128),
+            "layout_class": "UlyssesLowpSageLayout",
+        },
+    )
+    monkeypatch.setattr(lowp, "get_ulysses_lowp_module", lambda: "sage2-module")
+    monkeypatch.setattr(lowp, "device_support_pdl", lambda _device: False)
+    return comm, native
+
+
+def _registrations(native):
+    return [call for call in native.calls if call[0] == "allocate"]
+
+
+@pytest.mark.parametrize("transport", ["hybrid", "rdma", "p2p"])
+def test_qkv_pcie_prepares_every_geometry_on_one_registered_slot(
+    monkeypatch, transport
+):
+    """A registration holds max_bytes until close, so each preparation must
+    not add one: shapes and live lengths change between calls."""
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
     try:
-        with pytest.raises(ValueError, match="nccl or nvlink"):
-            comm.prepare_qkv((1, 64, 2, 64))
-        assert len(outcomes) == 1
-        assert outcomes[0][0] == "err"
+        first = comm.prepare_qkv((1, 64, 2, 64))
+        second = comm.prepare_qkv((2, 33, 4, 128), used_sequence=40)
+        assert _registrations(native) == [("allocate", (1, 1, 2, 1), 2, comm.max_bytes)]
+        assert list(comm._pcie_outputs) == [native.storage.data_ptr()]
+        assert first._wire_shape != second._wire_shape
+        for workspace in (first, second):
+            assert workspace.transport == "pcie"
+            assert workspace._recv_buffer.data_ptr() == native.storage.data_ptr()
+            assert tuple(workspace._send_buffer.shape) == workspace._wire_shape
+            assert tuple(workspace._recv_buffer.shape) == workspace._wire_shape
+            # The RDMA routes pack where the NIC reads; all-P2P reads in place.
+            landed = workspace._send_buffer.data_ptr() == native.landing.data_ptr()
+            assert landed == (transport != "p2p")
+        # Each RDMA workspace orders its vote stream once after the flag's
+        # zero fill on the caller's stream; all-P2P has no vote.
+        assert native.stream_waits == (["caller"] * 2 if transport != "p2p" else [])
+
+        comm.close()
+        assert comm._qkv_pcie_slot is None
+        assert comm._pcie_outputs == {}
     finally:
         comm._state = "closed"
+
+
+def test_qkv_pcie_rejections_before_registration_register_nothing(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, "hybrid", max_bytes=4096)
+    try:
+        # The payload is checked against max_bytes before the slot exists.
+        with pytest.raises(RuntimeError, match="prepare_qkv failed.*max_bytes"):
+            comm.prepare_qkv((1, 64, 2, 64))
+        # Statistics stay on NCCL, so a PCIe group must still provide it.
+        comm._group_supports_cuda_alltoall = lambda: (False, "gloo")
+        with pytest.raises(ValueError, match="CUDA NCCL process group"):
+            comm.prepare_qkv((1, 8, 2, 64))
+        assert native.calls == []
+        assert comm._qkv_pcie_slot is None
+        assert comm._state == ulysses_mod._OPEN
+    finally:
+        comm._state = "closed"
+
+
+def test_qkv_pcie_allocation_failure_keeps_the_registered_slot(monkeypatch):
+    """Allocation after registration stays recoverable; the slot is reused."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, "rdma")
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected QKV allocation failure")
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(lowp, "get_ulysses_lowp_module", fail)
+            with pytest.raises(RuntimeError, match="prepare_qkv failed"):
+                comm.prepare_qkv((1, 64, 2, 64))
+        assert comm._state == ulysses_mod._OPEN
+        assert comm._qkv_pcie_slot is not None
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        assert len(_registrations(native)) == 1
+        assert workspace._recv_buffer.data_ptr() == native.storage.data_ptr()
+    finally:
+        comm._state = "closed"
+
+
+def test_qkv_pcie_registration_failure_is_fail_stop(monkeypatch):
+    """The slot is an ordinary PCIe registration and keeps its contract."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, "hybrid")
+
+    def fail(*_args):
+        raise RuntimeError("injected registration failure")
+
+    native.module.allocate_output = fail
+    try:
+        with pytest.raises(RuntimeError, match="BROKEN state"):
+            comm.prepare_qkv((1, 64, 2, 64))
+        assert comm._state == ulysses_mod._BROKEN
+        assert comm._qkv_pcie_slot is None
+    finally:
+        comm._state = "closed"
+
+
+def _patch_qkv_stages(monkeypatch, native, order):
+    """Fake the Sage2 kernels and the statistics AllGather, in call order."""
+    monkeypatch.setattr(lowp, "_validate_qkv", lambda *_args: None)  # host tensors
+
+    def local_stats(*_args):
+        order.append("stats")
+        return torch.zeros(1), "ctx"
+
+    def finalize(*_args):
+        order.append("finalize")
+        # [B, H, D] for the (1, 64, 2, 64) geometry these tests prepare.
+        return SimpleNamespace(v_scale_global=torch.ones(1, 2, 64))
+
+    monkeypatch.setattr(lowp, "_local_stats_impl", local_stats)
+    monkeypatch.setattr(
+        dist, "all_gather_into_tensor", lambda *_args, **_kw: order.append("gather")
+    )
+    monkeypatch.setattr(lowp, "_finalize_stats_impl", finalize)
+    monkeypatch.setattr(
+        lowp, "_quant_and_pack_impl", lambda *_args: order.append("pack")
+    )
+    monkeypatch.setattr(
+        lowp, "_unpack_for_sage_impl", lambda *_args: order.append("unpack")
+    )
+    native.module.exchange = lambda _handle, x, out, mode, *shape: order.append(
+        ("exchange", x.data_ptr(), out.data_ptr(), mode, shape)
+    )
+    # The fake peer's vote: set native.peer_vote = 1 to model a peer failure.
+    native.peer_vote = 0
+
+    def all_reduce(tensor, op=None, group=None):
+        order.append("vote")
+        tensor.fill_(max(int(tensor.item()), native.peer_vote))
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+
+@pytest.mark.parametrize("transport", ["hybrid", "p2p"])
+def test_scatter_qkv_pcie_exchanges_into_the_registered_slot(monkeypatch, transport):
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+        result = comm.scatter_qkv(q, k, v, workspace=workspace)
+        chunk = workspace._wire_shape[1]
+        # Only the RDMA routes, whose barrier has no deadline, vote first.
+        vote = ["vote"] if transport != "p2p" else []
+        assert order == [
+            "stats",
+            "gather",
+            "finalize",
+            "pack",
+            *vote,
+            (
+                "exchange",
+                workspace._send_buffer.data_ptr(),
+                native.storage.data_ptr(),
+                2,
+                (1, 1, 2, chunk),
+            ),
+            "unpack",
+        ]
+        assert (workspace._exchange_vote is None) == (transport == "p2p")
+        assert torch.equal(result.v_scale, torch.ones(1, 1, 64))
+        assert comm._pcie_stream == "caller"  # bound at admission
+    finally:
+        comm._state = "closed"
+
+
+@pytest.mark.parametrize(
+    "transport,failure",
+    [
+        (transport, failure)
+        for transport in ("hybrid", "p2p")
+        for failure in ("capture", "stream", "workspace", "statistics")
+        # The all-P2P route is capturable.
+        if (transport, failure) != ("p2p", "capture")
+    ],
+)
+def test_scatter_qkv_pcie_rejects_before_enqueueing(monkeypatch, transport, failure):
+    """Mirrors the PCIe collective envelope: anything that stops this rank
+    before its exchange is enqueued is an ordinary error on the RDMA routes
+    and fail-stop on the all-P2P route, whose barrier has no abort protocol.
+    Capture and stream admission are decided before the statistics
+    AllGather, so a refused call has enqueued no collective work and binds
+    nothing. A later rank-local failure on an RDMA route still joins the
+    AllGather it skipped and the vote, so that no peer enters the exchange
+    alone; that call was admitted, so it has bound the stream."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+        expected_order = []
+        if failure == "capture":
+            monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        elif failure == "stream":
+            comm._pcie_stream = "bound elsewhere"
+        elif failure == "workspace":
+            workspace = None
+        else:
+
+            def fail(*_args):
+                order.append("stats")
+                raise RuntimeError("injected statistics failure")
+
+            monkeypatch.setattr(lowp, "_local_stats_impl", fail)
+            expected_order = (
+                ["stats"] if transport == "p2p" else ["stats", "gather", "vote"]
+            )
+
+        with pytest.raises((ValueError, RuntimeError)) as info:
+            comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert order == expected_order
+        if transport == "p2p":
+            assert "BROKEN state" in str(info.value)
+            assert comm._state == ulysses_mod._BROKEN
+            assert comm._pcie_python_teardown_safe is False
+        else:
+            assert "BROKEN" not in str(info.value)
+            assert comm._state == ulysses_mod._OPEN
+            assert comm._pcie_python_teardown_safe is True
+        bound = {"stream": "bound elsewhere", "statistics": "caller"}
+        assert comm._pcie_stream == bound.get(failure)
+    finally:
+        comm._state = "closed"
+
+
+@pytest.mark.parametrize("transport", ["hybrid", "rdma"])
+@pytest.mark.parametrize("failing", ["finalize", "peer"])
+def test_scatter_qkv_rdma_vote_keeps_peers_out_of_the_barrier(
+    monkeypatch, transport, failing
+):
+    """A rank-local failure between admission and the exchange raises on
+    every rank before any of them enters the unbounded RDMA barrier, and
+    leaves the communicator bound to the stream that may still hold the
+    aborted call's pack."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+        with pytest.MonkeyPatch.context() as patch:
+            if failing == "finalize":
+
+                def fail(*_args):
+                    order.append("finalize")
+                    raise RuntimeError("injected finalize failure")
+
+                patch.setattr(lowp, "_finalize_stats_impl", fail)
+                expected = ["stats", "gather", "finalize", "vote"]
+                message = "injected"
+            else:
+                patch.setattr(native, "peer_vote", 1)
+                expected = ["stats", "gather", "finalize", "pack", "vote"]
+                message = "peer"
+            with pytest.raises(RuntimeError, match=message):
+                comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert order == expected  # no exchange on any rank
+        assert comm._state == ulysses_mod._OPEN
+        # Admission bound the stream, so a retry from another stream cannot
+        # race the aborted pack into the shared landing buffer.
+        assert comm._pcie_stream == "caller"
+        order.clear()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(torch.cuda, "current_stream", lambda *_args: "other")
+            with pytest.raises(RuntimeError, match="bound to the stream"):
+                comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert order == []
+        assert comm._state == ulysses_mod._OPEN
+
+        # Nobody entered the barrier, so the same communicator and workspace
+        # proceed normally on the next call.
+        comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert [step for step in order if not isinstance(step, tuple)] == [
+            "stats",
+            "gather",
+            "finalize",
+            "pack",
+            "vote",
+            "unpack",
+        ]
+        assert any(isinstance(step, tuple) and step[0] == "exchange" for step in order)
+        assert comm._pcie_stream == "caller"
+    finally:
+        comm._state = "closed"
+
+
+@pytest.mark.parametrize("transport", ["hybrid", "p2p"])
+def test_scatter_qkv_pcie_output_allocation_failure_joins_the_envelope(
+    monkeypatch, transport
+):
+    """With ``out=None`` the outputs are allocated after admission, where a
+    rank-local OOM is covered like any other: on the RDMA routes it joins the
+    statistics AllGather in place and the vote, on all-P2P it is fail-stop."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+
+        def fail(*_args):
+            raise torch.OutOfMemoryError("injected output allocation failure")
+
+        monkeypatch.setattr(comm, "_prepare_qkv_out", fail)
+        with pytest.raises((RuntimeError, torch.OutOfMemoryError)) as info:
+            comm.scatter_qkv(q, k, v, workspace=workspace)
+        if transport == "p2p":
+            assert order == []
+            assert comm._state == ulysses_mod._BROKEN
+        else:
+            assert "injected output allocation failure" in str(info.value)
+            assert order == ["gather", "vote"]  # joined in place, then voted
+            assert comm._state == ulysses_mod._OPEN
+        assert comm._pcie_stream == "caller"  # admitted, so bound
+    finally:
+        comm._state = "closed"
+
+
+def test_scatter_qkv_rdma_local_failure_survives_a_zero_vote(monkeypatch):
+    """A rank that failed raises its own error even if the reduced vote it
+    reads is zero, rather than entering the exchange."""
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, "rdma")
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+
+    def fail(*_args):
+        order.append("finalize")
+        raise RuntimeError("injected finalize failure")
+
+    monkeypatch.setattr(lowp, "_finalize_stats_impl", fail)
+    monkeypatch.setattr(
+        dist,
+        "all_reduce",
+        lambda tensor, op=None, group=None: (order.append("vote"), tensor.fill_(0)),
+    )
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+        with pytest.raises(RuntimeError, match="injected finalize failure"):
+            comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert order == ["stats", "gather", "finalize", "vote"]
+    finally:
+        comm._state = "closed"
+
+
+def test_scatter_qkv_rdma_failure_before_gather_joins_it_in_place(monkeypatch):
+    """Peers are already in the statistics AllGather; the failing rank joins
+    it from its own slice of the gather buffer, allocating nothing. The slice
+    is zeroed first: on a fresh workspace it was never written (NaN under
+    deterministic fill), and TORCH_NCCL_NAN_CHECK asserts on NaN input."""
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, "rdma")
+    comm.rank = 1
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    gathers = []
+
+    def gather(out, inp, group=None):
+        assert not inp.isnan().any(), "TORCH_NCCL_NAN_CHECK asserts on NaN input"
+        gathers.append((out.data_ptr(), inp.data_ptr(), inp.numel()))
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", gather)
+
+    def fail(*_args):
+        raise RuntimeError("injected statistics failure")
+
+    monkeypatch.setattr(lowp, "_local_stats_impl", fail)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        workspace._stats_gather.fill_(float("nan"))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+        with pytest.raises(RuntimeError, match="injected statistics failure"):
+            comm.scatter_qkv(q, k, v, workspace=workspace)
+        chunk = workspace._stats_numel
+        base = workspace._stats_gather.data_ptr()
+        assert gathers == [(base, base + chunk * 4, chunk)]
+        assert order == ["vote"]
+        assert workspace._stats_gather[:chunk].isnan().all()  # the peer's slice
+    finally:
+        comm._state = "closed"
+
+
+@pytest.mark.parametrize("transport", ["hybrid", "rdma"])
+@pytest.mark.parametrize("where", ["gather", "rejoin", "vote"])
+def test_scatter_qkv_rdma_collective_failure_is_raised_as_is(
+    monkeypatch, transport, where
+):
+    """The vote covers host-side failures around the NCCL collectives, not a
+    failure inside one of them (the statistics AllGather, its in-place
+    rejoin, or the vote itself): that is a CUDA/process-group failure, raised
+    as is, with no further vote and no exchange."""
+    comm, native = _mock_pcie_qkv_comm(monkeypatch, transport)
+    order = []
+    _patch_qkv_stages(monkeypatch, native, order)
+    try:
+        workspace = comm.prepare_qkv((1, 64, 2, 64))
+        q, k, v = (torch.zeros(1, 64, 2, 64, dtype=torch.bfloat16) for _ in range(3))
+
+        def collective_fails(*_args, **_kw):
+            order.append("vote" if where == "vote" else "gather")
+            raise RuntimeError("injected process-group failure")
+
+        if where == "vote":
+            monkeypatch.setattr(dist, "all_reduce", collective_fails)
+            expected = ["stats", "gather", "finalize", "pack", "vote"]
+        else:
+            monkeypatch.setattr(dist, "all_gather_into_tensor", collective_fails)
+            expected = ["stats", "gather"]
+        if where == "rejoin":
+
+            def stats_fail(*_args):
+                order.append("stats")
+                raise RuntimeError("injected statistics failure")
+
+            monkeypatch.setattr(lowp, "_local_stats_impl", stats_fail)
+        with pytest.raises(RuntimeError, match="injected process-group failure"):
+            comm.scatter_qkv(q, k, v, workspace=workspace)
+        assert order == expected  # no vote after a failed AllGather, no exchange
+    finally:
+        comm._state = "closed"
+
+
+def _force_pcie_route(route):
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = route
+
+
+def _check_pcie_route(comm, route):
+    if route == "p2p":
+        # A forced p2p route never falls back, so a mismatch is a test bug.
+        assert comm.transport == "p2p", comm.transport
+    elif comm.transport != route:
+        raise UlyssesBackendError(f"forced {route} fell back to {comm.transport}")
+
+
+def _pcie_correctness_body(rank, world, group, arg):
+    route, dim = arg
+    _force_pcie_route(route)
+    # Two geometries per dtype share one registration. B=2 crosses the RDMA
+    # routes too: the payload is one [1, 1, P, chunk] operand whatever B is.
+    cases = {
+        torch.bfloat16: ((1, 129, world * 129 - 1, False), (2, 17, 1, True)),
+        torch.float16: (
+            (2, 65, min(world * 65, 129), False),
+            (1, 64, world * 64, True),
+        ),
+    }
+    for dtype, geometries in cases.items():
+        shards = [
+            _shards(rank, world, batch, length, dim, dtype, used, contiguous=contiguous)
+            for batch, length, used, contiguous in geometries
+        ]
+        expected = [
+            _standalone(shard, rank, world, group, geometry[2])
+            for shard, geometry in zip(shards, geometries, strict=True)
+        ]
+        capacity = max(_payload_bytes(shard[0].shape, world) for shard in shards)
+        with UlyssesCommunicator(
+            group, max_bytes=capacity, dtype=dtype, backend="pcie"
+        ) as comm:
+            _check_pcie_route(comm, route)
+            workspaces = [
+                comm.prepare_qkv(shard[0].shape, used_sequence=geometry[2])
+                for shard, geometry in zip(shards, geometries, strict=True)
+            ]
+            assert len(comm._pcie_outputs) == 1
+            slot = workspaces[0]._recv_buffer.data_ptr()
+            for workspace in workspaces:
+                assert workspace.transport == "pcie"
+                assert workspace._recv_buffer.data_ptr() == slot
+            # Alternate the geometries on the shared slot.
+            for _ in range(2):
+                for shard, geometry, workspace, (want, payload, recv) in zip(
+                    shards, geometries, workspaces, expected, strict=True
+                ):
+                    _batch, length, used, _ = geometry
+                    got = comm.scatter_qkv(*shard, workspace=workspace)
+                    _assert_result(
+                        got, want, used=used, total=world * length, dtype=dtype
+                    )
+                    _assert_bytes(workspace._send_buffer, payload)
+                    _assert_bytes(workspace._recv_buffer, recv)
+                    reused = comm.scatter_qkv(*shard, workspace=workspace, out=got)
+                    assert reused is got
+                    _assert_result(
+                        reused, want, used=used, total=world * length, dtype=dtype
+                    )
+    return "ok", f"{route} D{dim}"
+
+
+_PCIE_ROUTES = [(r, p) for r in ("p2p", "rdma") for p in (2, 4, 8)] + [("hybrid", 8)]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "route,world_size", _PCIE_ROUTES, ids=[f"{r}-p{p}" for r, p in _PCIE_ROUTES]
+)
+def test_qkv_pcie_matches_nccl(route, world_size, head_dim):
+    """The PCIe routes only move bytes: the result equals the NCCL chain."""
+    _require_gpus(world_size)
+    _run_multi_rank(
+        _pcie_correctness_body,
+        world_size,
+        (route, head_dim),
+        timeout=900,
+        allow_skip=True,
+    )
+
+
+def _pcie_split_direction_body(rank, world, group, route):
+    _force_pcie_route(route)
+    shard = _shards(rank, world, 1, 65, 64, torch.bfloat16, 129, contiguous=True)
+    heads = shard[0].shape[2]
+    expected, _, _ = _standalone(shard, rank, world, group, 129)
+    attention = torch.empty(
+        (1, world * 65, heads // world, 64), dtype=torch.bfloat16, device="cuda"
+    )
+    input_stream, output_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    with (
+        UlyssesCommunicator(
+            group,
+            max_bytes=_payload_bytes(shard[0].shape, world),
+            dtype=torch.bfloat16,
+            backend="pcie",
+        ) as input_comm,
+        UlyssesCommunicator(
+            group, max_bytes=attention.nbytes, dtype=torch.bfloat16, backend="pcie"
+        ) as output_comm,
+    ):
+        _check_pcie_route(input_comm, route)
+        _check_pcie_route(output_comm, route)
+        workspace = input_comm.prepare_qkv(shard[0].shape, used_sequence=129)
+        gathered = output_comm.allocate_output(attention, "gather_heads")
+        torch.cuda.synchronize()
+        for _ in range(3):
+            input_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(input_stream):
+                encoded = input_comm.scatter_qkv(*shard, workspace=workspace)
+                # Any floating [B, P*L, H/P, D] tensor stands in for attention.
+                attention.copy_(encoded.q)
+                ready = torch.cuda.Event()
+                ready.record(input_stream)
+            output_stream.wait_event(ready)
+            with torch.cuda.stream(output_stream):
+                output_comm.gather_heads(attention, out=gathered)
+            torch.cuda.synchronize()
+            _assert_result(
+                encoded, expected, used=129, total=world * 65, dtype=torch.bfloat16
+            )
+            _assert_bytes(gathered, _ref_gather_heads(attention, world, rank, group))
+        assert input_comm._pcie_stream == input_stream
+        assert output_comm._pcie_stream == output_stream
+    return "ok", f"{route} input and output on separate communicators and streams"
+
+
+@pytest.mark.parametrize("route", ["p2p", "rdma"])
+def test_qkv_pcie_split_input_output_communicators(route):
+    """The head-chunk pipeline's composition: input and output communication
+    on separate PCIe communicators, each bound to its own stream."""
+    _require_gpus(2)
+    _run_multi_rank(_pcie_split_direction_body, 2, route, timeout=600, allow_skip=True)
+
+
+def _pcie_rank_local_failure_body(rank, world, group, route):
+    _force_pcie_route(route)
+    shard = _shards(rank, world, 1, 65, 64, torch.bfloat16, 129)
+    expected, _, _ = _standalone(shard, rank, world, group, 129)
+
+    def fail(*_args):
+        raise RuntimeError("injected rank-local failure")
+
+    with UlyssesCommunicator(
+        group,
+        max_bytes=_payload_bytes(shard[0].shape, world),
+        dtype=torch.bfloat16,
+        backend="pcie",
+    ) as comm:
+        _check_pcie_route(comm, route)
+        workspace = comm.prepare_qkv(shard[0].shape, used_sequence=129)
+        # Rank 0 fails allocating the outputs, then in the statistics, then
+        # after the statistics AllGather. Peers that entered the RDMA barrier
+        # alone would hang until the timeout.
+        raised = []
+        for target, stage in (
+            (comm, "_prepare_qkv_out"),
+            (lowp, "_local_stats_impl"),
+            (lowp, "_finalize_stats_impl"),
+        ):
+            with pytest.MonkeyPatch.context() as patch:
+                if rank == 0:
+                    patch.setattr(target, stage, fail)
+                with pytest.raises(RuntimeError) as info:
+                    comm.scatter_qkv(*shard, workspace=workspace)
+            raised.append((stage, str(info.value)))
+            got = comm.scatter_qkv(*shard, workspace=workspace)
+            _assert_result(
+                got, expected, used=129, total=world * 65, dtype=torch.bfloat16
+            )
+    # Checked once every rank has left the collective sequence, so a wrong
+    # message fails this rank without stranding its peers. Rank 0 raises its
+    # own error whatever the vote reads; every peer raises the vote's error.
+    for stage, message in raised:
+        if rank == 0:
+            assert message == "injected rank-local failure", (stage, message)
+        else:
+            assert "failed on a peer rank" in message, (stage, message)
+    return "ok", f"{route}: three failures raised on every rank, then recovered"
+
+
+@pytest.mark.parametrize("route,world_size", [("rdma", 2), ("rdma", 8), ("hybrid", 8)])
+def test_qkv_pcie_rank_local_failure_releases_peers(route, world_size):
+    """The RDMA routes vote before their unbounded barrier, so a host-side
+    failure on one rank raises everywhere and the communicator stays usable."""
+    _require_gpus(world_size)
+    _run_multi_rank(
+        _pcie_rank_local_failure_body,
+        world_size,
+        route,
+        timeout=600,
+        allow_skip=True,
+    )

@@ -18,14 +18,23 @@ with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
     encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
     # The framework calls the appropriate Sage2 kernel with encoded fields.
     # Its full [B,P*L,H/P,D] output uses encoded.input_dtype and a zero tail.
-    local_output = comm.gather_heads(sage_adapter(encoded))
+    attention = sage_adapter(encoded)
+    # Multi-rank PCIe requires out= from allocate_output (ulysses_pcie.md);
+    # on NCCL/NVLink it returns ordinary storage. On PCIe the call is
+    # collective, refuses capture and holds max_bytes until close(), so
+    # allocate once per geometry and reuse it; each gather overwrites it.
+    gathered = comm.allocate_output(attention, "gather_heads")
+    local_output = comm.gather_heads(attention, out=gathered)
 ```
 
 `prepare_qkv` is collective, with three joint phases: configuration validation,
 layout/JIT admission, and allocation. Recoverable preparation failures publish
 no workspace and leave the existing communicator usable. Missing rank calls,
 invalid hot-path inputs and unrecoverable CUDA/process-group failures cannot
-be recovered this way. Ordinary `create_workspace` remains local.
+be recovered this way. Ordinary `create_workspace` remains local. On the
+experimental PCIe backend the first call also registers the communicator's
+chunk slot between admission and allocation; like every PCIe registration,
+that step is fail-stop rather than recoverable.
 
 The dedicated `UlyssesQKVWorkspace` fixes owner, shape, P, dtype, layout and U.
 It reuses the statistics receive buffer and mixed-dtype payload storage;
@@ -35,8 +44,14 @@ the complete packed Q/K/V operand, including scales and chunk alignment.
 `3 * q.nbytes` (the original floating Q/K/V total) is a conservative budget for
 both supported layouts; a single floating Q tensor's size is insufficient.
 Preparation checks the exact byte requirement before allocating wire buffers.
-NCCL allocates the actual wire size, not the full budget. Statistics and final
-outputs are separate storage, so this limit is not a total memory budget.
+NCCL allocates the actual wire size, not the full budget. PCIe registers the
+full budget once per communicator for the Q/K/V slot and again for each
+`allocate_output`, such as the `gather_heads` output above (each twice on the
+hybrid and all-RDMA routes), so there `max_bytes` should be the largest
+payload, about `1.5 * q.nbytes` for FP16/BF16 inputs plus scales and
+alignment, rather than the loose bound.
+Statistics and final outputs are separate storage, so this limit is not a
+total memory budget.
 Ordinary `UlyssesWorkspace` and `create_workspace(max_elems=...)` continue to
 express their staging capacities in elements.
 
@@ -52,15 +67,21 @@ or SM120 groups. It preserves the primitive stride and input-padding contract.
 Statistics AllGather uses NCCL on the existing group. Packed uint8 AllToAll
 uses the communicator's `exchange_chunks` interface: `[P, chunk_bytes]` becomes
 `[1, 1, P, chunk_bytes]` through a zero-copy view, with destination-major send
-and source-major receive ordering. The current `nccl` and `nvlink` backends
-both use NCCL for chunks; `workspace.transport` exposes that choice. Ordinary
-scatter/gather retains its NCCL or fused NVLink route. For these chunk calls,
-`allocate_output` provides ordinary PyTorch receive storage. The prepared Lowp
-API collectively rejects the experimental `pcie` backend; ordinary PCIe calls
-retain their own output-registration and dtype contracts. On NCCL/NVLink, only
-chunk exchange supports overriding the communicator dtype, including
-`torch.uint8`; dtype selection never performs quantization or conversion.
-All operations are serialized on the current stream. There is no ordinary
+and source-major receive ordering. The `nccl` and `nvlink` backends both use
+NCCL for chunks, and the experimental multi-rank `pcie` backend uses its
+selected route; `workspace.transport` (`"nccl"` or `"pcie"`) exposes that
+choice. Ordinary scatter/gather retains its NCCL, fused NVLink or PCIe route.
+On NCCL/NVLink, `allocate_output` provides ordinary PyTorch receive storage for
+these chunk calls. On PCIe, every workspace of a communicator views one
+registered chunk output, and on the RDMA routes the quantizer packs straight
+into its landing buffer; the
+[PCIe design note](ulysses_pcie.md#prepared-sage2-qkv) covers its sizing,
+lifetime, stream and failure contract. On NCCL/NVLink, only chunk exchange
+supports overriding the communicator dtype, including `torch.uint8`; dtype
+selection never performs quantization or conversion.
+All operations are serialized on the current stream; on the PCIe hybrid and
+all-RDMA routes the pre-exchange vote alone runs on an internal stream that
+the host synchronizes before the exchange. There is no ordinary
 floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.
 
 Validation is owned by the public entry point. The prepared communicator checks
