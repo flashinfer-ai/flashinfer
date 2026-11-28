@@ -18,8 +18,7 @@
 // module. Keep this launch-only translation unit free of framework tensor
 // types: the public TVM-FFI boundary owns validation and allocation.
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_prepare_dispatch(int*, int*, int,
-                                                                                 unsigned int*,
-                                                                                 bool);
+                                                                                 unsigned int*);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(
     int32_t* token_selected_experts, uint8_t* payload_0, uint8_t* payload_1, uint8_t* payload_2,
@@ -35,12 +34,12 @@ extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(
     int payload_1_bytes, int payload_2_bytes, int payload_3_bytes, int payload_4_bytes,
     int payload_5_bytes, int num_payloads, int max_tokens_per_rank, int local_num_tokens,
     int ep_rank, int ep_size, int num_experts, int top_k, int eplb_stats_num_experts,
-    bool enable_pdl, bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask,
+    bool enable_eplb, bool enable_rank_mask, unsigned long long active_rank_mask,
     int sanitize_payload_index, int invalid_expert_id);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(
     uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
-    unsigned long long, bool, int, bool);
+    unsigned long long, bool, int);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(
     uint8_t*, unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,
@@ -359,7 +358,7 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
   launchWithPdlWhenEnabled("mnnvl_moe_alltoall_prepare_dispatch", params.enable_pdl,
                            kernel_flashinfer_mnnvl_moe_alltoall_prepare_dispatch, 1, params.ep_size,
                            0, params.stream, params.send_counters, params.local_token_counter,
-                           params.ep_size, params.flag_val, params.enable_pdl);
+                           params.ep_size, params.flag_val);
 }
 
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
@@ -410,7 +409,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       payload_offsets[5], payload_bytes[0], payload_bytes[1], payload_bytes[2], payload_bytes[3],
       payload_bytes[4], payload_bytes[5], params.num_payloads, params.max_tokens_per_rank,
       params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts, params.top_k,
-      params.eplb_stats_num_experts, params.enable_pdl, params.enable_eplb, params.enable_rank_mask,
+      params.eplb_stats_num_experts, params.enable_eplb, params.enable_rank_mask,
       // The exported dispatch kernel can sanitize the received expert-id payload in its
       // last-arriving CTA (sanitize_payload_index >= 0). This launcher keeps the public
       // separate sanitize launch, so the in-kernel fill stays disabled (-1, 0).
@@ -466,7 +465,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
       static_cast<uint8_t*>(const_cast<void*>(params.prepare_payload)), params.workspace,
       params.workspace_stride_bytes, byteOffset(params.flag_val, rank_workspace),
       byteOffset(params.recv_buffers[params.ep_rank], params.workspace), payload_bytes, true,
-      params.ep_rank, params.enable_pdl);
+      params.ep_rank);
 }
 
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
