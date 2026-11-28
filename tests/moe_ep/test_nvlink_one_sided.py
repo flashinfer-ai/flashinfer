@@ -302,13 +302,11 @@ class _RecordingModule:
         return getattr(self._module, name)
 
     def moe_a2a_dispatch(self, *args):
-        assert args[10] is False, "CFT counted writes requested"
-        self._launches.append(("dispatch", _protocol(args[13])))
+        self._launches.append(("dispatch", _protocol(args[12])))
         return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
-        assert args[11] is False, "CFT counted writes requested"
-        self._launches.append(("combine", _protocol(args[17])))
+        self._launches.append(("combine", _protocol(args[16])))
         return self._module.moe_a2a_combine(*args)
 
 
@@ -800,11 +798,9 @@ def test_nvlink_one_sided(case: Case) -> None:
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cft", [False, True])
-def test_workspace_layout(cft: bool) -> None:
+def test_workspace_layout() -> None:
     """Regions are disjoint, aligned and fixed by the allocation-time capacities;
-    the CFT regions sit among the fence regions and the sentinel regions follow
-    them."""
+    the sentinel regions follow the fence regions."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.kernels import (
         get_nvlink_one_sided_alltoall_module,
         layout_constants,
@@ -814,7 +810,6 @@ def test_workspace_layout(cft: bool) -> None:
     ep_size, top_k, capacity, hidden, sentinel_tokens = 8, 6, 128, 7168, 32
     dispatch_bytes = ep_size * capacity * (hidden + 2 * top_k * 4)
     combine_input_bytes = ep_size * capacity * hidden * 2
-    combine_recv_bytes = ep_size * capacity * hidden if cft else 0
 
     def layout(sentinel_max_tokens: int, fmt: str = "BF16") -> torch.Tensor:
         metainfo = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
@@ -824,9 +819,7 @@ def test_workspace_layout(cft: bool) -> None:
             top_k,
             dispatch_bytes,
             combine_input_bytes,
-            combine_recv_bytes,
             0,
-            cft,
             sentinel_max_tokens,
             getattr(index, f"SENTINEL_FORMAT_{fmt}"),
             hidden,
@@ -857,20 +850,7 @@ def test_workspace_layout(cft: bool) -> None:
         "TOPK_TARGET_RANKS_OFFSET_INDEX"
     )
     assert capacity * top_k * 4 <= routes < capacity * (top_k + 1) * 4 + alignment
-    if cft:
-        recv_start = field("COMBINE_RECV_OFFSET_INDEX")
-        recv_bytes = field("COMBINE_RECV_SIZE_INDEX")
-        assert combine_end <= recv_start and recv_start % alignment == 0
-        assert recv_bytes == combine_recv_bytes
-        assert (
-            dispatch_end
-            <= field("COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX")
-            < combine_start
-        )
-        fence_end = recv_start + recv_bytes
-    else:
-        assert field("COMBINE_RECV_SIZE_INDEX") == 0
-        fence_end = combine_end
+    fence_end = combine_end
 
     # Without sentinel regions their fields are zero and the fence regions end
     # the slice; with them the fence offsets stay and the sentinel regions
