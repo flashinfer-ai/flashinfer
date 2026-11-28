@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,8 @@ from b12x.moe.fused_moe._impl import (
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
-from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig, MoeDecodeQuery
+from b12x.preparation import FrozenMapping
 
 
 def _weight_plan(
@@ -45,6 +47,57 @@ def _weight_plan(
     )
 
 
+def _default_decode_config(
+    *,
+    weight_plan,
+    quant_mode: str,
+    max_tokens: int,
+    num_topk: int,
+    route_num_experts: int | None = None,
+    apply_router_weight_on_input: bool = False,
+    collect_activation_amax: bool = False,
+    deterministic_output: bool | None = None,
+    w4a16_block_size_m: int | None = None,
+    **_caps_values,
+) -> MoeDecodeConfig:
+    """Return the untuned decode config production would choose for these caps."""
+    tokens = max(int(max_tokens), 1)
+    top_k = max(int(num_topk), 1)
+    query = MoeDecodeQuery(
+        quant_mode=quant_mode,
+        quant_modes=tuple(sorted(weight_plan.quant_modes)),
+        source_format=weight_plan.source_format,
+        activation=weight_plan.activation,
+        io_dtype=weight_plan.io_dtype,
+        num_experts=weight_plan.num_experts,
+        hidden_size=weight_plan.hidden_size,
+        intermediate_size=weight_plan.intermediate_size,
+        top_k=top_k,
+        num_tokens=tokens,
+        routed_rows=tokens * top_k,
+        route_num_experts=route_num_experts,
+        route_logits_dtype=None,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        collect_activation_amax=collect_activation_amax,
+        deterministic_output=deterministic_output,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        w13_layout=weight_plan.w13_layout,
+        weight_layouts=tuple(
+            sorted(layout.value for layout in weight_plan.weight_layouts)
+        ),
+        w4a16_weight_layout=weight_plan.w4a16_weight_layout,
+        w4a16_scale_format=weight_plan.w4a16_scale_format,
+        w4a16_block_size_m=w4a16_block_size_m,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+        nvfp4_inline_scales=weight_plan.nvfp4_inline_scales,
+    )
+    return tp_moe_impl._heuristic_moe_decode_config(query, None)
+
+
 def _caps(**overrides) -> TPMoEScratchCaps:
     weight_plan = overrides.pop("weight_plan", None) or _weight_plan()
     values = dict(
@@ -55,6 +108,8 @@ def _caps(**overrides) -> TPMoEScratchCaps:
         quant_mode=next(iter(weight_plan.quant_modes)),
     )
     values.update(overrides)
+    if "decode_config" not in values:
+        values["decode_config"] = _default_decode_config(**values)
     return TPMoEScratchCaps(**values)
 
 
@@ -505,6 +560,12 @@ def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
         device="cpu",
         weight_plan=weight_plan,
         quant_mode="w4a8_mx",
+        decode_config=_default_decode_config(
+            weight_plan=weight_plan,
+            quant_mode="w4a8_mx",
+            max_tokens=4096,
+            num_topk=8,
+        ),
     )
     core = tp_moe_impl._plan_core_workspace(
         execution.implementation,
@@ -607,13 +668,13 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
         route_num_experts=0,
     )
     plan_4080 = plan_tp_moe_scratch(
-        TPMoEScratchCaps(max_tokens=4080, core_token_counts=(4080,), **base_caps)
+        _caps(max_tokens=4080, core_token_counts=(4080,), **base_caps)
     )
     plan_4096 = plan_tp_moe_scratch(
-        TPMoEScratchCaps(max_tokens=4096, core_token_counts=(4096,), **base_caps)
+        _caps(max_tokens=4096, core_token_counts=(4096,), **base_caps)
     )
     plan_topk6 = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
+        _caps(
             max_tokens=4080,
             core_token_counts=(4080,),
             **{**base_caps, "num_topk": 6},
@@ -646,7 +707,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
         trellis_tile_config=(64, 256, 64, 256),
     )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
+        _caps(
             max_tokens=3072,
             core_token_counts=(3072,),
             num_topk=8,
@@ -772,7 +833,7 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
         trellis_tile_config=(64, 128, 64, 128),
     )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
+        _caps(
             max_tokens=4,
             core_token_counts=(4,),
             num_topk=2,
@@ -784,31 +845,37 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
         )
     )
 
-    assert tuple(tokens for tokens, _launch in plan._prewarmed_fused_launches) == (
-        1,
-        2,
-        3,
-        4,
-    )
+    # Full rotation retains both gate SUH broadcast forms for every live M and
+    # both down SVH broadcast forms for every route-id/map specialization.
+    assert sorted(
+        (tokens, launch.broadcast_suh)
+        for tokens, launch in plan._prewarmed_fused_launches
+    ) == [(tokens, broadcast) for tokens in range(1, 5) for broadcast in (False, True)]
     assert {
-        (ids_dtype, mapped)
-        for ids_dtype, mapped, _launch in plan._prewarmed_topk_sum_launches
+        (ids_dtype, mapped, launch.broadcast_svh)
+        for ids_dtype, mapped, launch in plan._prewarmed_topk_sum_launches
     } == {
-        (torch.int32, False),
-        (torch.int32, True),
-        (torch.int64, False),
-        (torch.int64, True),
+        (ids_dtype, mapped, broadcast)
+        for ids_dtype in (torch.int32, torch.int64)
+        for mapped in (False, True)
+        for broadcast in (False, True)
     }
 
 
-def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
+def test_trellis_scratch_plan_binds_retained_full_rotation_launches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused_launches = tuple((tokens, object()) for tokens in range(1, 5))
+    """Bind selects the retained launch for the live M and rotation broadcast."""
+    fused_launches = tuple(
+        (tokens, SimpleNamespace(broadcast_suh=broadcast_suh))
+        for tokens in range(1, 5)
+        for broadcast_suh in (False, True)
+    )
     sums = tuple(
-        (ids_dtype, mapped, object())
+        (ids_dtype, mapped, SimpleNamespace(broadcast_svh=broadcast_svh))
         for ids_dtype in (torch.int32, torch.int64)
         for mapped in (False, True)
+        for broadcast_svh in (False, True)
     )
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     monkeypatch.setattr(
@@ -829,7 +896,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         trellis_tile_config=(64, 128, 64, 128),
     )
     plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
+        _caps(
             max_tokens=4,
             core_token_counts=(4,),
             num_topk=2,
@@ -843,9 +910,14 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
     tensors = _runtime_tensors(n=128)
     captured = {}
 
+    @dataclass(frozen=True)
+    class _CapturedBinding:
+        scales_expanded: bool = False
+        w4a8_csf_inline: bool = False
+
     def _capture_binding(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace()
+        return _CapturedBinding()
 
     monkeypatch.setattr(
         tp_moe_impl,
@@ -853,16 +925,26 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         _capture_binding,
     )
     output_expert_map = torch.arange(8, dtype=torch.int32)
+    # A K-length gate SUH broadcasts across experts; a per-expert down SVH does not.
+    rotations = SimpleNamespace(
+        gate_suh=torch.ones(128),
+        down_svh=torch.ones(8 * 128),
+    )
     plan.bind(
         scratch=_scratch_for_plan(plan),
-        **_binding_args(tensors, _experts(tensors, weight_plan)),
+        **_binding_args(tensors, _experts(tensors, weight_plan, payload=rotations)),
         output_expert_map=output_expert_map,
     )
 
+    live_m = int(tensors["a"].shape[0])
     assert plan._prewarmed_fused_launches == fused_launches
     assert plan._prewarmed_topk_sum_launches == sums
-    assert captured["fused_launch"] is None
-    assert captured["topk_sum_launch"] is None
+    assert captured["fused_launch"] is dict(fused_launches[1::2])[live_m]
+    assert captured["topk_sum_launch"] is next(
+        launch
+        for ids_dtype, mapped, launch in sums
+        if ids_dtype == torch.int32 and mapped and not launch.broadcast_svh
+    )
 
 
 @pytest.mark.parametrize("tokens", (1, 2))
