@@ -48,7 +48,13 @@ from ..runtime import (
     to_cute,
     to_cute_dynamic,
 )
-from .column_gather import LLColumnGather, cluster_row_sum, poll_owned_fragment
+from .column_gather import (
+    LLColumnGather,
+    PushPlane,
+    cluster_row_sum,
+    commit_push_plane_epoch,
+    poll_owned_fragment,
+)
 
 _THREADS = 128
 _NVFP4_BLOCK = 16
@@ -69,6 +75,8 @@ class _AllGatherNormQuantDeviceKernel:
         capacity_m: int,
         constants: _NormQuantConstants,
         enable_pdl: bool,
+        lamport_2slot: bool = False,
+        lamport_atom_bytes: int = 2,
     ) -> None:
         self.hidden = hidden
         self.tp = tp
@@ -78,6 +86,9 @@ class _AllGatherNormQuantDeviceKernel:
         self.warps = _THREADS // WARP_SIZE
         self.constants = constants
         self.enable_pdl = enable_pdl
+        # Gather through a PushPlane, whose epoch is stage_state.
+        self.lamport_2slot = lamport_2slot
+        self.lamport_atom_bytes = lamport_atom_bytes
 
     @cute.jit
     def __call__(
@@ -89,6 +100,7 @@ class _AllGatherNormQuantDeviceKernel:
         scale_output: cute.Tensor,
         stage_state: cute.Tensor,
         m: Int32,
+        half_elements: Int64,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -98,6 +110,7 @@ class _AllGatherNormQuantDeviceKernel:
             packed_output,
             scale_output,
             stage_state,
+            half_elements,
         ).launch(
             grid=(m, self.cluster_size, 1),
             block=(_THREADS, 1, 1),
@@ -116,6 +129,7 @@ class _AllGatherNormQuantDeviceKernel:
         packed_output: cute.Tensor,
         scale_output: cute.Tensor,
         stage_state: cute.Tensor,
+        half_elements: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         token, _, _ = cute.arch.block_idx()
@@ -146,6 +160,9 @@ class _AllGatherNormQuantDeviceKernel:
             self.capacity_m,
             self.hidden_local,
             self.enable_pdl,
+            self.lamport_2slot,
+            half_elements,
+            self.lamport_atom_bytes,
         )
 
         smem = cutlass.utils.SmemAllocator()
@@ -163,6 +180,11 @@ class _AllGatherNormQuantDeviceKernel:
             warp,
             lane,
         )
+        if cutlass.const_expr(self.lamport_2slot):
+            # cluster_row_sum's cluster barrier already follows every CTA's re-arm.
+            if cluster_rank == 0 and tidx == 0:
+                m, _, _ = cute.arch.grid_dim()
+                commit_push_plane_epoch(stage_state, token, m)
         inv_rms = cute.math.rsqrt(
             sum_sq * Float32(1.0 / self.hidden) + Float32(self.constants.eps),
             fastmath=True,
@@ -210,6 +232,7 @@ class LLAllGatherNormQuant(LLColumnGather):
         capacity_m: int,
         group: dist.ProcessGroup,
         enable_pdl: bool,
+        push_plane: PushPlane | None = None,
     ) -> None:
         cluster_size, remainder = divmod(hidden_size, _THREADS * VEC_BF16)
         if remainder or not 1 <= cluster_size <= 8:
@@ -224,6 +247,7 @@ class LLAllGatherNormQuant(LLColumnGather):
             publish_threads=_THREADS,
             publish_release_before_store=False,
             enable_pdl=enable_pdl,
+            push_plane=push_plane,
         )
 
     def _compile(self, constants: _NormQuantConstants) -> Any:
@@ -233,6 +257,8 @@ class LLAllGatherNormQuant(LLColumnGather):
             capacity_m=self.capacity_m,
             constants=constants,
             enable_pdl=self.enable_pdl,
+            lamport_2slot=self._lamport_2slot,
+            lamport_atom_bytes=self._lamport_atom_bytes,
         )
         return cute.compile(
             device_kernel,
@@ -251,12 +277,13 @@ class LLAllGatherNormQuant(LLColumnGather):
             ),
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
+            Int64(0),
             current_cu_stream(),
         )
 
     def __call__(
         self,
-        shard: torch.Tensor,
+        shard: torch.Tensor | None,
         weight: torch.Tensor,
         global_scale: torch.Tensor,
         packed_output: torch.Tensor,
@@ -264,10 +291,12 @@ class LLAllGatherNormQuant(LLColumnGather):
         *,
         constants: _NormQuantConstants,
     ) -> None:
+        """``shard`` None: the rows are already in the push plane (consumer only)."""
         collective = self.compiled(constants)
-        m = Int32(shard.shape[0])
+        m = Int32(packed_output.shape[0])
         stream = current_cu_stream()
-        self._publish(shard, m, stream)
+        if shard is not None:
+            self._publish(shard, m, stream)
         collective(
             self._mailbox,
             to_cute(weight, 16),
@@ -282,5 +311,6 @@ class LLAllGatherNormQuant(LLColumnGather):
             ),
             self._stage_state,
             m,
+            self._half_elements,
             stream,
         )

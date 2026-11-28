@@ -39,8 +39,10 @@ from ..cute_dsl_primitives import (
     load_global_bf16_as_f32_predicated,
     load_global_u32x2,
     load_global_u32x4,
+    load_relaxed_gpu_u64,
     load_volatile_u32,
     map_shared_to_peer,
+    mark_zero_u32x4,
     packed_u32x2_to_bf16x4,
     packed_u32x4_to_bf16x8,
     sanitize_negative_zero_u32x2,
@@ -61,6 +63,14 @@ from ..static_fp8_epilogue import store_rmsnorm_output
 LAMPORT_GENERATIONS = 3
 NEXT_STAGE = 0
 ACTIVE_STAGE = 1
+
+
+@cute.jit
+def push_plane_phase(epoch: cute.Tensor) -> Uint32:
+    """The push plane's phase, bit 32 of its 64-bit epoch counter (``epoch`` viewed
+    as int32x2). Read after the PDL wait, with the commits' width and scope."""
+    word = load_relaxed_gpu_u64(Int64(epoch.iterator.toint()))
+    return Uint32(word >> Int64(32)) & Uint32(1)
 
 
 @cute.jit
@@ -568,11 +578,22 @@ class _SharedOnlyPublishDeviceKernel:
         peer_stores: bool = False,
         multicast_fragments: int = 0,
         bulk_peer_stores: bool = False,
+        lamport_2slot: bool = False,
+        lamport_atom_bytes: int = 2,
     ) -> None:
         if elements_per_thread not in (1, QUAD_BF16, VEC_BF16):
             raise ValueError("elements_per_thread must be 1, 4, or 8")
         if peer_stores and elements_per_thread != VEC_BF16:
             raise ValueError("peer_stores requires elements_per_thread == 8")
+        if lamport_atom_bytes not in (2, 4):
+            raise ValueError("lamport_atom_bytes must be 2 or 4")
+        if lamport_2slot and (
+            elements_per_thread != VEC_BF16 or peer_stores or release_before_store
+        ):
+            raise ValueError(
+                "lamport_2slot requires 8 elements per thread, multicast stores "
+                "and a store-then-release publish"
+            )
         if hidden <= 0 or hidden % elements_per_thread:
             raise ValueError("hidden must divide evenly across thread fragments")
         self.hidden = hidden
@@ -600,6 +621,15 @@ class _SharedOnlyPublishDeviceKernel:
         self.bulk_peer_stores = bulk_peer_stores and peer_stores
         if self.bulk_peer_stores and multicast_fragments % threads:
             raise ValueError("multicast_fragments must be a multiple of threads")
+        # lamport_2slot: store into a caller's two-slot push plane instead of
+        # the LL mailbox. Zero is the "not arrived" sentinel, the slot is the
+        # phase of the plane's epoch counter (passed as stage_state), and a slot
+        # of half_elements holds a dense [tp, m, hidden] block. The consumer
+        # commits the epoch, not this kernel.
+        self.lamport_2slot = lamport_2slot
+        # Sentinel granularity: 4 = 32-bit word, 2 = BF16. The LL mailbox's
+        # producer already stores no -0, so it serves either.
+        self.lamport_atom_bytes = lamport_atom_bytes
 
     def smem_size_in_bytes(self) -> int:
         return self.threads * 16 + 128 if self.bulk_peer_stores else 0
@@ -612,6 +642,7 @@ class _SharedOnlyPublishDeviceKernel:
         contribution_mailbox_multicast_address: Int64,
         peer_mailboxes: cute.Tensor | None,
         m: Int32,
+        half_elements: Int64,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -619,6 +650,8 @@ class _SharedOnlyPublishDeviceKernel:
             stage_state,
             contribution_mailbox_multicast_address,
             peer_mailboxes,
+            m,
+            half_elements,
         ).launch(
             grid=(m * self.ctas_per_token, 1, 1),
             block=(self.threads, 1, 1),
@@ -634,6 +667,8 @@ class _SharedOnlyPublishDeviceKernel:
         stage_state: cute.Tensor,
         contribution_mailbox_multicast_address: Int64,
         peer_mailboxes: cute.Tensor | None,
+        m: Int32,
+        half_elements: Int64,
     ) -> None:
         block, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -688,11 +723,21 @@ class _SharedOnlyPublishDeviceKernel:
                     cute.AddressSpace.gmem,
                     assumed_align=16,
                 )
-                packed_words.store(
-                    sanitize_negative_zero_u32x4(load_global_u32x4(pointer))
-                )
+                if cutlass.const_expr(self.lamport_2slot):
+                    packed_words.store(
+                        mark_zero_u32x4(
+                            load_global_u32x4(pointer), self.lamport_atom_bytes
+                        )
+                    )
+                else:
+                    packed_words.store(
+                        sanitize_negative_zero_u32x4(load_global_u32x4(pointer))
+                    )
 
-        stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
+        if cutlass.const_expr(self.lamport_2slot):
+            stage = push_plane_phase(stage_state)
+        else:
+            stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
         if cutlass.const_expr(self.release_before_store):
             if block == 0 and tidx == 0:
                 store_global_u32(
@@ -727,10 +772,18 @@ class _SharedOnlyPublishDeviceKernel:
                 )
         else:
             if fragment < self.fragments:
-                mailbox_element = (
-                    (Int64(stage) * self.tp + self.rank) * self.capacity_m
-                    + Int64(token)
-                ) * self.hidden + Int64(fragment) * VEC_BF16
+                if cutlass.const_expr(self.lamport_2slot):
+                    # half[stage]: [tp, m, hidden]
+                    mailbox_element = (
+                        Int64(stage) * half_elements
+                        + (Int64(m) * self.rank + Int64(token)) * self.hidden
+                        + Int64(fragment) * VEC_BF16
+                    )
+                else:
+                    mailbox_element = (
+                        (Int64(stage) * self.tp + self.rank) * self.capacity_m
+                        + Int64(token)
+                    ) * self.hidden + Int64(fragment) * VEC_BF16
                 if cutlass.const_expr(self.bulk_peer_stores):
                     if cta_in_token * self.threads < self.multicast_fragments:
                         stmc_bf16x8(
@@ -762,6 +815,7 @@ class _SharedOnlyPublishDeviceKernel:
                     stmc_bf16x8(
                         contribution_mailbox_multicast_address + mailbox_element * 2,
                         packed_words,
+                        word_atoms=self.lamport_2slot and self.lamport_atom_bytes == 4,
                     )
 
         if cutlass.const_expr(self.bulk_peer_stores):
@@ -791,11 +845,12 @@ class _SharedOnlyPublishDeviceKernel:
                     bulk_wait_group_read(0)
 
         if cutlass.const_expr(not self.release_before_store):
-            if block == 0 and tidx == 0:
-                store_global_u32(
-                    stage_state.iterator + ACTIVE_STAGE,
-                    stage,
-                )
+            if cutlass.const_expr(not self.lamport_2slot):
+                if block == 0 and tidx == 0:
+                    store_global_u32(
+                        stage_state.iterator + ACTIVE_STAGE,
+                        stage,
+                    )
             cute.arch.barrier()
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()

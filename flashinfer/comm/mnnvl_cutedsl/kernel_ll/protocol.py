@@ -236,13 +236,16 @@ def compile_shared_only_publish(
     peer_stores: bool = False,
     multicast_fragments: int = 0,
     bulk_peer_stores: bool = False,
+    lamport_2slot: bool = False,
+    lamport_atom_bytes: int = 2,
 ):
     """Compile the publisher that multicasts a local ``[m, hidden]`` BF16 tensor.
 
     The compiled function takes ``(local, stage_state, multicast_address,
-    peer_mailboxes, m, stream)``; ``peer_mailboxes`` is the ``[tp]`` int64
+    peer_mailboxes, m, half_elements, stream)``; ``peer_mailboxes`` is the ``[tp]`` int64
     table of unicast mailbox addresses with ``peer_stores`` and ``None``
-    otherwise.
+    otherwise. With ``lamport_2slot``, ``stage_state`` is a push
+    plane's epoch counter and ``multicast_address`` its base.
     """
     device_kernel = _SharedOnlyPublishDeviceKernel(
         hidden=hidden,
@@ -256,6 +259,8 @@ def compile_shared_only_publish(
         peer_stores=peer_stores,
         multicast_fragments=multicast_fragments,
         bulk_peer_stores=bulk_peer_stores,
+        lamport_2slot=lamport_2slot,
+        lamport_atom_bytes=lamport_atom_bytes,
     )
     return cute.compile(
         device_kernel,
@@ -266,6 +271,7 @@ def compile_shared_only_publish(
         if peer_stores
         else None,
         Int32(capacity_m),
+        Int64(0),
         current_cu_stream(),
     )
 
@@ -455,6 +461,7 @@ class AllReduceRMSNormLLKernel(_LLPath):
             if self._peer_stores
             else None,
             Int32(m),
+            Int64(0),
             current_cu_stream(),
         )
         self._launch_collective(
