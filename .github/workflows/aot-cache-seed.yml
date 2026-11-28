@@ -84,7 +84,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # Same lanes as the PR AOT matrix in pr-test.yml, so the seed writes the
+      # Same lanes as the PR AOT matrix in pr-test-dispatch.yml, so the seed writes the
       # key prefixes those lanes read.
       - name: Build seed matrix
         id: matrix

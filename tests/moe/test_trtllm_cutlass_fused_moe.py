@@ -711,6 +711,85 @@ def test_moe_raw_op_rejects_clamped_relu2_on_deepseek_blockscale():
         )
 
 
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "input",
+        "token_selected_experts",
+        "token_final_scales",
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_biases",
+        "fc2_expert_biases",
+        "output",
+    ],
+)
+@pytest.mark.parametrize("layout", ["padded_rows", "strided_columns"])
+@pytest.mark.parametrize("entrypoint", ["public", "registered"])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_rejects_noncontiguous_operands(argument, layout, entrypoint):
+    torch.manual_seed(0)
+    tokens, hidden, inter, experts, top_k = 16, 128, 128, 4, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 5
+    w1 = torch.randn(experts, 2 * inter, hidden, device="cuda", dtype=x.dtype) / 5
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=x.dtype) / 5
+    weights, ids = compute_routing(torch.randn(tokens, experts, device="cuda"), top_k)
+    ids = ids.to(torch.int32)
+    expected = compute_with_experts(experts, x, w1, w2, ids, weights)
+    args = dict(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        fc1_expert_biases=None,
+        fc2_expert_biases=None,
+        output=torch.empty_like(x),
+        output_dtype=x.dtype,
+        quant_scales=[],
+        enable_pdl=False,
+        profile_ids=[-1, -1],
+    )
+    major, minor = get_compute_capability(x.device)
+    call = (
+        fused_moe.cutlass_fused_moe
+        if entrypoint == "public"
+        else get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe
+    )
+    if argument in ("fc1_expert_biases", "fc2_expert_biases"):
+        args["fc1_expert_biases"] = torch.zeros(
+            experts, 2 * inter, device=x.device, dtype=x.dtype
+        )
+        args["fc2_expert_biases"] = torch.zeros(
+            experts, hidden, device=x.device, dtype=x.dtype
+        )
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
+
+    original = args[argument]
+    storage = torch.empty(
+        (*original.shape[:-1], original.shape[-1] * 2),
+        device=original.device,
+        dtype=original.dtype,
+    )
+    view = (
+        storage[..., : original.shape[-1]]
+        if layout == "padded_rows"
+        else storage[..., ::2]
+    )
+    view.copy_(original)
+    assert not view.is_contiguous()
+    args[argument] = view
+    with pytest.raises(
+        (ValueError, RuntimeError), match=f"{argument}.*must be contiguous"
+    ):
+        call(**args)
+
+    args[argument] = view.contiguous()
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
+
+
 def compute_with_experts_gelu_tanh(
     num_experts,
     x,
@@ -1272,6 +1351,34 @@ def test_moe_nvfp4(
     use_4over6,
     use_autotune,
 ):
+    _run_moe_nvfp4(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        otype,
+        wtype,
+        quantized_input,
+        activation_type,
+        use_4over6,
+        use_autotune,
+    )
+
+
+def _run_moe_nvfp4(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+    wtype,
+    quantized_input,
+    activation_type,
+    use_4over6,
+    use_autotune,
+):
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1420,6 +1527,112 @@ def test_moe_nvfp4(
         swiglu_limit=7.0 if activation_type == ActivationType.SwigluStep else None,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)),
+    reason="FINALIZE profiling coverage requires Blackwell SM100 or SM103",
+)
+def test_moe_nvfp4_autotune_profiles_finalize(monkeypatch):
+    """Cold autotuning must profile a real GEMM2 FINALIZE specialization."""
+    import math
+
+    from flashinfer.autotuner import AutoTuner
+    from torch.profiler import ProfilerActivity, profile
+
+    # Probe CUPTI separately so an unavailable profiler does not masquerade as
+    # a missing FINALIZE kernel. The original numerical tests still run normally.
+    probe = torch.ones(1, device="cuda")
+    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+        probe.add_(1)
+        torch.cuda.synchronize()
+    if not any(
+        event.device_type == torch.autograd.DeviceType.CUDA for event in trace.events()
+    ):
+        pytest.skip("torch.profiler records no CUDA activity on this device")
+
+    # Isolate this cold-cache assertion from earlier tests and persisted winners.
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    original_profile = AutoTuner._profile_single_kernel
+    finalized_tactics = set()
+    successful_profiles = 0
+    successful_cuda_profiles = 0
+
+    def observe_profile(self, runner, inputs, tactic, tuning_config, *args, **kwargs):
+        nonlocal successful_profiles, successful_cuda_profiles
+
+        if (
+            kwargs.get("gemm_idx") != 2
+            or not getattr(runner, "use_fused_finalize", False)
+            or finalized_tactics
+        ):
+            return original_profile(
+                self, runner, inputs, tactic, tuning_config, *args, **kwargs
+            )
+        # Observe the actual profiling invocation, not a later forward or an
+        # inference from tactic IDs. Keep candidates and returned timings intact.
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as trace:
+            elapsed = original_profile(
+                self, runner, inputs, tactic, tuning_config, *args, **kwargs
+            )
+        if not math.isfinite(elapsed):
+            return elapsed
+        successful_profiles += 1
+        cuda_events = [
+            event
+            for event in trace.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        successful_cuda_profiles += bool(cuda_events)
+        if any(
+            # These are the two SwapAB variants of the Blackwell FINALIZE
+            # fusion op; an unfused finalizeMoeRoutingKernel must not count.
+            any(
+                fusion_op in event.name
+                for fusion_op in (
+                    "ScaledAccPerRowBiasPerColScaleScatter",
+                    "ScaledAccPerColBiasPerRowScaleScatter",
+                )
+            )
+            for event in cuda_events
+        ):
+            finalized_tactics.add(tactic)
+        return elapsed
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", observe_profile)
+    was_deterministic = torch.are_deterministic_algorithms_enabled()
+    was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(False)
+    try:
+        # Reuse the existing quantization-aware numerical oracle. One real token
+        # bucket is sufficient; the workspace bound also depends on the tactics.
+        with autotune(True, tuning_buckets=(1,)):
+            _run_moe_nvfp4(
+                batch_size=1,
+                hidden_size=128,
+                num_experts=2,
+                top_k=2,
+                intermediate_size=128,
+                otype=torch.float16,
+                wtype=torch.float8_e4m3fn,
+                quantized_input=False,
+                activation_type=ActivationType.Swiglu,
+                use_4over6=False,
+                use_autotune=True,
+            )
+    finally:
+        torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+
+    # A long JIT build can invalidate the initial probe. Wait until all tactics
+    # and the numerical check finish before treating empty traces as unavailable.
+    if not finalized_tactics and successful_profiles and not successful_cuda_profiles:
+        pytest.skip(
+            "torch.profiler records no CUDA activity during successful GEMM2 profiling"
+        )
+    assert finalized_tactics, "Cold GEMM2 autotuning did not profile a FINALIZE kernel"
 
 
 def test_moe_nvfp4_pinned_4over6_requires_nvfp4():

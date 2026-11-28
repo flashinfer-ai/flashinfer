@@ -55,7 +55,7 @@ def preprocess_mega_weights(
 ) -> TransformedMegaWeights:
     """Canonical BF16 or prequantized MXFP8 weights -> SM107 kernel layout."""
     if isinstance(weights, PrequantizedMoEWeights):
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             preprocess_prequantized_block_scaled_weights,
         )
 
@@ -69,7 +69,7 @@ def preprocess_mega_weights(
             intermediate_size=intermediate_size,
         )
 
-    from ......kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         preprocess_block_scaled_weights,
     )
 
@@ -107,7 +107,7 @@ def validate_transformed_mega_weights(
     """Structure/shape/dtype checks for user-supplied transformed weights."""
     import torch
 
-    from ......kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         Mxfp8BlockSize,
         swizzled_flat_sf_size,
     )

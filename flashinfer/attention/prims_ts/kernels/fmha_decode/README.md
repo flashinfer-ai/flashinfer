@@ -29,6 +29,8 @@ Q tiles of 48 rows or more, for fixed grouped paged queries:
 | Swaps Q128 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
 | Keeps Q128 | 128 | FP8 / FP8 | FP16, BF16 | 1 |
 | Keeps Q64 | 128, 256 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Keeps Q64 | 512 | FP8 / NVFP4 | FP16, BF16 | 1 |
+| Keeps Q64 | 512 | FP8 / FP8 | FP16, BF16 | 1 |
 
 The Swaps rows support dense or causal masks and direct or GMEM split-KV
 reduction (fused or separate kernel). Packed queries, persistent scheduling,
@@ -39,8 +41,23 @@ separate warp groups. Keeps Q64 NVFP4 converts K/V into FP8 SMEM rings in
 separate warp groups: one per KV instance at D128, one per operand at D256.
 It requires the grouped token/head layout. This table describes supported
 profiles, not a performance ranking. Keeps Q64 is effective for D256,
-while D128 selection depends on query grouping and work per CTA. Swaps Q64
-also provides D512 coverage, where the Keeps NVFP4 profile is not implemented.
+while D128 selection depends on query grouping and work per CTA.
+
+D512 Keeps Q64 uses KV128 tiles, four D128 head-dim stages, one KV instance,
+and one O stage whose stages 2/3 sit in TMEM lanes 16-31. NVFP4 K/V is
+converted into FP8 SMEM rings by separate K and V warp groups, while FP8 K/V
+is consumed as stored. Both are qualified at eight Q heads per KV head:
+automatic selection compares Keeps Q64 there, and FP8 K/V D512 is rejected
+at other ratios. Both run fixed Q with dense or causal masks, direct or with
+GMEM split-KV reduction (fused or separate kernel); cluster-SMEM reduction
+has no Keeps implementation, and the NVFP4 profile also excludes persistent
+scheduling. NVFP4 K/V D512 at other head ratios runs on Swaps, with a tile
+that depends on the workload (query length, batch, KV length and how many
+CTAs fill the GPU). Grouped Swaps tiles, up to Q64, are candidates while one
+KV head's Q heads fit a Q64 tile (up to 64 Q heads per KV head); ungrouped
+head-band tiles (Q8, Q16) are candidates as well, for example when a grouped
+one-token launch would leave most of the first wave idle. Above 64 Q heads per
+KV head only ungrouped tiles remain.
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
 dense nibble pairs for SMEM conversion. Dense D256 one-instance Keeps profiles
@@ -443,7 +460,9 @@ The public accuracy, layout, mask, variable-Q, page-size, dtype, CUDA-graph,
 split-KV, and resource-safety coverage lives in:
 
 ```bash
-pytest -q tests/attention/test_attention_ts_decode.py
+pytest -q \
+  tests/attention/test_attention_ts_decode.py \
+  tests/attention/test_attention_ts_decode_mixed_precision.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
 

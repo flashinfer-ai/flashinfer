@@ -529,6 +529,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
         swap_ab: bool = False,
         routing_weights_before_fc2: bool = False,
+        localized_options: Optional[dict] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
@@ -540,8 +541,10 @@ class CuteDslFusedMoERunner(TunableRunner):
             raise ValueError(
                 f"per-token activation scaling is not supported for {quant_mode}"
             )
-        if localized_weights is not None and quant_mode != "w4a4":
-            raise ValueError("localized runner supports quant_mode='w4a4' only")
+        if localized_weights is not None and quant_mode not in ("w4a4", "mxfp8"):
+            raise ValueError(
+                "localized runner supports quant_mode='w4a4' and 'mxfp8' only"
+            )
         validate_pre_fc2_routing(
             routing_weights_before_fc2,
             quant_mode,
@@ -576,6 +579,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.localized_streams = localized_streams
         self.localized_sm_count = localized_sm_count
         self.localized_memset_stream = localized_memset_stream
+        self.localized_options = localized_options
 
         if localized_weights is not None and (
             len(localized_weights) != 2
@@ -711,11 +715,15 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
             for shard in self.localized_weights
         )
+        options = self.localized_options or {}
         return (
             "localized",
             self.localized_sm_count,
             shard_shapes,
             self.localized_memset_stream is not None,
+            options.get("fc2_split", "n"),
+            options.get("fc2_accumulator", "float32"),
+            options.get("output_memset", "overlap_fc1"),
         )
 
     def __hash__(self):
@@ -1098,6 +1106,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 localized_streams=self.localized_streams,
                 localized_memset_stream=self.localized_memset_stream,
                 sm_count=self.localized_sm_count,
+                localized_options=self.localized_options,
             )
 
         if self.routing_weights_before_fc2:

@@ -22,7 +22,7 @@ Prints the narrowed scope on one line; an empty line means nothing requested is
 covered and the lane should not be scheduled. Targets are files or directories
 under ``tests/`` (``::`` selectors are rejected upstream by
 ``experimental_test_scope.py``). A shard script with no parseable ``pytest`` line
-is a parser-drift bug, not an empty scope, and exits non-zero; ``pr-test.yml``
+is a parser-drift bug, not an empty scope, and exits non-zero; ``pr-test-dispatch.yml``
 runs ``--coverage-only`` on every setup so such drift fails the PR that causes it.
 """
 

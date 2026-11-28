@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import math
 from contextlib import contextmanager
@@ -27,7 +28,9 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     _build_q_token_kv_block_sparse_metadata as build_prims_ts_q_token_kv_block_sparse_metadata,
     _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
     _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
+    _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors,
     _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
+    _validate_wide_metadata_fits,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
@@ -367,6 +370,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "split_kv",
         "share_pattern_across_kv_heads",
         "count_current_block_in_topk",
+        "balanced_scheduler",
         "mask_type",
         "q_dtype",
         "kv_dtype",
@@ -1328,6 +1332,110 @@ def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("group_size", "packed", "max_seq_len_kv"),
+    (
+        (16, False, 128 * 1024),
+        (32, True, 256 * 1024),
+        # The O(1) word-rank array would lower occupancy (G16) or not fit
+        # (G16 at 4M, G32 at 2M): the kernel walks the word summaries instead.
+        (16, False, 1024 * 1024 + 1),
+        (16, True, 4 * 1024 * 1024),
+        (32, False, 2 * 1024 * 1024),
+    ),
+)
+def test_wide_group_sort_union_long_context_matches_reference(
+    group_size: int,
+    packed: bool,
+    max_seq_len_kv: int,
+) -> None:
+    """G16/G32 bit-map unions over long prefixes match a host reference, plane by plane."""
+
+    try:
+        _validate_wide_metadata_fits(
+            group_size, max_seq_len_kv, 4, torch.cuda.current_device()
+        )
+    except ValueError as error:
+        pytest.skip(str(error))
+    (
+        blocks,
+        table,
+        requests,
+        positions,
+        storage_page_size,
+        qo_indptr,
+    ) = _make_wide_sort_union_case(group_size, packed, max_seq_len_kv)
+    outputs = tuple(
+        torch.full(shape, -7, dtype=torch.int32, device="cuda")
+        for shape in get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes(
+            blocks.shape[0],
+            blocks.shape[1],
+            group_size,
+            num_query_groups=2,
+        )
+    )
+    indices, memberships, seq_lens = build_prims_ts_q_token_kv_block_sparse_metadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        group_size=group_size,
+        storage_page_size=storage_page_size,
+        max_seq_len_kv=max_seq_len_kv,
+        qo_indptr=qo_indptr,
+        out=outputs,
+    )
+    blocks_host = blocks.cpu()
+    table_host = table.cpu()
+    positions_host = positions.cpu()
+    requests_host = requests.cpu()
+    rows, block_topk = blocks_host.shape
+    route_offsets = (
+        [0, group_size, rows] if qo_indptr is None else qo_indptr.cpu().tolist()
+    )
+    planes = (group_size + 7) // 8
+    plane_bytes = memberships.shape[1] // planes * 4
+    membership_bytes = memberships.cpu().contiguous().view(torch.uint8)
+    indices_host = indices.cpu()
+    seq_lens_host = seq_lens.cpu()
+    subpages_per_storage_page = storage_page_size // 4
+    for group in range(2):
+        first_row, group_end = route_offsets[group], route_offsets[group + 1]
+        membership_by_block: dict[int, int] = {}
+        for q_index in range(group_end - first_row):
+            row = first_row + q_index
+            visible_tokens = int(positions_host[row]) + 1
+            complete_pages = min(visible_tokens // 4, block_topk)
+            for logical_block in blocks_host[row, :complete_pages].tolist():
+                if 0 <= logical_block < visible_tokens // 4:
+                    membership_by_block[logical_block] = membership_by_block.get(
+                        logical_block, 0
+                    ) | (1 << q_index)
+            if visible_tokens % 4:
+                tail_block = visible_tokens // 4
+                membership_by_block[tail_block] = membership_by_block.get(
+                    tail_block, 0
+                ) | (1 << q_index)
+        union = sorted(membership_by_block.items())
+        last_tail = (int(positions_host[group_end - 1]) + 1) % 4
+        tail_padding = 0 if last_tail == 0 else 4 - last_tail
+        assert int(seq_lens_host[group]) == max(len(union) * 4 - tail_padding, 1)
+        for rank, (logical_block, membership) in enumerate(union):
+            storage_page, token_offset = divmod(logical_block * 4, storage_page_size)
+            request = int(requests_host[first_row])
+            locator = (
+                int(table_host[request, storage_page]) * subpages_per_storage_page
+                + token_offset // 4
+            )
+            assert int(indices_host[group, rank]) == locator, (group, rank)
+            for plane in range(planes):
+                assert (
+                    int(membership_bytes[group, plane * plane_bytes + rank])
+                    == (membership >> (8 * plane)) & 0xFF
+                ), (group, rank, plane)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("group_size", range(2, 9))
 @pytest.mark.parametrize("packed", (False, True))
 def test_query_major_memberships_graph(group_size: int, packed: bool) -> None:
@@ -2013,14 +2121,16 @@ def _run_private_q_token_kv_block_sparse_decode(
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("group_size", "segment_memberships", "expected_keeps"),
+    ("group_size", "num_qo_heads", "segment_memberships", "expected_keeps"),
     (
-        (2, (0b01, 0b10, 0b11, 0b01, 0b10), False),
-        (4, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
+        (2, 8, (0b01, 0b10, 0b11, 0b01, 0b10), False),
+        (2, 12, (0b01, 0b10, 0b11, 0b01, 0b10), True),
+        (4, 12, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
     ),
 )
 def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundaries(
     group_size: int,
+    num_qo_heads: int,
     segment_memberships: tuple[int, ...],
     expected_keeps: bool,
 ) -> None:
@@ -2029,14 +2139,15 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     Every 32 page-four locators form one KV128 tile.  Using a different
     membership mask in each tile makes a split that restarts the membership
     pointer, or applies the locator stride to membership words, visibly route
-    pages to the wrong query.  Q2 covers the production SwapsMmaAb path and Q4
-    covers KeepsMmaAb; both resolve to a separate-reduction split-KV launch.
+    pages to the wrong query.  Eight-head Q2 (16 rows) covers the production
+    SwapsMmaAb path; twelve-head Q2 and Q4 (24 and 48 rows) cover KeepsMmaAb,
+    which D256 BF16 takes beyond 16 rows. All resolve to a separate-reduction
+    split-KV launch.
     """
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
     batch_size = 1
-    num_qo_heads = 12
     num_kv_heads = 1
     head_dim = 256
     sparse_page_size = 4
@@ -2068,7 +2179,10 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
         False,
     )
     assert spec.config.use_keeps_mma_ab is expected_keeps
-    assert spec.config.tile_size_q == (64 if expected_keeps else 32)
+    # D256 takes SwapsMmaAb only up to 16 rows (Q8/Q16 tiles): on GB300 a Swaps
+    # Q32 tile measured 10-110% slower than the Keeps Q64 tile at every dtype
+    # (``SWAPS_MAX_ROWS_D256``), so 24 and 48 rows take Keeps Q64.
+    assert spec.config.tile_size_q == (64 if expected_keeps else 16)
     # The exact first-wave fanout is device-capacity dependent; this test only
     # requires a real multi-split launch to exercise split-local addressing.
     assert spec.config.splits_kv == spec.config.max_splits_kv
@@ -2210,6 +2324,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2364,6 +2479,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2469,6 +2585,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2855,6 +2972,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -4077,6 +4195,19 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     )
 
 
+def _interleave_v_scale_factors(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder ``[pages, Hkv, page_size, D/16]`` V scales into TRT-LLM's
+    four-token interleaved order."""
+
+    pages, heads, page_size, groups = scales.shape
+    return (
+        scales.reshape(pages, heads, page_size // 4, 4, 4, groups // 4)
+        .permute(0, 1, 2, 4, 5, 3)
+        .reshape(scales.shape)
+        .contiguous()
+    )
+
+
 def dequantize_nvfp4_reference(
     payload: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
@@ -4178,11 +4309,14 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     fewer than four fragments per KV tile (``block64``), or with fragments
     wider than one gather4 box (``block8``: 8 x 144 bytes; ``block8-heads2``
     also checks the second KV head's coordinates). Separate scale tensors
-    stage 128-byte SW128 payload rows and a separate scale stage.
+    stage 128-byte SW128 payload rows and a separate scale stage; compact
+    scale tensors gather four fragments' scale rows per TMA gather4, and the
+    transposed ``nhd-view`` scales keep one copy per fragment.
 
     ``packed`` passes the same queries as packed ``[total_q, Hq, D]`` rows
-    with ``qo_indptr``: FP8 Q up to G4 (8-32 Q rows per KV head) runs the
-    TMEM-transformed Swaps recipe, FP8 G5 and BF16 Q run the Keeps transform.
+    with ``qo_indptr``: FP8 Q up to G4 with at most 16 Q rows per KV head runs
+    the TMEM-transformed Swaps recipe; FP8 G4 with 32 rows (eight Q heads per
+    KV head), FP8 G5 and BF16 Q run the Keeps transform.
 
     ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
     give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4
@@ -4263,15 +4397,7 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
         kv_scale_factors = None
     else:
         caches = tuple(payload)
-        # V scales use TRT-LLM's four-token interleaved order.
-        v_scale = (
-            scales[1]
-            .reshape(num_pages, num_kv_heads, page_size // 4, 4, 4, head_dim // 64)
-            .permute(0, 1, 2, 4, 5, 3)
-            .reshape(scales[1].shape)
-            .contiguous()
-        )
-        kv_scale_factors = (scales[0], v_scale)
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
         if cache_layout == "nhd-view":
             caches, kv_scale_factors = (
                 tuple(
@@ -4369,6 +4495,604 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
                     rtol=tolerance,
                     atol=tolerance,
                 )
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("split_kv", (True, False))
+@pytest.mark.parametrize(
+    ("kv_dtype", "head_dim"),
+    ((torch.bfloat16, 128), (torch.bfloat16, 256), (torch.uint8, 256)),
+    ids=("bf16-d128", "bf16-d256", "nvfp4-d256"),
+)
+@pytest.mark.parametrize(
+    (
+        "num_qo_heads",
+        "num_kv_heads",
+        "group_size",
+        "block_size",
+        "page_size",
+        "share_pattern",
+    ),
+    (
+        (4, 1, 16, 4, 64, True),
+        (4, 1, 32, 4, 64, True),
+        (16, 2, 16, 4, 64, True),
+        (2, 1, 32, 4, 64, True),
+        # One Q head per KV head: rows 16-63 of the Keeps Q64 tile are padding,
+        # read through the preloaded (4-token) and on-demand (8-token) paths.
+        (1, 1, 16, 4, 64, True),
+        (1, 1, 16, 8, 8, True),
+        # 32-token blocks on 4-token pages: 4-token fragments, one membership
+        # byte each, which G16/G32 support.
+        (4, 1, 16, 32, 4, True),
+        # Per-KV-head patterns: each head's planes stay inside its own row
+        # (Keeps Q64 and Q128 tiles).
+        (8, 2, 16, 4, 64, False),
+        (16, 2, 16, 4, 64, False),
+    ),
+)
+def test_wide_group_packed_attention_matches_reference(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    group_size: int,
+    block_size: int,
+    page_size: int,
+    share_pattern: bool,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    split_kv: bool,
+) -> None:
+    """G16/G32 routes (two/four page-major membership planes) match FP32.
+
+    Every query of each route, including a short tail route, is compared.
+    Each query takes half of its blocks from a pool shared by the route and
+    half privately, so the memberships differ per query and per plane.
+    """
+
+    block_topk = 64 if block_size == 4 else 16
+    generator = torch.Generator(device="cuda").manual_seed(
+        group_size * 131 + num_qo_heads
+    )
+    prefix, num_queries = 1100, 3 * group_size + 5
+    seq_len = prefix + num_queries
+    num_pages = (seq_len + page_size - 1) // page_size
+    table = (
+        torch.randperm(num_pages, generator=generator, device="cuda")
+        .to(torch.int32)
+        .view(1, num_pages)
+    )
+    shape = (num_pages, num_kv_heads, page_size)
+    if kv_dtype == torch.bfloat16:
+        caches = tuple(
+            torch.randn((*shape, head_dim), generator=generator, device="cuda").to(
+                torch.bfloat16
+            )
+            for _ in range(2)
+        )
+        kv_scale_factors = None
+        keys, values = (cache.float() for cache in caches)
+    else:
+        caches = tuple(
+            torch.randint(
+                0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+            ).to(torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (
+                torch.rand((*shape, head_dim // 16), generator=generator, device="cuda")
+                / 2
+            )
+            .add(0.05)
+            .to(torch.float8_e4m3fn)
+            for _ in range(2)
+        ]
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        keys, values = (
+            dequantize_nvfp4_reference(data, scale)
+            for data, scale in zip(caches, scales, strict=True)
+        )
+    positions = torch.arange(prefix, seq_len, dtype=torch.int32, device="cuda")
+    # One selection per query and KV head; a shared pattern keeps head 0's.
+    blocks = torch.full(
+        (num_queries, num_kv_heads, block_topk), -1, dtype=torch.int32, device="cuda"
+    )
+    for kv_head in range(num_kv_heads):
+        pool = torch.randperm(prefix // block_size, generator=generator, device="cuda")[
+            : 2 * block_topk
+        ]
+        for token in range(num_queries):
+            bound = (int(positions[token]) + 1) // block_size
+            shared = pool[
+                torch.randperm(pool.numel(), generator=generator, device="cuda")[
+                    : block_topk // 2
+                ]
+            ]
+            private = torch.randperm(bound, generator=generator, device="cuda")
+            private = private[~torch.isin(private, shared)][
+                : block_topk - shared.numel()
+            ]
+            selected = torch.cat((shared, private))
+            blocks[token, kv_head, : selected.numel()] = selected.to(torch.int32)
+    if share_pattern:
+        blocks = blocks[:, :1].expand(-1, num_kv_heads, -1)
+    run_blocks = blocks[:, 0].contiguous() if share_pattern else blocks.contiguous()
+    query = torch.randn(
+        (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    requests = torch.zeros(num_queries, dtype=torch.int32, device="cuda")
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, num_queries], dtype=torch.int32),
+        num_queries,
+        group_size=group_size,
+        device="cuda",
+    )
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            caches[0],
+            table,
+            block_topk=block_topk,
+            max_seq_len_kv=seq_len,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            kv_block_size=block_size,
+            split_kv=split_kv,
+            share_pattern_across_kv_heads=share_pattern,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        qo_indptr.numel() - 1,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        page_size,
+        block_topk,
+        seq_len,
+        device="cuda",
+        workspace_buffer=workspace,
+        group_size=group_size,
+        packed_query=True,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern,
+        q_dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+    )
+    output = torch.empty_like(query)
+    wrapper.run(
+        query,
+        caches,
+        table,
+        run_blocks,
+        requests,
+        positions,
+        qo_indptr=qo_indptr,
+        out=output,
+        kv_scale_factors=kv_scale_factors,
+    )
+
+    keys, values = (
+        tensor[table[0].long()]
+        .permute(0, 2, 1, 3)
+        .reshape(num_pages * page_size, num_kv_heads, head_dim)
+        for tensor in (keys, values)
+    )
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+    for token in range(num_queries):
+        visible = int(positions[token]) + 1
+        tail = torch.arange(visible - visible % block_size, visible, device="cuda")
+        for kv_head in range(num_kv_heads):
+            selected = blocks[token, kv_head]
+            live = selected[selected >= 0].long()
+            token_ids = torch.cat(
+                (
+                    (
+                        live[:, None] * block_size
+                        + torch.arange(block_size, device="cuda")
+                    ).flatten(),
+                    tail,
+                )
+            )
+            heads = slice(kv_head * heads_q_per_kv, (kv_head + 1) * heads_q_per_kv)
+            scores = query[token, heads].float() @ keys[token_ids, kv_head].T
+            reference = (scores / head_dim**0.5).softmax(-1) @ values[
+                token_ids, kv_head
+            ]
+            error = (output[token, heads].float() - reference).norm() / reference.norm()
+            assert error < 0.01, (token, token % group_size, kv_head, float(error))
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
+    ("kv_dtype", "head_dim"),
+    ((torch.bfloat16, 128), (torch.uint8, 256)),
+    ids=("bf16-d128", "nvfp4-d256"),
+)
+def test_persistent_routes_run_longest_first(
+    kv_dtype: torch.dtype, head_dim: int
+) -> None:
+    """``balanced_scheduler=True`` takes persistent routes longest first.
+
+    The metadata kernel's last CTA writes ``route_order`` (a permutation of
+    the routes by descending KV128 tiles) and rearms its counter; attention
+    maps CLC index i to ``route_order[i]``. Two requests with different
+    prefixes, and per-route selection windows (every query fills its required
+    indexer prefix), give routes of different lengths; every query of every
+    route (including short tail routes) matches FP32, and later runs reuse
+    the rearmed counter and rewrite the order (poisoned before each). These
+    37 routes fit in one wave, so the default (``None``) leaves the order
+    off. Their K/V fits in L2, so every route is ordered; the third run
+    reorders only the 8 shortest routes (as when K/V exceeds L2), and the
+    others keep index order.
+    """
+
+    num_qo_heads, num_kv_heads, group_size, block_size, page_size = 16, 1, 4, 4, 64
+    block_topk = 64
+    generator = torch.Generator(device="cuda").manual_seed(4093)
+    prefixes, counts = (300, 1800), (61, 83)
+    seq_lens = [p + c for p, c in zip(prefixes, counts, strict=True)]
+    pages_per_request = (max(seq_lens) + page_size - 1) // page_size
+    table = (
+        torch.randperm(2 * pages_per_request, generator=generator, device="cuda")
+        .to(torch.int32)
+        .view(2, pages_per_request)
+    )
+    shape = (2 * pages_per_request, num_kv_heads, page_size)
+    if kv_dtype == torch.bfloat16:
+        caches = tuple(
+            torch.randn((*shape, head_dim), generator=generator, device="cuda").to(
+                torch.bfloat16
+            )
+            for _ in range(2)
+        )
+        kv_scale_factors = None
+        keys, values = (cache.float() for cache in caches)
+    else:
+        caches = tuple(
+            torch.randint(
+                0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+            ).to(torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (
+                torch.rand((*shape, head_dim // 16), generator=generator, device="cuda")
+                / 2
+            )
+            .add(0.05)
+            .to(torch.float8_e4m3fn)
+            for _ in range(2)
+        ]
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        keys, values = (
+            dequantize_nvfp4_reference(data, scale)
+            for data, scale in zip(caches, scales, strict=True)
+        )
+
+    num_queries = sum(counts)
+    positions = torch.cat(
+        [
+            torch.arange(p, p + c, dtype=torch.int32, device="cuda")
+            for p, c in zip(prefixes, counts, strict=True)
+        ]
+    )
+    requests = torch.cat(
+        [
+            torch.full((c,), r, dtype=torch.int32, device="cuda")
+            for r, c in enumerate(counts)
+        ]
+    )
+    blocks = torch.full((num_queries, block_topk), -1, dtype=torch.int32, device="cuda")
+    for token in range(num_queries):
+        bound = (int(positions[token]) + 1) // block_size
+        take = min(bound, block_topk)
+        # The queries of one route pick from the same recent window, whose
+        # width varies by route: overlap, and so the union, differs per route.
+        request = int(requests[token])
+        route = (token - (counts[0] if request else 0)) // group_size
+        window = min(bound, block_topk + (97 * route + 31 * request) % (3 * block_topk))
+        chosen = (
+            bound
+            - window
+            + torch.randperm(window, generator=generator, device="cuda")[:take]
+        )
+        blocks[token, :take] = chosen.to(torch.int32)
+    query = torch.randn(
+        (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, counts[0], num_queries], dtype=torch.int32),
+        num_queries,
+        group_size=group_size,
+        device="cuda",
+    )
+    workspace = torch.full(
+        (
+            get_q_token_kv_block_sparse_workspace_size(
+                query,
+                caches[0],
+                table,
+                block_topk=block_topk,
+                max_seq_len_kv=max(seq_lens),
+                out_dtype=torch.bfloat16,
+                qo_indptr=qo_indptr,
+                group_size=group_size,
+                kv_block_size=block_size,
+                split_kv=False,
+            ),
+        ),
+        0xFF,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    # Only shared patterns take the order, so per-head patterns reserve no
+    # route-order region, even with one KV head.
+    for share, route_order_bytes in ((True, 4 * (qo_indptr.numel() - 1)), (False, 0)):
+        layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
+            query,
+            caches[0],
+            table,
+            block_topk,
+            max_seq_len_kv=max(seq_lens),
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            sparse_block_size=block_size,
+            split_kv=False,
+            share_pattern_across_kv_heads=share,
+        )
+        assert layout.route_order_bytes == route_order_bytes, share
+
+    def plan(balanced_scheduler):
+        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper.plan(
+            qo_indptr.numel() - 1,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            page_size,
+            block_topk,
+            max(seq_lens),
+            device="cuda",
+            workspace_buffer=workspace,
+            group_size=group_size,
+            packed_query=True,
+            split_kv=False,
+            balanced_scheduler=balanced_scheduler,
+            q_dtype=torch.bfloat16,
+            kv_dtype=kv_dtype,
+            out_dtype=torch.bfloat16,
+        )
+        return wrapper
+
+    single_wave = plan(None)
+    single_wave.run(
+        query,
+        caches,
+        table,
+        blocks,
+        requests,
+        positions,
+        qo_indptr=qo_indptr,
+        kv_scale_factors=kv_scale_factors,
+    )
+    assert single_wave._prepared_plan._metadata_plan.route_order is None
+
+    wrapper = plan(True)
+    for run in range(3):  # run 1 reuses the rearmed counter; run 2 has a short tail
+        if run == 2:
+            prepared = wrapper._prepared_plan
+            wrapper._prepared_plan = dataclasses.replace(
+                prepared,
+                _metadata_plan=dataclasses.replace(
+                    prepared._metadata_plan, route_order_tail=8
+                ),
+            )
+        output = torch.full_like(query, float("nan"))
+        if run:
+            # Poison the published order: a stale one fails the checks below.
+            wrapper._prepared_plan._metadata_plan.route_order.fill_(-1)
+        wrapper.run(
+            query,
+            caches,
+            table,
+            blocks,
+            requests,
+            positions,
+            qo_indptr=qo_indptr,
+            out=output,
+            kv_scale_factors=kv_scale_factors,
+        )
+        torch.cuda.synchronize()
+
+        metadata = wrapper._prepared_plan._metadata_plan
+        assert metadata.route_order is not None
+        routes = qo_indptr.numel() - 1
+        order = metadata.route_order.cpu()
+        assert sorted(order.tolist()) == list(range(routes))
+        tail = routes if metadata.route_order_tail == 0 else metadata.route_order_tail
+        head, ordered = order[: routes - tail], order[routes - tail :]
+        all_tiles = (metadata.seq_lens.cpu() + 127) // 128
+        tiles = all_tiles[ordered.long()]
+        assert bool((tiles[:-1] >= tiles[1:]).all()), tiles.tolist()
+        assert bool((head[:-1] < head[1:]).all()), head.tolist()
+        if head.numel():
+            # The tail holds the shortest routes; one tile bucket may straddle.
+            assert int(all_tiles[head.long()].min()) >= int(tiles.max())
+        assert int(metadata.route_order_counter.item()) == 0
+
+        for token in range(num_queries):
+            request = int(requests[token])
+            visible = int(positions[token]) + 1
+            tail = torch.arange(visible - visible % block_size, visible, device="cuda")
+            selected = blocks[token]
+            live = selected[selected >= 0].long()
+            token_ids = torch.cat(
+                (
+                    (
+                        live[:, None] * block_size
+                        + torch.arange(block_size, device="cuda")
+                    ).flatten(),
+                    tail,
+                )
+            )
+            pages = table[request, token_ids // page_size].long()
+            slots = token_ids % page_size
+            scores = query[token].float() @ keys[pages, 0, slots].T
+            reference = (scores / head_dim**0.5).softmax(-1) @ values[pages, 0, slots]
+            error = (output[token].float() - reference).norm() / reference.norm()
+            assert error < 0.01, (token, float(error))
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_wide_group_rejects_metadata_map_beyond_shared_memory() -> None:
+    """G32 over a 64M-token model prefix has no metadata map that fits SMEM;
+    workspace sizing (and plan) rejects it instead of failing at run."""
+
+    page_size, max_seq_len_kv = 4096, 64 * 1024 * 1024
+    query = torch.empty((32, 4, 256), dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty((1, 1, page_size, 256), dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(
+        (1, max_seq_len_kv // page_size), dtype=torch.int32, device="cuda"
+    )
+    qo_indptr = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="shared memory"):
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            cache,
+            table,
+            block_topk=64,
+            max_seq_len_kv=max_seq_len_kv,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=32,
+            kv_block_size=4,
+        )
+
+
+def test_wide_group_suggestion_for_long_nvfp4_prefill() -> None:
+    """Long packed NVFP4 prefill takes a two/four-plane group where it pays:
+    4/1 heads over a 64K context (G16) or from an empty prefix (G32); 16/2
+    heads over 64K keep G8. Fixed-shape queries never get G16/G32, which
+    ``plan`` rejects for them."""
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    long_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=65536 + 4096, **packed)
+    fresh_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, **packed)
+    long_16_2 = suggest(1, 2048, 2051, 16, 2, 148, seq_len_kv=65536 + 2048, **packed)
+    short = suggest(1, 4, 2051, 16, 2, 148, seq_len_kv=65536 + 4, **packed)
+    assert (long_4_1, fresh_4_1, long_16_2) == (16, 32, 8) and short <= 4
+    assert suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, nvfp4_kv=True) <= 8
+
+
+def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
+    """Routes of a prefill from a short prefix see only their own context.
+
+    The expected union of each route is capped at the KV length its last
+    query sees and averaged over the request's routes (checked against a
+    direct mean). Sixteen Q heads per KV head from an empty prefix then
+    take G8 (one TileQ128 per eight queries, GB300: 136 us vs 169 us for
+    G4 at 4096 queries), where a single request-length cap preferred G4.
+    """
+
+    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+        _mean_route_union_tokens,
+    )
+
+    for prefix in (0, 100, 4000, 65536):
+        for seq_len_q in (1, 7, 100, 4096):
+            for group_size in (1, 4, 8, 32):
+                for union in (1, 2051, 4241):
+                    routes = -(-seq_len_q // group_size)
+                    capped = [
+                        min(union, prefix + min((r + 1) * group_size, seq_len_q))
+                        for r in range(routes)
+                    ]
+                    expected = max(1, -(-sum(capped) // routes))
+                    assert (
+                        _mean_route_union_tokens(
+                            union, group_size, seq_len_q, prefix + seq_len_q
+                        )
+                        == expected
+                    )
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    assert suggest(1, 4096, 2051, 16, 1, 152, seq_len_kv=4096, **packed) == 8
+
+
+def test_group_suggestion_follows_nvfp4_layout_and_wide_head_groups() -> None:
+    """Interleaved NVFP4 rows have their own latency constants.
+
+    GB300 (balanced scheduler), 128/8 Q/KV heads, 1024 queries over a 64K
+    prefix: separate scales run G4 in 580 us (G8: 622 us), interleaved rows
+    G8 in 608 us (G4: 637 us). With 32 Q heads per KV head, TileQ128 already
+    forms at G4: 4096 queries over a 32K prefix take G4 (424/406 us
+    separate/rows) over G2 (456/499 us), which a slower-growing union
+    estimate preferred.
+    """
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    for interleaved, group_size in ((False, 4), (True, 8)):
+        assert (
+            suggest(
+                1,
+                1024,
+                2051,
+                128,
+                8,
+                152,
+                seq_len_kv=65536 + 1024,
+                nvfp4_interleaved_kv=interleaved,
+                **packed,
+            )
+            == group_size
+        )
+    for interleaved in (False, True):
+        assert (
+            suggest(
+                1,
+                4096,
+                2051,
+                32,
+                1,
+                152,
+                seq_len_kv=32768 + 4096,
+                nvfp4_interleaved_kv=interleaved,
+                **packed,
+            )
+            == 4
+        )
+    with pytest.raises(TypeError, match="nvfp4_interleaved_kv"):
+        suggest(1, 4, 2051, 16, 1, 152, nvfp4_interleaved_kv=1, **packed)
+
+
+def test_wide_group_suggestion_needs_small_blocks() -> None:
+    """Keeps lanes read four blocks per G16/G32 membership word, so blocks
+    wider than 16 tokens keep the suggestion at G8 or below."""
+
+    for block_size in (32, 64):
+        group_size = suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            1,
+            4096,
+            2048 + block_size - 1,
+            4,
+            1,
+            148,
+            kv_block_size=block_size,
+            nvfp4_kv=True,
+            packed_query=True,
+        )
+        assert group_size <= 8
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION

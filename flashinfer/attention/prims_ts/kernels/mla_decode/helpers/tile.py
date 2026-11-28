@@ -20,9 +20,14 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
-from .kv_bounds import query_kv_bound
-from .layout import _TASK_CACHE_SEQ_LEN_KV, _TASK_CACHE_LOCAL_KV_TILES
-from .mask import MaskType, mask_visible_k_length
+from ...mask import kv_tile_needs_right_mask
+from .context_parallel import local_kv_length
+from .layout import (
+    _TASK_CACHE_KV_VISIBLE_END,
+    _TASK_CACHE_LOCAL_KV_TILES,
+    _TASK_CACHE_SEQ_LEN_KV,
+)
+from .mask import MaskType, mask_visible_k_length, rows_have_distinct_kv_prefix
 from .query import (
     flat_query_row_state,
     query_batch_bounds,
@@ -201,7 +206,7 @@ def runtime_base_seq_len_kv(cfg: MlaConfig, cache_seqs, batch_idx):
 
 
 @cute.jit
-def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
+def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx, cp_rank=0):
     """Return whether a batch row publishes O / LSE (and split scratch).
 
     An empty request (zero KV length) publishes nothing, which preserves its
@@ -210,7 +215,9 @@ def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
     """
     if cutlass.const_expr(cfg.sparse_d576_reload):
         return cutlass.Boolean(True)
-    return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
+    return local_kv_length(
+        cfg, runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx), cp_rank
+    ) > Int32(0)
 
 
 @cute.jit
@@ -220,29 +227,26 @@ def runtime_seq_len_kv_for_logical_q(
     batch_idx,
     logical_q_idx,
     cu_seqlens_q=None,
-    kv_bounds=None,
+    cp_rank=0,
 ):
     """Return the mask-visible KV length for one logical Q row.
 
     Dense decode exposes the full runtime cache. Bottom-right causal decode
     removes the speculative K positions following ``logical_q_idx``.
-    Explicit bounds replace either policy with a per-query prefix count.
+    Global logical prefixes are mapped to this context-parallel rank.
     """
-    if cutlass.const_expr(kv_bounds is not None):
-        return query_kv_bound(
-            kv_bounds, cu_seqlens_q, batch_idx, logical_q_idx, cfg.logical_seq_len_q
-        )
     _, logical_seq_len_q = query_batch_bounds(
         cu_seqlens_q,
         batch_idx,
         cfg.logical_seq_len_q,
     )
-    return mask_visible_k_length(
+    global_bound = mask_visible_k_length(
         cfg.mask_type,
         runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx),
         logical_q_idx,
         logical_seq_len_q,
     )
+    return local_kv_length(cfg, global_bound, cp_rank)
 
 
 @cute.jit
@@ -252,17 +256,17 @@ def runtime_seq_len_kv_for_q(
     batch_idx,
     cta_idx_q,
     cu_seqlens_q=None,
+    cp_rank=0,
 ):
     """Return the KV domain shared by flat query rows in a CTA.
 
-    The last physical row has the largest causal domain. Explicit per-query
-    bounds instead retain the full raw cache domain. Softmax applies each
+    The last physical row has the largest causal domain. Softmax applies each
     row's remaining prefix mask within this shared producer/reducer domain.
     """
-    if cutlass.const_expr(cfg.use_kv_bounds or cfg.mask_type == MaskType.DENSE.value):
-        # Explicit bounds replace causality. The raw cache domain conservatively
-        # covers every row's prefix and is shared with split reduction.
-        return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx)
+    if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
+        return local_kv_length(
+            cfg, runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx), cp_rank
+        )
     _, _, logical_q_idx, _, _ = flat_query_row_state(
         Int32(cfg.tile_size_q - 1),
         cta_idx_q,
@@ -278,6 +282,7 @@ def runtime_seq_len_kv_for_q(
         batch_idx,
         logical_q_idx,
         cu_seqlens_q,
+        cp_rank,
     )
 
 
@@ -312,6 +317,7 @@ def runtime_split_tile_is_active(
     cta_idx_q,
     cta_idx_kv,
     requested_splits=None,
+    cp_rank=0,
 ):
     """Return whether a configured split rank owns runtime KV work."""
 
@@ -323,6 +329,7 @@ def runtime_split_tile_is_active(
         batch_idx,
         cta_idx_q,
         cu_seqlens_q,
+        cp_rank,
     )
     total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
     local_kv_tiles = runtime_local_kv_tiles(
@@ -345,6 +352,7 @@ def runtime_work_tile_activity(
     cta_idx_q,
     cta_idx_kv,
     requested_splits=None,
+    cp_rank=0,
 ):
     """Return the independent runtime Q and split-KV activity predicates."""
 
@@ -362,9 +370,10 @@ def runtime_work_tile_activity(
         cta_idx_q,
         cta_idx_kv,
         requested_splits=requested_splits,
+        cp_rank=cp_rank,
     )
     query_is_active = query_is_active & (
-        runtime_request_publishes(cfg, cache_seqs, batch_idx)
+        runtime_request_publishes(cfg, cache_seqs, batch_idx, cp_rank)
     )
     return query_is_active, split_is_active
 
@@ -378,6 +387,7 @@ def runtime_work_tile_is_active(
     cta_idx_q,
     cta_idx_kv,
     requested_splits=None,
+    cp_rank=0,
 ):
     """Return whether a Q/split work tile owns any runtime data."""
 
@@ -389,6 +399,7 @@ def runtime_work_tile_is_active(
         cta_idx_q,
         cta_idx_kv,
         requested_splits=requested_splits,
+        cp_rank=cp_rank,
     )
     return query_is_active and split_is_active
 
@@ -401,7 +412,7 @@ def runtime_seq_len_kv_for_query_row(
     cta_idx_q,
     row_in_tile,
     cu_seqlens_q=None,
-    kv_bounds=None,
+    cp_rank=0,
 ):
     """Return the KV length visible to one physical flat-query row."""
     _, _, logical_q_idx, _, _ = flat_query_row_state(
@@ -419,7 +430,56 @@ def runtime_seq_len_kv_for_query_row(
         batch_idx,
         logical_q_idx,
         cu_seqlens_q,
-        kv_bounds,
+        cp_rank,
+    )
+
+
+def cta_rows_have_distinct_kv_prefix(cfg: MlaConfig) -> bool:
+    """Return whether query rows of one 1CTA tile can see different K prefixes."""
+    return rows_have_distinct_kv_prefix(
+        cfg.mask_type, not cfg.fixed_seqlen, cfg.logical_seq_len_q
+    )
+
+
+@cute.jit
+def cta_visible_kv_end(
+    cfg: MlaConfig,
+    cache_seqs,
+    batch_idx,
+    cta_idx_q,
+    cu_seqlens_q=None,
+    cp_rank=0,
+):
+    """Return the keys ``[0, end)`` visible to every query row of one 1CTA tile.
+
+    Computed once per work tile (``MlaDecodeTask.get_domain``) for tiles whose
+    rows see different prefixes. Bottom-right causal prefixes, and their
+    rank-local counts under context parallelism, are nondecreasing in the flat
+    query row, so the tile's first row has the shortest prefix.
+    """
+    return runtime_seq_len_kv_for_query_row(
+        cfg,
+        cache_seqs,
+        batch_idx,
+        cta_idx_q,
+        Int32(0),
+        cu_seqlens_q,
+        cp_rank,
+    )
+
+
+@cute.jit
+def kv_tile_needs_mask(cfg: MlaConfig, task_cache, tile_offset_k, seq_len_kv):
+    """Return whether the K tile at ``tile_offset_k`` reaches past a visible key.
+
+    Rows with distinct prefixes test the work tile's cached common prefix
+    (``_TASK_CACHE_KV_VISIBLE_END``); otherwise every row sees ``seq_len_kv``.
+    """
+    visible_k_end = seq_len_kv
+    if cutlass.const_expr(cta_rows_have_distinct_kv_prefix(cfg)):
+        visible_k_end = Int32(task_cache[_TASK_CACHE_KV_VISIBLE_END])
+    return kv_tile_needs_right_mask(
+        tile_offset_k, Int32(cfg.tile_size_kv), visible_k_end
     )
 
 
@@ -430,11 +490,12 @@ def runtime_seq_len_kv_from_task_cache(
     cta_idx_q,
     cu_seqlens_q=None,
     batch_idx=None,
+    cp_rank=0,
 ):
     """Return the CTA-visible KV domain from the task-cached raw length."""
     seq_len_kv = Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV])
-    if cutlass.const_expr(cfg.use_kv_bounds or cfg.mask_type == MaskType.DENSE.value):
-        return seq_len_kv
+    if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
+        return local_kv_length(cfg, seq_len_kv, cp_rank)
     _, logical_seq_len_q = query_batch_bounds(
         cu_seqlens_q,
         batch_idx,
@@ -449,12 +510,13 @@ def runtime_seq_len_kv_from_task_cache(
         cu_seqlens_q,
         batch_idx,
     )
-    return mask_visible_k_length(
+    global_bound = mask_visible_k_length(
         cfg.mask_type,
         seq_len_kv,
         logical_q_idx,
         logical_seq_len_q,
     )
+    return local_kv_length(cfg, global_bound, cp_rank)
 
 
 @cute.jit

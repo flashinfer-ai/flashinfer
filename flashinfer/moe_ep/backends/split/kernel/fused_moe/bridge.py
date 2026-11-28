@@ -136,6 +136,7 @@ def build_activation_pack(
     hidden_size: Optional[int] = None,
     recv_count: Optional[torch.Tensor] = None,
     num_experts: Optional[int] = None,
+    recv_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -194,6 +195,7 @@ def build_activation_pack(
         global_scale=global_scale,
         mxfp8_dispatch=mxfp8_dispatch,
         hidden_size=hidden_size,
+        flat_scale=recv_scale.reshape(m, -1) if recv_scale is not None else None,
     )
 
 
@@ -431,7 +433,7 @@ def _view_dispatched_activations(
 
     weight, activation = quant.pair
     values = values.view(torch.uint8)
-    scales = scales.view(torch.uint8)
+    scales = scales.view(torch.uint8).reshape(values.shape[0], -1)
     if activation is QuantFormat.DeepSeekFp8:
         # Runners take the 1x128 block scales transposed, as [hidden // 128, M].
         values = values.reshape(-1, values.shape[-1])

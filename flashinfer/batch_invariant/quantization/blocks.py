@@ -19,6 +19,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import canon
 from .cvt_fp8 import cvt_f32x2_to_fp8x2  # noqa: F401  (re-exported: the e4m3 / e5m2 pair conversion)
+from .cvt_fp8 import cvt_f32x8_to_e2m1x8  # noqa: F401  (re-exported: the MX / NVFP4 e2m1 conversion)
 from .layout import SF_COL_TILE, SF_ROW_TILE, SF_ROW_TILE_8X4
 from .mx_spec import BLOCK, block_amax_placement, block_reduction, leaf_value
 
@@ -109,46 +110,7 @@ def cvt_f32_to_ue8m0(a: Float32, rnd: cutlass.Constexpr[str], *, loc=None, ip=No
     )
 
 
-@dsl_user_op
-def cvt_f32x8_to_e2m1x8(
-    v0: Float32,
-    v1: Float32,
-    v2: Float32,
-    v3: Float32,
-    v4: Float32,
-    v5: Float32,
-    v6: Float32,
-    v7: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    """Four ``cvt.rn.satfinite.e2m1x2.f32``: element ``2j`` in the low nibble of byte ``j``, the four bytes packed
-    little-endian into one 32-bit word (byte 0 = elements 0, 1). The one e2m1 conversion of the MXFP4 and the NVFP4
-    classes (the strings are pinned by the IR tests; the CPU model is ``exact.to_e2m1``)."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Float32(v).ir_value(loc=loc, ip=ip)
-                for v in (v0, v1, v2, v3, v4, v5, v6, v7)
-            ],
-            """
-        {
-            .reg .b8 b0, b1, b2, b3;
-            cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;
-            cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;
-            cvt.rn.satfinite.e2m1x2.f32 b2, $6, $5;
-            cvt.rn.satfinite.e2m1x2.f32 b3, $8, $7;
-            mov.b32 $0, {b0, b1, b2, b3};
-        }
-        """,
-            "=r,f,f,f,f,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
+# the e2m1 conversion lives in ``cvt_fp8.py`` (shared with the MoE epilogues that quantize the intermediate in place)
 
 
 def pack_block_codes(fp, ys, elem_fmt: str):

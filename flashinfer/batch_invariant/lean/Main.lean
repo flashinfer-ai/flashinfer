@@ -112,3 +112,10 @@ def main : IO Unit := do
     IO.println s!"gemmmxw48k64out {steps} {fmt} {(outputKfoldMXW48K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do
     IO.println s!"attn {name} {(Attn.output P).sexpr}"
+  for (name, P) in attnLseCases do
+    IO.println s!"attnlse2 {name} {Attn.lse2 P}"
+    IO.println s!"attnlseE {name} {Attn.lseE P}"
+  for (name, P) in attnSinkCases do
+    IO.println s!"attnsink {name} {(Attn.outputSink P).sexpr}"
+    IO.println s!"attnsinklse2 {name} {Attn.lse2Sink P}"
+    IO.println s!"attnsinklseE {name} {Attn.lseESink P}"

@@ -45,6 +45,7 @@ from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
+from ._q_token_kv_block_sparse_policy import membership_planes
 from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
 
 if TYPE_CHECKING:
@@ -72,6 +73,49 @@ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
 
 
+@functools.cache
+def _wide_metadata_smem_bytes(
+    group_size: int, max_seq_len_kv: int, sparse_block_size: int
+) -> int:
+    module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
+    return int(
+        module.wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    )
+
+
+def _validate_wide_metadata_fits(
+    group_size: int,
+    max_seq_len_kv: int,
+    sparse_block_size: int,
+    device_index: int,
+) -> None:
+    """Reject G16/G32 when their metadata map cannot fit the device's SMEM.
+
+    G9-G32 metadata keeps a map over the model's whole block prefix
+    (``max_seq_len_kv / sparse_block_size`` blocks) in shared memory; there is
+    no bounded fallback, so the check runs before any launch.
+    """
+    if group_size <= 8:
+        return
+    needed = _wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    available = torch.cuda.get_device_properties(
+        device_index
+    ).shared_memory_per_block_optin
+    if needed < 0 or needed > available:
+        raise ValueError(
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} keeps a "
+            f"metadata map of max_seq_len_kv={max_seq_len_kv} / "
+            f"kv_block_size={sparse_block_size} blocks in shared memory, which "
+            + (
+                "exceeds the map's size limit"
+                if needed < 0
+                else f"needs {needed} bytes"
+            )
+            + f" (device limit {available}); use group_size <= 8, a larger "
+            "kv_block_size or a smaller max_seq_len_kv"
+        )
+
+
 @dataclass(frozen=True)
 class _PrimsTSQTokenKvBlockSparseWorkspaceViews:
     """Typed views bound to one caller-owned QToken-KvBlock-Sparse-Attention attention workspace."""
@@ -80,6 +124,7 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceViews:
     q_token_kv_block_sparse_page_memberships: torch.Tensor
     seq_lens: torch.Tensor
     attention_workspace_buffer: torch.Tensor
+    route_order: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +235,7 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     q_token_kv_block_sparse_page_memberships_bytes: int
     seq_lens_byte_offset: int
     seq_lens_bytes: int
+    route_order_bytes: int
     attention_workspace_byte_offset: int
     attention_scratch_bytes: int
     uses_split_kv: bool
@@ -224,6 +270,15 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
         seq_lens = workspace_bytes[
             self.seq_lens_byte_offset : self.seq_lens_byte_offset + self.seq_lens_bytes
         ].view(torch.int32)
+        route_order_byte_offset = self.seq_lens_byte_offset + self.seq_lens_bytes
+        route_order = (
+            workspace_bytes[
+                route_order_byte_offset : route_order_byte_offset
+                + self.route_order_bytes
+            ].view(torch.int32)
+            if self.route_order_bytes
+            else None
+        )
         attention_workspace_buffer = workspace_bytes[
             self.attention_workspace_byte_offset : self.attention_workspace_byte_offset
             + self.attention_scratch_bytes
@@ -233,6 +288,7 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
             q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             seq_lens=seq_lens,
             attention_workspace_buffer=attention_workspace_buffer,
+            route_order=route_order,
         )
 
 
@@ -254,6 +310,12 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     locator_head_multiplier: int = 1
     count_current_block_in_topk: bool = True
     fixed_query_len: int = 0
+    # Longest-first route order for persistent attention, and the plan-owned
+    # completion counter the metadata grid rearms after each launch.
+    route_order: Optional[torch.Tensor] = None
+    route_order_counter: Optional[torch.Tensor] = None
+    # Shortest routes reordered at the end (0: all routes, longest first).
+    route_order_tail: int = 0
 
     def run(
         self,
@@ -282,6 +344,9 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.locator_head_multiplier,
                 self.count_current_block_in_topk,
                 self.fixed_query_len,
+                self.route_order,
+                self.route_order_counter,
+                self.route_order_tail,
             )
         else:
             self.metadata_run(
@@ -453,6 +518,7 @@ class _QTokenKvBlockSparsePlanConfig:
     split_kv: bool
     share_pattern_across_kv_heads: bool
     count_current_block_in_topk: bool
+    balanced_scheduler: Optional[bool]
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     out_dtype: torch.dtype
@@ -522,6 +588,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         split_kv: bool = True,
         share_pattern_across_kv_heads: bool = True,
         count_current_block_in_topk: bool = True,
+        balanced_scheduler: Optional[bool] = None,
         mask_type: Literal["causal"] = "causal",
         q_dtype: torch.dtype = torch.float16,
         kv_dtype: Optional[torch.dtype] = None,
@@ -559,6 +626,20 @@ class QTokenKvBlockSparsePagedTSWrapper:
         one KV partition and omits split scratch. Pass False for prefill and
         True for decode, independently of ``packed_query``. Workspace sizing
         must use the same value. Change it only by replanning outside capture.
+
+        ``balanced_scheduler`` controls longest-first scheduling of grouped
+        packed routes on the persistent (CLC) scheduler: the metadata kernel
+        orders routes by their K/V union and SMs take the longest first, so
+        long routes do not extend the last wave. ``None`` (default) enables it
+        when the routes span more than one wave of SMs and can read more than
+        one KV128 tile (``max_seq_len_kv`` > 128); routes of up to four tiles
+        (``max_seq_len_kv`` <= 512) also need three or more waves. True
+        enables it on every persistent launch; False keeps route order. Launches without the
+        persistent scheduler (split-KV, single-wave static grids) ignore it.
+        Routes are ranked by whole KV128 tiles of their union; routes of 127
+        or more tiles (16K+ tokens) share the longest rank, so their order
+        among themselves, and which of them fall into a reordered final-wave
+        tail, is arbitrary.
 
         ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
         FP32 tensors of shape () or (1,). They establish the compiled argument kinds
@@ -645,6 +726,8 @@ class QTokenKvBlockSparsePagedTSWrapper:
                     "QToken-KvBlock-Sparse-Attention planning is unsupported during "
                     "CUDA Graph capture"
                 )
+        if balanced_scheduler is not None and not isinstance(balanced_scheduler, bool):
+            raise TypeError("balanced_scheduler must be None or a bool")
         candidate = _QTokenKvBlockSparsePlanConfig(
             batch_size=batch_size,
             group_size=group_size,
@@ -661,6 +744,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             split_kv=split_kv,
             share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             count_current_block_in_topk=count_current_block_in_topk,
+            balanced_scheduler=balanced_scheduler,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             out_dtype=out_dtype,
@@ -715,6 +799,34 @@ class QTokenKvBlockSparsePagedTSWrapper:
         Q's dtype selects the MMA: BF16 Q runs exact BF16 operands (E2M1 x E4M3
         products are exact in BF16), FP8 Q runs FP8 MMA on K/V rounded to E4M3.
         The output is BF16 either way.
+
+        The kernel transforms NVFP4 K/V once per KV tile of every route that
+        loads it. Grouped routes overlap, so long packed query batches
+        transform each selected token many times (about 90 times at 4K queries
+        over a 64K context). With BF16 Q, a framework can instead convert each
+        request's visible NVFP4 pages to a BF16 paged cache once per call and
+        run this wrapper with BF16 K/V (``kv_dtype=torch.bfloat16`` and that
+        cache's block table). Results are unchanged, since E2M1 x E4M3 products
+        are exact in BF16. This does not apply to FP8 Q, which rounds K/V to
+        E4M3 and requires FP8 K/V otherwise. It needs no Prims-TS support; the
+        trade-off is:
+
+        - It pays only with TileQ128 groups (``group_size * Hq / Hkv > 64``,
+          e.g. G32 for 4 Q heads per KV head, G16 for 8), whose transform is
+          on the critical path, and with many queries. On GB300 (D256, top-k
+          512 blocks of 4 tokens, 0-64K prefixes) it measured 1.02-1.37x faster
+          than the best NVFP4 launch for 1K-4K packed queries (more with more
+          queries and longer prefixes), 0.84-1.11x at 512, and 0.63-1.0x
+          (never faster) at 128-256.
+        - Its cost grows with visible tokens x KV heads, not with the queries
+          (about 26 us for 64K tokens x 2 KV heads, near HBM bandwidth), and
+          the BF16 copy takes about 3.6x the NVFP4 cache's memory. Overlap it
+          with independent work (e.g. the indexer's top-k) and skip it for long
+          contexts, where it can cost more than it saves (not measured past
+          64K).
+        - Converting only the blocks the indexer selected did not pay: marking
+          them costs more than it saves, and long query batches select half or
+          more of the visible blocks anyway.
 
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
@@ -1005,6 +1117,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         count_current_block_in_topk=config.count_current_block_in_topk,
                         fixed_query_len=fixed_query_len,
                         kv_scale_factors=kv_scale_factors,
+                        balanced_scheduler=config.balanced_scheduler,
                     )
                     self._prepared_key = prepared_key
         assert self._prepared_plan is not None
@@ -1095,8 +1208,12 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     return (groups, page_capacity), (groups, membership_words), (groups,)
 
@@ -1202,6 +1319,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, device_index
+    )
     spec = _resolve_decode_launch_spec(
         device_index,
         groups,
@@ -1236,8 +1356,12 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     q_token_kv_block_sparse_page_indices_shape = (metadata_rows, page_capacity)
     q_token_kv_block_sparse_page_indices_bytes = metadata_rows * page_capacity * 4
@@ -1265,8 +1389,21 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     attention_scratch_bytes = attention_layout.total_bytes
     uses_split_kv = attention_layout.uses_split_kv
+    # Persistent grouped launches that share one pattern across KV heads take
+    # routes longest first: the metadata writes their order right after
+    # seq_lens, where the attention work queue reads it (seq_lens + routes).
+    # Split-KV and static grids, and per-head patterns (even with one KV
+    # head), read none; the same config properties gate the planner.
+    route_order_bytes = (
+        metadata_rows * 4
+        if packed_query
+        and group_size > 1
+        and spec.config.shares_sparse_pattern
+        and spec.config.use_persistent_scheduler
+        else 0
+    )
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
-        seq_lens_byte_offset + seq_lens_bytes
+        seq_lens_byte_offset + seq_lens_bytes + route_order_bytes
     )
     return _PrimsTSQTokenKvBlockSparseWorkspaceLayout(
         q_token_kv_block_sparse_page_indices_shape=q_token_kv_block_sparse_page_indices_shape,
@@ -1276,6 +1413,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         q_token_kv_block_sparse_page_memberships_bytes=q_token_kv_block_sparse_page_memberships_bytes,
         seq_lens_byte_offset=seq_lens_byte_offset,
         seq_lens_bytes=seq_lens_bytes,
+        route_order_bytes=route_order_bytes,
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
         uses_split_kv=uses_split_kv,
@@ -1591,6 +1729,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     if groups == 0:
         return outputs
 
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, block_indices.device.index
+    )
     enable_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     release_attention_pdl = enable_pdl and release_attention_pdl
@@ -1611,6 +1752,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             release_attention_pdl,
             1,
             count_current_block_in_topk,
+            0,
+            None,
+            None,
             0,
         )
     else:
@@ -1825,6 +1969,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     count_current_block_in_topk: bool = True,
     fixed_query_len: int = 0,
     kv_scale_factors: Optional[PagedKVScaleFactors] = None,
+    balanced_scheduler: Optional[bool] = None,
 ) -> _PrimsTSQTokenKvBlockSparsePlan:
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
@@ -2033,6 +2178,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         allow_head_aware_locators=group_size > 1,
         softmax_scale=scale_qk,
         output_scale=scale_v,
+        balanced_scheduler=balanced_scheduler,
     )
     # Preparation only binds shapes and storage; attention does not read these
     # outputs until metadata runs. Use its resolved format for the producer.
@@ -2054,6 +2200,39 @@ def _prepare_q_token_kv_block_sparse_attention(
         count_current_block_in_topk=count_current_block_in_topk,
         fixed_query_len=fixed_query_len,
     )
+    if attention_plan._uses_route_order:
+        if views.route_order is None:
+            raise AssertionError("persistent grouped routes need a route-order region")
+        # When the requests' K/V fits in half of L2, every route is ordered
+        # longest first. Beyond that, only the last two SM waves are reordered:
+        # the others keep index order, so routes running at the same time stay
+        # close in their request and keep reusing its K/V in L2.
+        properties = torch.cuda.get_device_properties(query.device)
+        # Bytes per token over all KV heads: K/V (with their rows' scales when
+        # interleaved) plus separate NVFP4 scale tensors; pages lead each.
+        kv_bytes = (
+            int(block_table.shape[0])
+            * max_seq_len_kv
+            * sum(
+                tensor[0].numel() * tensor.element_size()
+                for tensor in (k_cache, v_cache, *(kv_scale_factors or ()))
+            )
+            // int(k_cache.shape[2])
+        )
+        route_order_tail = (
+            0
+            if 2 * kv_bytes <= properties.L2_cache_size
+            else 2 * properties.multi_processor_count
+        )
+        # The counter is plan-owned so that no other plan sharing the workspace
+        # can disturb it; it is zero between launches (the last metadata CTA
+        # rearms it).
+        metadata_plan = replace(
+            metadata_plan,
+            route_order=views.route_order,
+            route_order_counter=torch.zeros(1, dtype=torch.int32, device=query.device),
+            route_order_tail=route_order_tail,
+        )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
         _bmm1_scale=scale_qk,
