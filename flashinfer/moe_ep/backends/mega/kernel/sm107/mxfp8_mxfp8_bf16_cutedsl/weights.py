@@ -3,7 +3,8 @@
 Kernel weight layout (see the drop's ``generate_inputs`` contract):
 
 - FC1: logical ``(E, hidden, 2*intermediate)`` with hidden stride-1 and the N
-  axis in 16-row gate/up pair stripes; flat atom-swizzled E8M0 SF plane of
+  axis in 16-row gate/up pair stripes (nongated activations use I rows,
+  without stripes); flat atom-swizzled E8M0 SF plane of
   ``round_up(2*intermediate, 128) * round_up(hidden/32, 4)`` per expert.
 - FC2: logical ``(E, intermediate, hidden)`` with intermediate stride-1; flat
   SF plane of ``round_up(hidden, 128) * round_up(intermediate/32, 4)``.
@@ -15,11 +16,11 @@ from typing import TYPE_CHECKING, Tuple
 
 from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
-from ..validation import validate_weight_layout
 from ...weight_validation import (
     check_transformed_mega_weights_structure,
     check_transformed_weight_pair,
 )
+from ..validation import validate_weight_layout
 from .config import Sm107Mxfp8Kind
 
 if TYPE_CHECKING:
@@ -52,8 +53,15 @@ def preprocess_mega_weights(
     intermediate_size: int,
     hidden_size: int,
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3",
+    activation: str = "swiglu",
 ) -> TransformedMegaWeights:
     """Canonical BF16 or prequantized MXFP8 weights -> SM107 kernel layout."""
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
+        fc1_rows_per_intermediate,
+    )
+
+    fc1_rows = fc1_rows_per_intermediate(activation)
+    gated = fc1_rows == 2
     if isinstance(weights, PrequantizedMoEWeights):
         from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             preprocess_prequantized_block_scaled_weights,
@@ -67,6 +75,7 @@ def preprocess_mega_weights(
             quant_kind=kind,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            gated=gated,
         )
 
     from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
@@ -77,7 +86,7 @@ def preprocess_mega_weights(
     if w13.ndim != 3 or w2.ndim != 3:
         raise MoEEpConfigError("canonical w13 and w2 must both be 3D tensors")
     num_local_experts = w13.shape[0]
-    fc1_out = 2 * intermediate_size
+    fc1_out = fc1_rows_per_intermediate(activation) * intermediate_size
     if tuple(w13.shape) != (num_local_experts, fc1_out, hidden_size):
         raise MoEEpConfigError(
             f"w13 shape {tuple(w13.shape)} != "
@@ -91,7 +100,7 @@ def preprocess_mega_weights(
 
     _data_dtype(kind)
     return preprocess_block_scaled_weights(
-        w13, w2, quant_kind=kind, intermediate_size=intermediate_size
+        w13, w2, quant_kind=kind, intermediate_size=intermediate_size, gated=gated
     )
 
 
@@ -103,6 +112,7 @@ def validate_transformed_mega_weights(
     kind: Sm107Mxfp8Kind,
     world_size: int,
     num_experts: int,
+    activation: str = "swiglu",
 ) -> None:
     """Structure/shape/dtype checks for user-supplied transformed weights."""
     import torch
@@ -111,10 +121,13 @@ def validate_transformed_mega_weights(
         Mxfp8BlockSize,
         swizzled_flat_sf_size,
     )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
+        fc1_rows_per_intermediate,
+    )
 
     check_transformed_mega_weights_structure(transformed)
     num_local_experts = num_experts // world_size
-    fc1_out = 2 * intermediate_size
+    fc1_out = fc1_rows_per_intermediate(activation) * intermediate_size
     check_transformed_weight_pair(
         transformed[0],
         label="fc1",

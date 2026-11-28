@@ -2,15 +2,14 @@
 
 import ast
 import hashlib
-from importlib import metadata
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from importlib import metadata
+from pathlib import Path
 
 import pytest
-
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "flashinfer"
 if not _PACKAGE_ROOT.is_dir():
