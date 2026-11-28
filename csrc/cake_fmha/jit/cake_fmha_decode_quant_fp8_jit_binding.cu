@@ -205,22 +205,18 @@ CUtensorMap EncodeTmaQuery(TensorView tensor, void* data,
 CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 4)
       << name << " must be rank-4 HND paged KV";
-  TVM_FFI_ICHECK_EQ(tensor.dtype(),
 #if CAKE_FMHA_NVFP4
-                    dl_uint8
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_uint8);
 #else
-                    dl_float8_e4m3fn
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
 #endif
-  );
   TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_KV_HEADS);
   TVM_FFI_ICHECK_EQ(tensor.size(2), CAKE_FMHA_PAGE_SIZE);
-  TVM_FFI_ICHECK_EQ(tensor.size(3),
 #if CAKE_FMHA_NVFP4
-                    kHeadDim / 2
+  TVM_FFI_ICHECK_EQ(tensor.size(3), kHeadDim / 2);
 #else
-                    kHeadDim
+  TVM_FFI_ICHECK_EQ(tensor.size(3), kHeadDim);
 #endif
-  );
   TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
   TVM_FFI_ICHECK_GT(tensor.stride(0), 0);
   TVM_FFI_ICHECK_GT(tensor.stride(1), 0);
@@ -418,13 +414,11 @@ void cake_paged_attention_decode(
     bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens) {
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
-  TVM_FFI_ICHECK_EQ(key_cache.dtype(),
 #if CAKE_FMHA_NVFP4
-                    dl_uint8
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_uint8);
 #else
-                    dl_float8_e4m3fn
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
 #endif
-  );
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), key_cache.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK_EQ(query.ndim(), 3);
