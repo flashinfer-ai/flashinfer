@@ -225,35 +225,42 @@ def _worker(rank, store, use_graph):
 def test_cupti_fallback_is_collective(tmp_path, use_graph):
     """A rank-local tracing failure changes timers for the whole tuning subgroup."""
     processes = []
+    # The ranks are waited for one at a time, so the workers write to files: a
+    # rank whose unread output fills its pipe buffer would stall the whole group.
+    logs = [tmp_path / f"rank{rank}.log" for rank in range(3)]
     deadline = time.monotonic() + 120
+    timed_out = False
     try:
         for rank in range(3):
-            processes.append(
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        str(rank),
-                        str(tmp_path / "store"),
-                        str(int(use_graph)),
-                    ],
-                    env={**os.environ, "TORCH_DISTRIBUTED_DEBUG": "DETAIL"},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
+            with open(logs[rank], "w") as log:
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            str(Path(__file__).resolve()),
+                            str(rank),
+                            str(tmp_path / "store"),
+                            str(int(use_graph)),
+                        ],
+                        env={**os.environ, "TORCH_DISTRIBUTED_DEBUG": "DETAIL"},
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
                 )
-            )
-        outputs = []
-        for rank, process in enumerate(processes):
-            output, _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
-            outputs.append(f"rank {rank}:\n{output}")
-        assert all(process.returncode == 0 for process in processes), "\n".join(outputs)
+        for process in processes:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        timed_out = True
     finally:
         for process in processes:
             if process.poll() is None:
                 process.kill()
         for process in processes:
-            process.communicate()
+            process.wait()
+    texts = [log.read_text(errors="replace") for log in logs]
+    outputs = "\n".join(f"rank {rank}:\n{text}" for rank, text in enumerate(texts))
+    assert not timed_out, f"workers exceeded the 120 s deadline\n{outputs}"
+    assert all(process.returncode == 0 for process in processes), outputs
 
 
 if __name__ == "__main__":
