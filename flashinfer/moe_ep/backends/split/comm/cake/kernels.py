@@ -311,8 +311,9 @@ def combine(
     ``float8_e4m3fn`` or packed FP4 ``uint8``. Quantized outputs write their
     block scales to the contiguous ``output_scales``: UE8M0 ``uint8`` scales
     per 32 elements for MXFP8 / MXFP4, UE4M3 ``float8_e4m3fn`` scales per 16
-    for NVFP4, laid out by ``sf_layout`` including its padding. NVFP4 applies
-    ``output_scalar_scale`` before block scaling. ``use_low_precision``
+    for NVFP4, laid out by ``sf_layout`` including its padding. A quantized
+    row holds whole scale blocks, and its ``output`` is 16-byte aligned. NVFP4
+    applies ``output_scalar_scale`` before block scaling. ``use_low_precision``
     transfers the payload as FP8 (e4m3) and accumulates into a bfloat16
     result. ``output``, a contiguous CUDA tensor of the result's shape and
     dtype, receives the result in place.

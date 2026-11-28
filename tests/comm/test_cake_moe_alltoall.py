@@ -183,6 +183,8 @@ def _compute_sf_size(
         ("dtype", "Tensor type"),
         ("packed_dtype", "packed fp4"),
         ("extent", "extent"),
+        ("misaligned", "16-byte aligned"),
+        ("partial_block", "multiple of 32"),
     ],
 )
 @pytest.mark.skipif(
@@ -191,7 +193,8 @@ def _compute_sf_size(
 )
 def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
     num_tokens = 8
-    hidden_size = 64
+    # The quantizers take whole 32-element MXFP8 blocks.
+    hidden_size = 48 if invalid_kind == "partial_block" else 64
     payload = make_payload(num_tokens, hidden_size, torch.bfloat16)
     routes = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
     received, workspaces, metainfo, combine_offsets = dispatch_from_single_rank(
@@ -223,6 +226,10 @@ def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
     elif invalid_kind == "extent":
         output_scales = torch.empty(scale_extent + 1, dtype=torch.uint8, device="cuda")
     output = torch.empty((num_tokens, output_width), dtype=output_dtype, device="cuda")
+    if invalid_kind == "misaligned":
+        output = torch.empty(
+            num_tokens * output_width + 1, dtype=output_dtype, device="cuda"
+        )[1:].view(num_tokens, output_width)
     with pytest.raises(Exception, match=error_match):
         cake_kernels.combine(
             combine_payload,

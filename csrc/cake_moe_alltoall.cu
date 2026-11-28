@@ -506,6 +506,14 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
           << "Quantization not supported for output dtype: " << output.dtype();
     }
 
+    // The quantizers read and write whole 16-element chunks of a scale block with vector
+    // accesses, so a row holds whole blocks and the output is 16-byte aligned.
+    int64_t const blockSize = params.quant_mode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
+    TVM_FFI_ICHECK_EQ(elementsPerToken % blockSize, 0)
+        << "quantized moe_a2a_combine needs a hidden size that is a multiple of " << blockSize;
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(output.data_ptr()) % 16, 0)
+        << "quantized moe_a2a_combine output must be 16-byte aligned";
+
     TVM_FFI_ICHECK(sfLayout >= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4) &&
                    sfLayout <= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::LINEAR))
         << "sf_layout must be layout_128x4, layout_8x4, or layout_linear";
