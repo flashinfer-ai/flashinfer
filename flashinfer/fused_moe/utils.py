@@ -286,7 +286,7 @@ def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
     if x >= max_num_tokens:
         return max_num_tokens
     if x <= _PHASE1_END:
-        return next_positive_power_of_2(x)
+        return min(next_positive_power_of_2(x), max_num_tokens)
     if x <= _PHASE2_END:
         return min(_ceil_to_step(x, _PHASE2_STEP), max_num_tokens)
     if x <= _PHASE3_END:
