@@ -25,18 +25,21 @@ import pytest
 import torch
 
 from flashinfer import RoutingMethodType, fp4_quantize
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
+    populate_trtllm_moe_routing_metadata_,
     split_fp4_moe_weights_by_locality_domain,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_moe_routing_tile_n,
     trtllm_fp4_block_scale_routed_moe,
+    trtllm_moe_allocate_routing_metadata_multi_tile,
 )
 from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
 )
-from flashinfer.tllm_enums import ActivationType, SfLayout
+from flashinfer.tllm_enums import ActivationType, RoutingInputMode, SfLayout
 from flashinfer.utils import get_compute_capability
 
 _FP4_GLOBAL = 448.0 * 6.0
@@ -335,6 +338,228 @@ def test_localized_routed_and_cuda_graph_gpu():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(output.float(), eager)
+
+
+@pytest.mark.parametrize("tuned", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 64, 1024])
+def test_localized_routing_metadata_gpu(num_tokens, tuned):
+    _skip_unless_sm10x()
+    hidden_size, intermediate_size = 1024, 512
+    num_experts, top_k = 8, 2
+    problem = _make_problem(num_tokens, hidden_size, intermediate_size, num_experts)
+    cache = {}
+    w1, sf1, w2, sf2 = _shuffle(*problem["raw_weights"], cache)
+    streams, sm_count = _domain_streams(torch.cuda.current_device())
+    localized = dict(
+        localized_weights=_localized_shards(problem["raw_weights"], cache),
+        localized_streams=streams,
+        localized_sm_count=sm_count,
+    )
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(problem["routing_logits"].float(), -1), top_k
+    )
+    routing = (topk_ids.to(torch.int32), topk_weights.to(torch.bfloat16))
+
+    def call(**kwargs):
+        return trtllm_fp4_block_scale_routed_moe(
+            routing,
+            None,
+            problem["hidden_states"],
+            problem["hidden_states_scale"],
+            w1,
+            sf1,
+            None,
+            None,
+            None,
+            None,
+            w2,
+            sf2,
+            None,
+            problem["output1_scale_scalar"],
+            problem["output1_scale_gate_scalar"],
+            problem["output2_scale_scalar"],
+            num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            0,
+            num_experts,
+            None,
+            RoutingMethodType.TopK.value,
+            True,
+            None,
+            ActivationType.Swiglu.value,
+            hidden_states_scale_layout=SfLayout.layout_linear,
+            tune_max_num_tokens=num_tokens,
+            **kwargs,
+        )[0].float()
+
+    AutoTuner.get().clear_cache()
+    if tuned:
+        with autotune(True):
+            call(**localized)
+    stock = call()
+    want = call(**localized)
+
+    # Both domains run the expert GEMMs from the same caller-populated metadata.
+    tile_n = trtllm_fp4_block_scale_moe_routing_tile_n(
+        routing,
+        problem["hidden_states"],
+        problem["hidden_states_scale"],
+        w1,
+        sf1,
+        num_experts,
+        top_k,
+        intermediate_size,
+        num_experts,
+        tune_max_num_tokens=num_tokens,
+        hidden_states_scale_layout=SfLayout.layout_linear,
+        localized_sm_count=sm_count,
+    )
+    assert tile_n is not None
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        routing[0],
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        num_local_experts=num_experts,
+        tile_ns=(tile_n,),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        topk_weights=routing[1],
+    )
+    populate_trtllm_moe_routing_metadata_(metadata, *routing)
+    got = call(routing_metadata=metadata.slots[0], **localized)
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
+    assert _relative_error(got, stock) < 2e-2
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        populate_trtllm_moe_routing_metadata_(metadata, *routing)
+        captured = call(routing_metadata=metadata.slots[0], **localized)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, want)
+
+
+@pytest.mark.parametrize("num_tokens", [16, 128])
+def test_localized_routing_metadata_unfinalized_replay_gpu(num_tokens):
+    """Unfinalized expert outputs of an EP rank with a nonzero expert offset: a captured
+    populate + localized body follows routing that changes in place between replays."""
+    _skip_unless_sm10x()
+    hidden_size, intermediate_size = 1024, 512
+    num_experts, num_local, offset, top_k = 16, 8, 8, 4
+    problem = _make_problem(num_tokens, hidden_size, intermediate_size, num_local)
+    cache = {}
+    w1, sf1, w2, sf2 = _shuffle(*problem["raw_weights"], cache)
+    streams, sm_count = _domain_streams(torch.cuda.current_device())
+    localized = dict(
+        localized_weights=_localized_shards(problem["raw_weights"], cache),
+        localized_streams=streams,
+        localized_sm_count=sm_count,
+    )
+    # Static routing buffers that the graph reads; refilled in place before each replay.
+    topk_ids = torch.empty(num_tokens, top_k, dtype=torch.int32, device="cuda")
+    topk_weights = torch.empty(num_tokens, top_k, dtype=torch.bfloat16, device="cuda")
+    routing = (topk_ids, topk_weights)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def reroute():
+        ids = torch.stack(
+            [
+                torch.randperm(num_experts, device="cuda", generator=gen)[:top_k]
+                for _ in range(num_tokens)
+            ]
+        )
+        topk_ids.copy_(ids)
+        topk_weights.copy_(
+            torch.rand(num_tokens, top_k, device="cuda", generator=gen).softmax(-1)
+        )
+
+    def call(**kwargs):
+        out, _, permuted = trtllm_fp4_block_scale_routed_moe(
+            routing,
+            None,
+            problem["hidden_states"],
+            problem["hidden_states_scale"],
+            w1,
+            sf1,
+            None,
+            None,
+            None,
+            None,
+            w2,
+            sf2,
+            None,
+            problem["output1_scale_scalar"],
+            problem["output1_scale_gate_scalar"],
+            problem["output2_scale_scalar"],
+            num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            offset,
+            num_local,
+            None,
+            RoutingMethodType.TopK.value,
+            False,  # do_finalize: per-expert outputs, as SGLang's Muse Spark MoE runs
+            None,
+            ActivationType.Swiglu.value,
+            hidden_states_scale_layout=SfLayout.layout_linear,
+            tune_max_num_tokens=num_tokens,
+            **kwargs,
+        )[:3]
+        return out, permuted
+
+    def per_slot(out, permuted):
+        # Each (token, slot)'s expert output; slots routed to other ranks are zero.
+        idx = permuted.reshape(-1).long()
+        rows = out[idx.clamp(min=0)].float()
+        rows[idx < 0] = 0
+        return rows
+
+    AutoTuner.get().clear_cache()
+    reroute()
+    tile_n = trtllm_fp4_block_scale_moe_routing_tile_n(
+        routing,
+        problem["hidden_states"],
+        problem["hidden_states_scale"],
+        w1,
+        sf1,
+        num_experts,
+        top_k,
+        intermediate_size,
+        num_local,
+        do_finalize=False,
+        tune_max_num_tokens=num_tokens,
+        hidden_states_scale_layout=SfLayout.layout_linear,
+        localized_sm_count=sm_count,
+    )
+    assert tile_n is not None
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        topk_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        num_local_experts=num_local,
+        tile_ns=(tile_n,),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        topk_weights=topk_weights,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        populate_trtllm_moe_routing_metadata_(metadata, *routing)
+        captured = call(routing_metadata=metadata.slots[0], **localized)
+    for _ in range(3):
+        reroute()
+        graph.replay()
+        want = per_slot(*call(**localized))
+        torch.cuda.synchronize()
+        got = per_slot(*captured)
+        assert want.abs().sum() > 0
+        assert torch.equal(got, want)
 
 
 def test_localized_autotune_gpu():
