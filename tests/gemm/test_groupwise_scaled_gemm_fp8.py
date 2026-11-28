@@ -389,6 +389,118 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend)
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
+def _skip_unless_sm10x_cutlass():
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if compute_capability[0] != 10 or not gemm_fp8_nt_groupwise.is_backend_supported(
+        "cutlass", cc
+    ):
+        pytest.skip("Covers the SM10x cutlass gemm_fp8_nt_groupwise dispatch.")
+
+
+@pytest.mark.parametrize("m", [5, 17, 31, 33, 127, 130])
+@pytest.mark.parametrize("scale_granularity_m", [1, 128])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+def test_fp8_groupwise_gemm_sm10x_unaligned_m(m, scale_granularity_m, scale_major_mode):
+    # m <= 32 runs the swap-AB small-batch kernel; per-row MN-major scales with m > 32 are
+    # padded to a multiple of 4 in Python; block-scaled A (granularity 128) is never padded.
+    _skip_unless_sm10x_cutlass()
+    torch.random.manual_seed(0)
+    tile_size = 128
+    n, k = 256, 256
+    out_dtype = torch.bfloat16
+    # quantize_fp8 needs whole scale blocks: quantize a block-aligned A, then slice m rows.
+    m_alloc = math.ceil(m / scale_granularity_m) * scale_granularity_m
+    m_blocks = m_alloc // scale_granularity_m
+
+    a_val = torch.randn((m_alloc, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+    if scale_major_mode == "K":
+        a_scale_shape = (m_blocks, k // tile_size)
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (k // tile_size, m_blocks)
+        b_scale_shape = (k // tile_size, n // tile_size)
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, (scale_granularity_m, tile_size), scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, (tile_size, tile_size), scale_major_mode
+    )
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)[:m]
+
+    # Per-row scales already have m rows (m_alloc == m); block scales keep ceil(m / 128) blocks.
+    a_fp8 = a_fp8[:m]
+
+    out = torch.empty((m, n), dtype=out_dtype, device="cuda")
+    c = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        scale_granularity_mnk=(scale_granularity_m, tile_size, tile_size),
+        out=out,
+        backend="cutlass",
+    )
+    assert c.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("m", [20, 32])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+def test_fp8_groupwise_gemm_sm10x_small_batch_repeated(m, scale_major_mode):
+    # Regression for flashinfer-ai/flashinfer#4396: with K-major scales and 16 < m <= 32, the
+    # swap-AB small-batch kernel's scale-factor copy used to write past its pipeline stage and
+    # corrupt output rows 0..m-17. The rate grows with the number of K stages: about half or more
+    # of these launches on B200 at k=2048, none observed at k=256. The compile-time guard is the
+    # static_assert in CutlassGroupwiseScaledGEMMSM100LowLatency; this is the runtime check.
+    _skip_unless_sm10x_cutlass()
+    torch.random.manual_seed(0)
+    tile_size = 128
+    n, k = 512, 2048
+    out_dtype = torch.bfloat16
+
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+    if scale_major_mode == "K":
+        a_scale_shape = (m, k // tile_size)
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (k // tile_size, m)
+        b_scale_shape = (k // tile_size, n // tile_size)
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, (1, tile_size), scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, (tile_size, tile_size), scale_major_mode
+    )
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
+
+    num_launches = 512
+    outs = torch.empty((num_launches, m, n), dtype=out_dtype, device="cuda")
+    for i in range(num_launches):
+        gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            out=outs[i],
+            backend="cutlass",
+        )
+    bad = [
+        i
+        for i in range(num_launches)
+        if not torch.allclose(outs[i], ref_c, atol=1e-2, rtol=1e-2)
+    ]
+    assert not bad, f"{len(bad)}/{num_launches} launches mismatched, first {bad[:8]}"
+
+
 @pytest.mark.parametrize("m", [1, 4, 17, 31, 32, 33, 64, 65, 128, 129, 192, 193, 256])
 @pytest.mark.parametrize("n", [256, 4096, 16384])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
