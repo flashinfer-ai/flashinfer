@@ -301,7 +301,7 @@ __device__ __forceinline__ uint32_t bitrev16(uint32_t b) { return __brev(b) >> 1
 // Verified bitwise against HW (cvt.rs.satfinite.e4m3x4.f32 on sm_100a) across 22528
 // inputs spanning subnormal, normal, and saturation regions during the SR
 // reverse-engineering effort — see .plans/e4m3_stochastic_rounding.md.
-__device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
+static __device__ __noinline__ uint8_t cvt_rs_e4m3_cold_generic(float x, uint32_t rand16) {
   uint32_t bits = __float_as_uint(x);
   uint32_t sign = (bits >> 31) & 1u;
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
@@ -376,6 +376,24 @@ __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
     }
     return static_cast<uint8_t>((sign << 7) | (e4m3_exp << 3) | (int_part & 0x7u));
   }
+}
+
+__device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
+  uint32_t bits = __float_as_uint(x);
+  uint32_t sign = (bits >> 31) & 1u;
+  uint32_t abs_bits = bits & 0x7FFFFFFFu;
+  uint32_t f32_exp = (abs_bits >> 23) & 0xFFu;
+
+  // Exact normal-binade path. Original finite exponent E in [121,254].
+  // abs_bits + (rand16<<4) <= 0x7f8fffef: no uint32 overflow.
+  // The carry increments the biased exponent exactly as the generic loop.
+  if (f32_exp >= 121u && f32_exp < 255u) {
+    uint32_t const magnitude = ((abs_bits + ((rand16 & 0xFFFFu) << 4)) >> 20) - (120u << 3);
+    uint32_t const saturated = magnitude > 126u ? 126u : magnitude;
+    return static_cast<uint8_t>((sign << 7) | saturated);
+  }
+
+  return cvt_rs_e4m3_cold_generic(x, rand16);
 }
 
 // Stochastic rounding: convert four fp32 values to packed fp8x4 e4m3 using random bits.
@@ -462,10 +480,9 @@ __device__ __forceinline__ int8_t cvt_rs_sat_s8(float x, uint32_t rand_bits) {
 
 // Stochastic rounding: convert four fp32 values to packed s8x4 using a single
 // 32-bit random integer.  Analogous to cvt_rs_e4m3x4_f32: 16-bit chunks are
-// reused via bitrev16 so each output gets 16 bits of independent randomness
-// while consuming only one shared 16-bit chunk per pair (two bitrev16'd halves
-// of a uniform 16-bit value remain uniformly distributed and statistically
-// independent).
+// reused via bitrev16 so each output gets 16 uniformly distributed bits
+// while consuming only one shared 16-bit chunk per pair. Reversing bits
+// preserves each marginal distribution, but the paired values are correlated.
 //
 // 16-bit entropy per element is far more than int8 SR requires: the rounding
 // decision compares against a fractional residual with at most ~7 bits of

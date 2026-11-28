@@ -528,6 +528,8 @@ void checkpointing_ssu(
   if (rand_seed.has_value()) {
     auto const& rs = rand_seed.value();
     CHECK_CUDA(rs);
+    FLASHINFER_CHECK(rs.device().device_id == state.device().device_id,
+                     "rand_seed must be on the same device as state");
     FLASHINFER_CHECK(rs.numel() == 1, "rand_seed must be single-element, got numel=", rs.numel());
     FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
     p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());

@@ -161,12 +161,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
             pcfg.numAttrs = 1;
             FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
           };
-      static int const num_sms = [] {
-        int dev = 0, n = 0;
-        FLASHINFER_CUDA_CHECK(cudaGetDevice(&dev));
-        FLASHINFER_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
-        return n;
-      }();
+      int const num_sms = GetCudaMultiProcessorCount();
 
       // ── Head-tiling default: heads/CTA == warps/CTA (1 head/warp), coupled in
       // launch_precompute (PRECOMPUTE_NUM_WARPS = max(hc, 4)).  hc=8 (→ 8 warps) measured as
@@ -357,7 +352,12 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
         config.stream = stream;
         config.attrs = attrs;
         config.numAttrs = 1;
-        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params));
+#if defined(FLASHINFER_MAMBA_SR_SHARED_SEED) && FLASHINFER_MAMBA_SR_SHARED_SEED
+        constexpr bool shared_seed = true;
+#else
+        constexpr bool shared_seed = false;
+#endif
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params, shared_seed));
       } else {
         FLASHINFER_CHECK(false,
                          "checkpointing_ssu_kernel_8bit: unsupported D_SPLIT != 1 for 8-bit "
