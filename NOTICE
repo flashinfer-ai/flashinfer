@@ -46,3 +46,11 @@ and FlashInfer PR #4266 provenance. The fixed-order batched GEMM retains
 code derived from batch_invariant_ops, Copyright 2025 Thinking Machines Lab,
 under the MIT License (licenses/LICENSE.batch-invariant-ops.txt).
 Pinned sources and modifications: flashinfer/experimental/hc_sum_sm100/SOURCES.md.
+
+The RDMA MoE AlltoAll transport, its quantization
+helpers, and portions of their correctness references are adapted from DeepEP
+and subsequent SM120 transport adaptations. The adaptation starting-point
+fork revision is be2582ffe69b5e7d61c3bc9bf7a5316bc48261f9.
+Copyright (c) 2025 DeepSeek, under the MIT License (LICENSE.deepep.txt).
+Original project: https://github.com/deepseek-ai/DeepEP
+Source provenance and adaptation notes: include/flashinfer/comm/rdma_moe_alltoall/VENDOR.md
