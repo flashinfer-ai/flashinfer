@@ -22,4 +22,5 @@ Kernels for applying rotary embeddings.
     apply_rope_with_cos_sin_cache_inplace
     rope_quantize_fp8
     rope_quantize_fp8_append_paged_kv_cache
+    rope_append_paged_kv_cache
     mla_rope_quantize_fp8
