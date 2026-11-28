@@ -86,6 +86,15 @@ from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
     TransformedCakeMegaWeights,
     preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cake_mega_weights,
 )
+from .backends.mega.kernel.sm120.mxfp4_mxfp4_bf16_cake import (
+    Sm120_Mxfp4_Mxfp4_Bf16_Cake_MegaMoeConfig,
+)
+from .backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cake import (
+    Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig,
+    TransformedCakeNvfp4MegaWeights,
+    mxfp4_scales_to_nvfp4,
+    mxfp4_scales_to_nvfp4_shifted,
+)
 from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights,
@@ -345,11 +354,14 @@ __all__ = [
     "Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig",
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
+    "Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig",
+    "Sm120_Mxfp4_Mxfp4_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
     "NosyncOptions",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedCakeMegaWeights",
+    "TransformedCakeNvfp4MegaWeights",
     "TransformedCakeW8a8MegaWeights",
     "SplitConfig",
     "SplitKernelContext",
@@ -376,6 +388,8 @@ __all__ = [
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm103_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cake_mega_weights",
+    "mxfp4_scales_to_nvfp4",
+    "mxfp4_scales_to_nvfp4_shifted",
     "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",

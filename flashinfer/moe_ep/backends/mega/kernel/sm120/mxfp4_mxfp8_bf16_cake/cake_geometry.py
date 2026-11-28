@@ -17,7 +17,7 @@
 The device source ``cake_sm120_megamoe_kernel.cuh`` (``kernels/cake/mxfp4_megamoe_sm120/``)
 is one CUDA source with compile-time parameters (EP world size, global expert count, top-k,
 max rows per rank, hidden size, intermediate size, shared expert on/off, SwiGLU clamp,
-return-codec overflow capacity, LSA copier count).  Every
+return-codec overflow capacity, LSA copier count, activation family and parameters, return codec).  Every
 derived quantity the host needs — the structural switches that select code paths, the
 scratch and window extents, the dynamic shared memory, the kernel argument list and the
 kernel's own guards — is recorded by the generator in
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -80,6 +81,16 @@ class KernelParams:
     # Copier CTAs of the copier instances (one per LSA destination of a rank); the
     # copier-free instances ignore it.
     lsa_copiers: int = 1
+    # Activation family (0 SwiGLU, 1 SwiGLU with alpha / beta, 2 SiTU) and its parameters in
+    # 1/1000 units (P0: swiglu_alpha or situ_beta; P1: swiglu_beta or situ_linear_beta, 0 = unset).
+    activation: int = 0
+    act_p0: int = 0
+    act_p1: int = 0
+    # Wire format of the expert results: 0 lossless BF16 codec, 1 int8 + BF16 scale per 64 values.
+    return_codec: int = 0
+    # Activation codec: 0 MXFP8 (W4A8), 1 NVFP4 (W4A4: E2M1 + E4M3 per 16 values, both GEMMs FP4),
+    # 2 MXFP4 (W4A4: E2M1 + UE8M0 per 32 values, both GEMMs FP4, the W4A8 weights unchanged).
+    act_codec: int = 0
 
     @property
     def local_experts(self) -> int:
@@ -99,6 +110,11 @@ class KernelParams:
             self.swiglu_limit,
             self.codec_ovf_blocks,
             self.lsa_copiers,
+            self.activation,
+            self.act_p0,
+            self.act_p1,
+            self.return_codec,
+            self.act_codec,
         )
 
     def env(self) -> dict[str, int]:
@@ -112,7 +128,16 @@ class KernelParams:
             "MOE_SWIGLU_LIMIT": self.swiglu_limit,
             "MOE_CODEC_OVF_BLOCKS": self.codec_ovf_blocks,
             "MOE_LSA_COPIERS": self.lsa_copiers,
+            "MOE_ACTIVATION": self.activation,
+            "MOE_ACT_P0": self.act_p0,
+            "MOE_ACT_P1": self.act_p1,
+            "MOE_RETURN_CODEC": self.return_codec,
+            "MOE_ACT_CODEC": self.act_codec,
         }
+
+
+# MOE_ACT_CODEC -> activation format (the suffix of a non-default build's kernel key)
+ACT_CODEC_NAMES = {0: "mxfp8", 1: "nvfp4", 2: "mxfp4"}
 
 
 def kernel_max_rows(max_tokens_per_rank: int) -> int:
@@ -280,6 +305,19 @@ def check_supported_region(params: KernelParams) -> None:
     lo, hi = SUPPORTED_RANKS
     if not lo <= params.ranks <= hi:
         raise GeometryError(f"EP world size {params.ranks} outside {lo}..{hi}")
+    if params.act_codec not in ACT_CODEC_NAMES:
+        raise GeometryError(
+            f"act_codec {params.act_codec} must be 0 (MXFP8), 1 (NVFP4) or 2 (MXFP4)"
+        )
+    if params.act_codec and params.hidden % 1024:
+        raise GeometryError(
+            f"FP4 activations need hidden_size % 1024 == 0, got {params.hidden}"
+        )
+    if params.act_codec and params.shared_expert and params.intermediate % 256:
+        raise GeometryError(
+            f"FP4 activations with the in-kernel shared expert need intermediate_size % 256 == 0, "
+            f"got {params.intermediate}"
+        )
     if params.experts % params.ranks:
         raise GeometryError(
             f"num_experts {params.experts} is not divisible by the EP world size {params.ranks}"
@@ -295,8 +333,61 @@ def check_supported_region(params: KernelParams) -> None:
         )
 
 
+# Joint limits that the parameter table does not show (both are also kernel guards / generated
+# regions; the hints below only name them):
+# * the dispatch staging ring holds 12 records of ``hidden + hidden / 32`` bytes plus top-k
+#   metadata in 96 KiB, so top_k > 9 (64-entry metadata) needs hidden_size <= 7168;
+# * a routed row pool past 2**31 elements needs 64-bit pool indices, which the generated
+#   source covers for some EP sizes only (all of 32 ranks, part of 4 / 8 / 16 ranks).
+STAGING_TOPK_METADATA_SPLIT = 9
+STAGING_TOPK_HIDDEN_MAX = 7168
+
+
+def _guard_hint(params: KernelParams, formula: str) -> str:
+    if "98304" in formula and params.top_k > STAGING_TOPK_METADATA_SPLIT:
+        return (
+            f" (the dispatch staging ring does not fit hidden_size {params.hidden} with "
+            f"top_k {params.top_k}: top_k > {STAGING_TOPK_METADATA_SPLIT} needs hidden_size "
+            f"<= {STAGING_TOPK_HIDDEN_MAX})"
+        )
+    return ""
+
+
+def _region_hint(params: KernelParams, instance: int, g: Any) -> str:
+    entry = g.ladder.get("MOE_SW_POOL_INDEX_64")
+    if not isinstance(entry, list) or not entry:
+        return ""
+    if not compile_expression(entry[0][0])(params.env()):
+        return ""
+    # largest row capacity of this geometry that resolves (coverage shrinks with the rows)
+    lo, hi = 0, params.max_rows // MAX_ROWS_QUANTUM - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        try:
+            resolve(
+                dataclasses.replace(params, max_rows=mid * MAX_ROWS_QUANTUM),
+                instance,
+                geometry=g,
+                _explain=False,
+            )
+            lo = mid
+        except GeometryError:
+            hi = mid - 1
+    limit = (
+        f"; this geometry builds with at most {lo * MAX_ROWS_QUANTUM} rows per rank "
+        "(max_tokens_per_rank)"
+        if lo
+        else ""
+    )
+    return (
+        f": the routed row pool (EP {params.ranks} x {params.max_rows} rows x top_k "
+        f"{params.top_k}, hidden_size {params.hidden}) needs 64-bit pool indices, which the "
+        f"generated source covers for some EP sizes only{limit}"
+    )
+
+
 def resolve(
-    params: KernelParams, instance: int, *, geometry: Any = None
+    params: KernelParams, instance: int, *, geometry: Any = None, _explain: bool = True
 ) -> dict[str, Any]:
     """Switches, constants, buffer extents, SMEM, windows and ABI of one instance.
 
@@ -331,7 +422,10 @@ def resolve(
                 axes[name] = compile_expression(formula)(env)
                 break
         else:
-            raise GeometryError(f"parameter region not covered (switch {name})")
+            raise GeometryError(
+                f"parameter region not covered (switch {name})"
+                + (_region_hint(params, instance, g) if _explain else "")
+            )
     key = (
         axes["MOE_SHARED_EXPERT"],
         axes["MOE_INSTANCE"],
@@ -347,6 +441,7 @@ def resolve(
         if not compile_expression(g.formulas[guard])(env):
             raise GeometryError(
                 f"parameters violate a kernel guard: {g.formulas[guard]}"
+                + _guard_hint(params, g.formulas[guard])
             )
     consts = {
         k: compile_expression(g.formulas[v])(env) for k, v in table["consts"].items()
@@ -388,9 +483,16 @@ def _descriptors(c: dict[str, int]) -> dict[str, dict[str, Any]]:
         }
 
     out = {}
+    fp4_activations = bool(c.get("ACT_CODEC", 0))
     for g in ("W1", "W2"):
-        out[f"{g}_A"] = d("u8", [k, m], swz)
-        out[f"{g}_B"] = d("fp4_e2m1", [k, n], swz, fp4=True)
+        if fp4_activations:
+            # NVFP4 / MXFP4: pool / intermediate rows and routed weights are packed e2m1 bytes, 64 B (128 values)
+            # per K block row with the 64B swizzle.
+            out[f"{g}_A"] = d("u8", [k // 2, m], [4, 2, 3])
+            out[f"{g}_B"] = d("u8", [k // 2, n], [4, 2, 3])
+        else:
+            out[f"{g}_A"] = d("u8", [k, m], swz)
+            out[f"{g}_B"] = d("fp4_e2m1", [k, n], swz, fp4=True)
         out[f"{g}_B8"] = d("u8", [k, n], swz)
         out[f"{g}_SFA"] = d("u32", [m, 1], none)
         out[f"{g}_SFB"] = d("u32", [c["MMA_N_SUBTILES"], 8], none)
@@ -476,7 +578,8 @@ def describe_kernel(params: KernelParams) -> dict[str, Any]:
     variant = "fp8shared" if params.shared_expert else "noshared"
     return {
         "key": f"{variant}_ep{params.ranks}_e{params.experts}_k{params.top_k}"
-        f"_r{params.max_rows}_h{params.hidden}_i{params.intermediate}",
+        f"_r{params.max_rows}_h{params.hidden}_i{params.intermediate}"
+        + ("" if not params.act_codec else f"_{ACT_CODEC_NAMES[params.act_codec]}"),
         "params": params,
         "variant": variant,
         "world_size": params.ranks,

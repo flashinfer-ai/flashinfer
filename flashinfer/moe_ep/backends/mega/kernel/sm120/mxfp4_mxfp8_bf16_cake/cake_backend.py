@@ -37,9 +37,10 @@ The host side owns:
   NCCL communicator): symmetric windows, LSA peer pointers, GIN device comm;
 * the transport table (setup probe or a pinned table) and, from it, the
   instance pair to launch: with or without the LSA copier CTAs;
-* the two row schedules of that pair (M64 for at most ``m64_max_rows`` tokens
-  on every rank, M128 otherwise), chosen per call from the largest per-rank row
-  count, exactly as the generator's qualification harness chose them;
+* the two row schedules of that pair (64- or 128-row expert tiles), chosen per
+  call from rank-uniform row counts (:func:`_row_schedule`: a tile-count model
+  on GPUs with a measured tile cost ratio, else at most ``m64_max_rows`` rows ->
+  M64, the generator's qualification rule);
 * fixed-capacity scratch shared by both schedules (each schedule binds views
   with its own extents), TMA descriptor carriers, and the kernel-ordered
   argument list, rebuilt per call from a static template.
@@ -75,10 +76,13 @@ bound is refused (the routing exchange reads device data back).
 from __future__ import annotations
 
 import ctypes
+import functools
+import math
+import os
 import struct
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
@@ -93,8 +97,11 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from .cake_config import (
+    RETURN_CODECS,
+    ROW_SCHEDULES,
     TRANSPORT_TABLE_AUTO,
     TRANSPORT_TABLE_TUNED,
+    Sm120CakeMegaMoeConfigBase,
     Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
 )
 from .cake_geometry import GeometryError, KernelParams, describe_kernel, kernel_max_rows
@@ -122,6 +129,51 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 KERNEL_NAME = "sm120_mxfp4_mxfp8_bf16_cake"
+
+# Row schedule model.  An expert with n routed rows runs ceil(n / m) tiles of the m-row schedule; with
+# n ~ Poisson(lam), lam = routed rows / experts, the m128 schedule is chosen when
+# E[ceil(n / 128)] * r < E[ceil(n / 64)], r = time of a 128-row tile over a 64-row tile.  The count
+# ratio is 1 below 64 rows per expert (m64 always), 2 in (64, 128], ~1.5 near 160, so the choice is not
+# monotonic in the rows.  r per (SM count, activation codec), from forced-m64 / forced-m128 sweeps
+# (EP4, 1..4 busy ranks, 256..2048 rows per rank, DeepSeek-V4-Flash routing; the model picks the faster
+# schedule in all 288 cells).  RTX 6000D (156 SMs): m64 is faster in every cell (4-27 %), r = inf.
+# Other GPUs keep the closure threshold (``m64_max_rows``).
+_ROW_TILE_COST_RATIO: dict[tuple[int, int], float] = {
+    (110, 0): 1.70,  # RTX PRO 5000 Blackwell, MXFP8 activations (W4A8)
+    (110, 1): 1.80,  # NVFP4 activations
+    (110, 2): 1.80,  # MXFP4 activations
+    (156, 0): math.inf,  # RTX 6000D
+    (156, 1): math.inf,
+    (156, 2): math.inf,
+}
+_ROW_SCHEDULE_ENV = "FLASHINFER_CAKE_ROW_SCHEDULE"
+
+
+@functools.lru_cache(maxsize=4096)
+def _expected_tiles(routed_rows: int, num_experts: int, tile_m: int) -> float:
+    """E[ceil(n / tile_m)] per expert for n ~ Poisson(routed_rows / num_experts)."""
+
+    lam = routed_rows / num_experts
+    if lam <= 0:
+        return 0.0
+    span = 12.0 * math.sqrt(lam) + 16.0
+    log_lam = math.log(lam)
+    return sum(
+        math.exp(n * log_lam - lam - math.lgamma(n + 1)) * -(-n // tile_m)
+        for n in range(max(0, int(lam - span)), int(lam + span) + 1)
+    )
+
+
+def _row_schedule_setting(config_value: str) -> str:
+    env = os.environ.get(_ROW_SCHEDULE_ENV, "").strip()
+    value = env or config_value
+    if value not in ROW_SCHEDULES:
+        raise MoEEpConfigError(
+            f"{KERNEL_NAME}: {_ROW_SCHEDULE_ENV}={value!r} must be one of {list(ROW_SCHEDULES)}"
+        )
+    return value
+
+
 _TENSOR_MAP_BYTES = 128
 _PER_CALL_NAMES = (
     "W1_B",
@@ -255,10 +307,26 @@ def scratch_specs(
     P, ES, MR, T = C["PHYSICAL_RANKS"], C["EXPERT_SLOTS"], C["MAX_ROWS"], C["MAX_TASKS"]
     PR, DC, RC = C["POOL_ROWS"], C["DISPATCH_CHUNKS"], C["RESULT_CHUNKS"]
     i32, u32, u64 = torch.int32, torch.uint32, torch.uint64
+    # Pool / intermediate row widths (POOL_ACT_WORDS, INTER_ROW_BYTES), allocated pool rows (POOL_ALLOC_ROWS)
+    # and the per-expert global-scale tail of the routing weights (EXPERT_SCALE_WORDS) depend on the
+    # activation codec: MXFP8 builds have POOL_ALLOC_ROWS == POOL_ROWS, EXPERT_SCALE_WORDS == 0; FP4 builds
+    # (NVFP4, MXFP4) pack e2m1 rows and split the FP8 rows of the in-kernel shared expert; NVFP4 builds also
+    # append [fc1_alpha | fc2_alpha | fc1_norm_const] (EXPERT_SCALE_WORDS == 0 for MXFP4).
+    PA = C["POOL_ALLOC_ROWS"]
     specs: list[tuple[str, torch.dtype, tuple[int, ...], int | None]] = [
-        ("pool_fp8_u32", i32, (PR, C["ACTIVATION_WORDS"]), _FILL_ZERO),
+        (
+            "pool_fp8_u32",
+            i32,
+            (PA, C["POOL_ACT_WORDS"]),
+            _FILL_ZERO,
+        ),
         ("pool_sf_u32", i32, (C["SCALE_WORDS"], PR), _FILL_ZERO),
-        ("routing_weight_pool", torch.float32, (PR,), _FILL_ZERO),
+        (
+            "routing_weight_pool",
+            torch.float32,
+            (PR + C["EXPERT_SCALE_WORDS"],),
+            _FILL_ZERO,
+        ),
     ]
     for name in ("meta_source_rank", "meta_token", "meta_slot", "meta_result_index"):
         specs.append((name, i32, (PR,), _FILL_MINUS_ONE))
@@ -332,7 +400,12 @@ def scratch_specs(
     specs += [
         ("W1_D", torch.bfloat16, (PR, C["W1_N"]), _FILL_NONE),
         ("W2_D", torch.bfloat16, (PR, C["W2_N"]), _FILL_NONE),
-        ("intermediate_fp8", torch.uint8, (PR, C["INTERMEDIATE"]), _FILL_NONE),
+        (
+            "intermediate_fp8",
+            torch.uint8,
+            (PA, C["INTER_ROW_BYTES"]),
+            _FILL_NONE,
+        ),
         (
             "intermediate_sfa_u8",
             torch.uint8,
@@ -684,6 +757,10 @@ class _CakeWorkspace:
     num_experts: int
     local_experts: int
     m64_max_rows: int
+    # ``auto`` / ``m64`` / ``m128`` (config ``row_schedule`` or FLASHINFER_CAKE_ROW_SCHEDULE) and the
+    # tile cost ratio of the ``auto`` model on this GPU and codec (None: the m64_max_rows threshold).
+    row_schedule: str
+    tile_cost_ratio: float | None
     stats: torch.Tensor  # int32 [1 + E] per-call row count + expert histogram
     gathered_stats: torch.Tensor  # int32 [world, 1 + E]
     epoch: int = (
@@ -693,6 +770,9 @@ class _CakeWorkspace:
     # Rank-uniform per-rank row bound of the invocation (``compile_tokens_per_rank``).
     compile_tokens_per_rank: int | None = None
     staged_bound: int | None = None
+    # Optional rank-uniform per-rank row counts of the next invocation (``set_rows_by_rank``); only the
+    # row schedule (m64 / m128) reads it.  Reset by every ``set_rows_by_rank`` call.
+    rows_hint: tuple[int, ...] | None = None
     last_launch: dict[str, Any] = field(default_factory=dict)
     layers: dict[int, _LayerDescriptors] = field(default_factory=dict)
     destroyed: bool = False
@@ -721,11 +801,15 @@ class _CakeWorkspace:
 @register_mega_kernel(KERNEL_NAME)
 class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
+    # Activation codec of the device build (MOE_ACT_CODEC): 0 MXFP8 here, 1 NVFP4 / 2 MXFP4 in the W4A4 subclasses.
+    ACT_CODEC = 0
+    # Config class this backend accepts (the configs are siblings, not subclasses of each other).
+    CONFIG_TYPE: type = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
 
-    def __init__(self, config: Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig) -> None:
-        if not isinstance(config, Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig):
+    def __init__(self, config: Sm120CakeMegaMoeConfigBase) -> None:
+        if not isinstance(config, self.CONFIG_TYPE):
             raise TypeError(
-                f"{KERNEL_NAME} config must be Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig, got {type(config).__name__}"
+                f"{self.kernel_name()} config must be {self.CONFIG_TYPE.__name__}, got {type(config).__name__}"
             )
         super().__init__(config)
         self._kernel_config = config
@@ -754,12 +838,14 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         EP world size, global (physical) expert count, hidden size and the per-rank token
         capacity come from the fleet; intermediate size, top-k, the shared-expert
-        variant, the SwiGLU clamp and the codec overflow capacity from the kernel config;
+        variant, the SwiGLU clamp, the codec overflow capacity and the return codec from the
+        kernel config;
         ``lsa_copiers`` (copier instances only) from the transport table.  The kernel's
         row capacity is ``max_tokens_per_rank`` rounded up to a multiple of 128.
         """
 
         config = self._kernel_config
+        activation, act_p0, act_p1 = config.activation_parameters()
         return KernelParams(
             ranks=world_size,
             experts=fleet_params.num_experts,
@@ -769,8 +855,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             intermediate=config.intermediate_size,
             shared_expert=config.variant == "fp8shared",
             swiglu_limit=config.swiglu_limit,
-            codec_ovf_blocks=config.codec_overflow_blocks,
+            codec_ovf_blocks=config.kernel_codec_overflow_blocks,
             lsa_copiers=lsa_copiers,
+            activation=activation,
+            act_p0=act_p0,
+            act_p1=act_p1,
+            return_codec=RETURN_CODECS[config.return_codec],
+            act_codec=self.ACT_CODEC,
         )
 
     def _describe(
@@ -786,7 +877,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"num_experts={fleet_params.num_experts}, hidden={fleet_params.token_hidden_size}, "
                 f"intermediate={self._kernel_config.intermediate_size}, top_k={self._kernel_config.top_k}, "
                 f"swiglu_limit={self._kernel_config.swiglu_limit}, "
+                f"activation={self._kernel_config.activation}, "
                 f"codec_overflow_blocks={self._kernel_config.codec_overflow_blocks}, "
+                f"return_codec={self._kernel_config.return_codec}, "
                 f"lsa_copiers={lsa_copiers}, "
                 f"max_tokens_per_rank={fleet_params.max_tokens_per_rank}): {error}"
             ) from error
@@ -871,6 +964,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         config = self._kernel_config
         return (
             KERNEL_NAME,
+            self.ACT_CODEC,  # layers of different activation codecs never share a workspace (staging buffers)
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -881,9 +975,12 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.swiglu_limit,
-            config.codec_overflow_blocks,
+            config.activation_parameters(),
+            config.kernel_codec_overflow_blocks,
+            config.return_codec,
             config.variant,
             config.transport_table,
+            _row_schedule_setting(config.row_schedule),  # with the env override applied
             knobs_pool_key(config.knobs),
         )
 
@@ -937,11 +1034,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         import torch.distributed as dist
 
-        from .cake_knob_cache import lookup_knobs, topology_digest
+        from .cake_knob_cache import lookup_knobs, topology_digest, variant_key
 
         world = session.world_size
         key = {
-            "variant": self._kernel_config.variant,
+            "variant": variant_key(
+                self._kernel_config.variant, self._kernel_config.return_codec
+            ),
             "world_size": world,
             "hidden": int(kernel["hidden"]),
             "intermediate": int(kernel["intermediate"]),
@@ -1104,9 +1203,10 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 count = int(torch.Size(entry[2]).numel())
                 views[inst][name] = raw[: count * itemsize].view(dtype).view(entry[2])
         MR, H, TK = C128["MAX_ROWS"], C128["HIDDEN"], C128["TOP_K"]
+        x_shape, sf_shape = self._activation_shapes(MR, H)
         inputs = {
-            "x_fp8": torch.zeros((MR, H), dtype=torch.uint8, device=device),
-            "x_sf": torch.zeros((MR, H // 32), dtype=torch.uint8, device=device),
+            "x_fp8": torch.zeros(x_shape, dtype=torch.uint8, device=device),
+            "x_sf": torch.zeros(sf_shape, dtype=torch.uint8, device=device),
             "topk_idx": torch.full((MR, TK), -1, dtype=torch.int64, device=device),
             "topk_weights": torch.zeros((MR, TK), dtype=torch.float32, device=device),
         }
@@ -1153,6 +1253,25 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         # -- kernel instances ---------------------------------------------------
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        # Every rank must launch the same row schedule in a call, so the group needs one setting and
+        # one tile-cost calibration: reject differing settings; a group of GPUs with different SM
+        # counts uses the rank-uniform threshold rule instead of the per-GPU model.
+        row_schedule = _row_schedule_setting(self._kernel_config.row_schedule)
+        code = ROW_SCHEDULES.index(row_schedule)
+        probe = torch.tensor(
+            [sm_count, -sm_count, code, -code], dtype=torch.int64, device=device
+        )
+        dist.all_reduce(probe, op=dist.ReduceOp.MIN, group=group)
+        if int(probe[2]) != -int(probe[3]):
+            raise MoEEpConfigError(
+                f"{KERNEL_NAME}: the row schedule (config row_schedule or {_ROW_SCHEDULE_ENV}) "
+                "differs between EP ranks; every rank must use the same value"
+            )
+        tile_cost_ratio = (
+            _ROW_TILE_COST_RATIO.get((sm_count, self.ACT_CODEC))
+            if int(probe[0]) == -int(probe[1])
+            else None
+        )
         instances: dict[str, _Instance] = {}
         device_parameters = kernel["params"].device_parameters()
         gin_backend = _NO_GIN_BACKEND
@@ -1203,9 +1322,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             C = spec["constants"]
             b = views[inst_name]
             static_sources = {
+                # rows of POOL_ACT_WORDS words: H bytes (MXFP8) or H / 2 (NVFP4 / MXFP4, plus the
+                # split shared-expert rows of POOL_ALLOC_ROWS)
                 "W1_A": b["pool_fp8_u32"]
                 .view(torch.uint8)
-                .reshape(C["POOL_ROWS"], C["HIDDEN"]),
+                .reshape(C["POOL_ALLOC_ROWS"], C["POOL_ACT_WORDS"] * 4),
                 "W1_SFA": b["pool_sf_u32"].view(torch.uint32),
                 "W1_D": b["W1_D"],
                 "W2_A": b["intermediate_fp8"],
@@ -1285,6 +1406,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             num_experts=E,
             local_experts=int(kernel["local_experts"]),
             m64_max_rows=int(kernel["transport"]["m64_max_rows"]),
+            row_schedule=row_schedule,
+            tile_cost_ratio=tile_cost_ratio,
             stats=torch.zeros(1 + E, dtype=torch.int32, device=device),
             gathered_stats=torch.zeros(
                 (world_size, 1 + E), dtype=torch.int32, device=device
@@ -1483,6 +1606,73 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             None if compile_tokens_per_rank is None else int(compile_tokens_per_rank)
         )
 
+    def set_rows_by_rank(
+        self, workspace: Any, rows_by_rank: Sequence[int] | None
+    ) -> None:
+        """Rank-uniform per-rank row counts of the next invocation (``None`` clears them).
+
+        With a ``compile_tokens_per_rank`` bound the kernel cannot see how many rows the other
+        ranks hold, so the row schedule used to follow the bound (the largest per-rank count): a
+        P/D prefill step with one rank at 1024 rows and three at 0 ran the m128 schedule, whose
+        128-row tiles are ~80 % padding at ~24 rows per local expert.  With the counts the schedule
+        follows the mean rows per rank (``ceil(sum / world)``), which equals the largest count
+        for uniform loads, so uniform calls keep their schedule.  Grid sizing still uses the
+        bound.  Every EP rank must pass the same counts (e.g. the DP metadata), else the ranks
+        could launch different schedules.
+        """
+
+        ws = self._live(workspace)
+        if rows_by_rank is None:
+            ws.rows_hint = None
+            return
+        hint = tuple(int(v) for v in rows_by_rank)
+        if len(hint) != ws.world_size or min(hint) < 0:
+            raise MoEEpConfigError(
+                f"{KERNEL_NAME}: rows_by_rank={list(hint)} must hold one non-negative count per "
+                f"EP rank (world size {ws.world_size})"
+            )
+        ws.rows_hint = hint
+
+    @staticmethod
+    def _schedule_rows(ws: _CakeWorkspace, rows_by_rank: list[int]) -> int:
+        """Rows that pick the row schedule (m64 when ``<= m64_max_rows``)."""
+
+        collective_rows = max(rows_by_rank)
+        hint = ws.rows_hint
+        if ws.staged_bound is None or hint is None:
+            return collective_rows
+        # A function of rank-uniform values only (hint, bound): every rank picks the same schedule.
+        # Advisory: both schedules serve any row count up to the workspace capacity (identical
+        # results), so a hint that misstates the rows changes speed, never correctness.
+        return min(collective_rows, -(-sum(hint) // ws.world_size))
+
+    @classmethod
+    def _row_schedule(cls, ws: _CakeWorkspace, rows_by_rank: list[int]) -> str:
+        """``"m64"`` or ``"m128"`` for a call with these rank-uniform per-rank rows.
+
+        A pinned ``row_schedule`` wins.  ``auto`` on a GPU with a measured tile cost ratio applies the
+        tile-count model (:data:`_ROW_TILE_COST_RATIO`) to the routed rows of the call: the hint's
+        total when there is one (capped by the bound), else the rows the grid is sized for.  Other GPUs
+        keep the closure threshold on :meth:`_schedule_rows`.  Only rank-uniform values are read, so
+        every rank launches the same schedule."""
+
+        if ws.row_schedule != "auto":
+            return ws.row_schedule
+        if ws.tile_cost_ratio is None:
+            return (
+                "m64"
+                if cls._schedule_rows(ws, rows_by_rank) <= ws.m64_max_rows
+                else "m128"
+            )
+        if math.isinf(ws.tile_cost_ratio):
+            return "m64"
+        rows = sum(rows_by_rank)
+        if ws.staged_bound is not None and ws.rows_hint is not None:
+            rows = min(rows, sum(ws.rows_hint))
+        routed = rows * ws.top_k
+        m128 = _expected_tiles(routed, ws.num_experts, 128) * ws.tile_cost_ratio
+        return "m128" if m128 < _expected_tiles(routed, ws.num_experts, 64) else "m64"
+
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
     ) -> None:
@@ -1499,7 +1689,23 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"{KERNEL_NAME}: compile_tokens_per_rank={bound} is below this rank's "
                 f"{t.hidden_states.shape[0]} tokens"
             )
-        ws.staged_rows = stage_inputs(
+        ws.staged_rows = self._stage_activations(t, ws, quantize_input=quantize_input)
+        ws.staged_bound = bound
+
+    # Hooks of the activation codec (overridden by the W4A4 subclasses).
+
+    @staticmethod
+    def _activation_shapes(
+        max_rows: int, hidden: int
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Workspace staging shapes of the activation codes and their scale bytes."""
+
+        return (max_rows, hidden), (max_rows, hidden // 32)
+
+    def _stage_activations(
+        self, t: MoEEpTensors, ws: _CakeWorkspace, *, quantize_input: bool
+    ) -> int:
+        return stage_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
@@ -1510,7 +1716,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
         )
-        ws.staged_bound = bound
+
+    def _before_launch(
+        self, ws: _CakeWorkspace, inst: _Instance, transformed_weights: Any
+    ) -> None:
+        """Per-call device writes ahead of the launch (stream-ordered, graph-capturable)."""
 
     def workspace_output(self, workspace: Any) -> torch.Tensor:
         return self._live(workspace).output
@@ -1566,7 +1776,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             if output is not None:
                 return output[:0]
             return out
-        inst = ws.instances["m64" if collective_rows <= ws.m64_max_rows else "m128"]
+        schedule_rows = self._schedule_rows(ws, rows_by_rank)
+        inst = ws.instances[self._row_schedule(ws, rows_by_rank)]
         grid_args: dict[str, Any] = dict(
             task_m=inst.task_m,
             with_shared_expert=ws.variant == "fp8shared",
@@ -1605,6 +1816,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             name = entry["name"]
             if name in per_call:
                 self._write_arg(inst.arg_values, entry, per_call[name])
+        self._before_launch(ws, inst, transformed_weights)
         ws.module.launch_cooperative(
             inst.function,
             grid,
@@ -1621,6 +1833,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             "epoch": ws.epoch,
             "rows_by_rank": rows_by_rank,
             "collective_rows": collective_rows,
+            "schedule_rows": schedule_rows,
             "grid_rule": "routing" if expert_counts is not None else "bound",
         }
         ws.epoch += 1
