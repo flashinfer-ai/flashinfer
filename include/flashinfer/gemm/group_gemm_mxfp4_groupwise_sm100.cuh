@@ -57,8 +57,8 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   int swizzled_k = (k + alignment_swizzled_k - 1) / alignment_swizzled_k * alignment_swizzled_k;
   int sf_k = swizzled_k / ScaleGranularity;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
   int m_offset = m_indptr[i];
   int m_offset_next = m_indptr[i + 1];
