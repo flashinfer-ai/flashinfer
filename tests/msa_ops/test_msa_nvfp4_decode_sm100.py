@@ -205,8 +205,15 @@ def _build_inputs(
     topk=TOPK,
     num_kv_heads=NUM_KV_HEADS,
     num_qo_heads=NUM_QO_HEADS,
+    recipe_scales=(),
 ):
-    """One decode step against a planar NVFP4 page pool, vLLM's layout."""
+    """One decode step against a planar NVFP4 page pool, vLLM's layout.
+
+    ``recipe_scales`` names the operands (``"k"``, ``"v"``) quantized with the
+    standard NVFP4 recipe, ``global_scale = amax / (6 * 448)``, which puts the
+    largest block scale at the top of the e4m3 range; the others use the fixed
+    global scales, whose block scales stay near 1.
+    """
     generator = torch.Generator(device=device).manual_seed(seed)
     seqused_k = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
     assert int(seqused_k.numel()) == batch
@@ -247,8 +254,16 @@ def _build_inputs(
         device=device,
         dtype=torch.float32,
     )
-    packed_k, sf_k = _quantize_nvfp4(keys.to(torch.bfloat16), K_GLOBAL_SCALE)
-    packed_v, sf_v = _quantize_nvfp4(values.to(torch.bfloat16), V_GLOBAL_SCALE)
+
+    def global_scale(x, operand, fixed):
+        if operand not in recipe_scales:
+            return fixed
+        return float(x.to(torch.bfloat16).float().abs().max()) / (6.0 * 448.0)
+
+    k_global_scale = global_scale(keys, "k", K_GLOBAL_SCALE)
+    v_global_scale = global_scale(values, "v", V_GLOBAL_SCALE)
+    packed_k, sf_k = _quantize_nvfp4(keys.to(torch.bfloat16), k_global_scale)
+    packed_v, sf_v = _quantize_nvfp4(values.to(torch.bfloat16), v_global_scale)
     k_data.copy_(packed_k)
     v_data.copy_(packed_v)
     k_scale.copy_(sf_k)  # linear
@@ -302,8 +317,8 @@ def _build_inputs(
         seqlen_q=1,
         causal=True,
         softmax_scale=HEAD_DIM**-0.5,
-        k_global_scale=K_GLOBAL_SCALE,
-        v_global_scale=V_GLOBAL_SCALE,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
     )
 
 
@@ -1512,6 +1527,65 @@ def test_a_non_causal_decode_step(rows, backend, route, monkeypatch):
     inputs["causal"] = False
     assert route == "auto" and backend != CUTE, (backend, route)
     assert backend == (PINNED if len(rows) >= 33 else PARAMETRIC), backend
+    _assert_peer(
+        _call_on(backend, inputs, monkeypatch, route=route), _reference(inputs)
+    )
+
+
+def _recipe_scale_params():
+    params = []
+    for tp, qo, kv in TP_GEOMETRIES:
+        for rows in (_NON_CAUSAL_ROWS, _NON_CAUSAL_ROWS * 6):
+            for causal in (True, False):
+                for backend, route in bodies_for(
+                    rows, causal=causal, num_qo_heads=qo, num_kv_heads=kv
+                ):
+                    for operand in ("k", "v"):
+                        params.append(
+                            pytest.param(
+                                qo,
+                                kv,
+                                rows,
+                                causal,
+                                backend,
+                                route,
+                                operand,
+                                id=f"tp{tp}-b{len(rows)}-causal{int(causal)}"
+                                f"-{backend}-{operand}",
+                            )
+                        )
+    return params
+
+
+@sm100_only
+@pytest.mark.parametrize(
+    "num_qo_heads, num_kv_heads, rows, causal, backend, route, operand",
+    _recipe_scale_params(),
+)
+def test_block_scales_up_to_the_e4m3_maximum(
+    num_qo_heads, num_kv_heads, rows, causal, backend, route, operand, monkeypatch
+):
+    """Regression: an e2m1 code times a block scale must not clip at 448.
+
+    With the standard NVFP4 recipe the largest block scale is 448, so a
+    dequantized element reaches 6 * 448 = 2688. The C++ bodies stage K and V
+    as e4m3 MMA operands, and converting with ``satfinite`` clipped every
+    element of a block whose scale exceeds 448 / 6 (rel_fro ~0.6 against the
+    reference). The fixed global scales of the other tests keep every block
+    scale near 1 and never reach that range.
+    """
+    inputs = _build_inputs(
+        len(rows),
+        rows,
+        torch.device("cuda"),
+        seed=31,
+        num_kv_heads=num_kv_heads,
+        num_qo_heads=num_qo_heads,
+        recipe_scales=(operand,),
+    )
+    inputs["causal"] = causal
+    scales = inputs[f"{operand}_scale"].view(torch.float8_e4m3fn).float()
+    assert float(scales.max()) > 448.0 / 6.0
     _assert_peer(
         _call_on(backend, inputs, monkeypatch, route=route), _reference(inputs)
     )
