@@ -514,9 +514,9 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
             if (use_state_indices != 0) {
                 state_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx];
             }
-            long long state_head_base = (long long)state_slot * state_slot_stride + (long long)head_idx * 128 * 128;
-            long long state_base_top = state_head_base + (long long)state_row_top * 128;
-            long long state_base_bot = state_head_base + (long long)state_row_bot * 128;
+            long long state_head_base = (long long)state_slot * state_slot_stride + (long long)head_idx * 128ll * 128ll;
+            long long state_base_top = state_head_base + (long long)state_row_top * 128ll;
+            long long state_base_bot = state_head_base + (long long)state_row_bot * 128ll;
             unsigned int zero_diag[4];
             zero_diag[0] = 0;
             zero_diag[1] = 0;
@@ -712,6 +712,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                     :: "r"(taddr + 224 + (unsigned int)tmem_row_base), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&residual_values_bf16[7])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(v_free_addr);
                 if (elect_sync()) {
@@ -816,7 +817,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
             }
             int ckpt_odd = lane_quad_1 & 1;
             int ckpt_col = ckpt_odd * 16 + (lane_quad_1 >> 1) * 8;
-            int ckpt_wide = (((state_checkpoints_addr & 31) == 0) ? 1 : 0);
+            int ckpt_wide = (((state_checkpoints_addr & 31ull) == 0ull) ? 1 : 0);
             int ckpt_quad_hi = lane_quad_1 >> 1 & 1;
             unsigned int _phase_state_inp_ready = 0;
             #pragma unroll 1
@@ -840,9 +841,9 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                     }
                     if (ckpt_chunk != 0) {
                         long long ckpt_row = ckpt_seq_row + (long long)(chunk_idx_1 * 32 / checkpoint_every_n_tokens);
-                        long long ckpt_head_base = (ckpt_row * (long long)num_heads + (long long)head_idx_1) * 128 * 128;
+                        long long ckpt_head_base = (ckpt_row * (long long)num_heads + (long long)head_idx_1) * 128ll * 128ll;
                         if (ckpt_wide != 0) {
-                            long long ckpt_row_base_1_0 = ckpt_head_base + (long long)state_row_top_1 * 128 + (long long)(lane_quad_1 * 16);
+                            long long ckpt_row_base_1_0 = ckpt_head_base + (long long)state_row_top_1 * 128ll + (long long)(lane_quad_1 * 16);
                             unsigned int ckpt_run_1_0[8];
                             ckpt_run_1_0[0] = ckpt_words[0];
                             ckpt_run_1_0[1] = ckpt_words[1];
@@ -951,9 +952,9 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                                 const unsigned* _raw_stv8_1 = reinterpret_cast<const unsigned*>(ckpt_run_1_1);
                                 asm volatile(
                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                    :: "l"((void*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_0 + 64))), "r"(_raw_stv8_1[0]), "r"(_raw_stv8_1[1]), "r"(_raw_stv8_1[2]), "r"(_raw_stv8_1[3]), "r"(_raw_stv8_1[4]), "r"(_raw_stv8_1[5]), "r"(_raw_stv8_1[6]), "r"(_raw_stv8_1[7]) : "memory");
+                                    :: "l"((void*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_0 + 64ll))), "r"(_raw_stv8_1[0]), "r"(_raw_stv8_1[1]), "r"(_raw_stv8_1[2]), "r"(_raw_stv8_1[3]), "r"(_raw_stv8_1[4]), "r"(_raw_stv8_1[5]), "r"(_raw_stv8_1[6]), "r"(_raw_stv8_1[7]) : "memory");
                             }
-                            long long ckpt_row_base_1_1 = ckpt_head_base + (long long)state_row_bot_1 * 128 + (long long)(lane_quad_1 * 16);
+                            long long ckpt_row_base_1_1 = ckpt_head_base + (long long)state_row_bot_1 * 128ll + (long long)(lane_quad_1 * 16);
                             unsigned int ckpt_run_1_2[8];
                             ckpt_run_1_2[0] = ckpt_words[2];
                             ckpt_run_1_2[1] = ckpt_words[3];
@@ -1062,10 +1063,10 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                                 const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(ckpt_run_1_3);
                                 asm volatile(
                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                    :: "l"((void*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_1 + 64))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
+                                    :: "l"((void*)(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_1 + 64ll))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
                             }
                         } else {
-                            long long ckpt_row_base_1_2 = ckpt_head_base + (long long)state_row_top_1 * 128 + (long long)ckpt_col;
+                            long long ckpt_row_base_1_2 = ckpt_head_base + (long long)state_row_top_1 * 128ll + (long long)ckpt_col;
                             unsigned int ckpt_run_1_4[4];
                             unsigned int ckpt_send_1_32 = ((ckpt_odd != 0) ? ckpt_words[0] : ckpt_words[4]);
                             unsigned int ckpt_recv_2_32 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_32, 1);
@@ -1085,7 +1086,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_35 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_35, 1);
                             ckpt_run_1_5[1] = ((ckpt_odd != 0) ? ckpt_recv_2_35 : ckpt_words[9]);
                             ckpt_run_1_5[3] = ((ckpt_odd != 0) ? ckpt_words[13] : ckpt_recv_2_35);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 32))[0] = reinterpret_cast<int4*>(ckpt_run_1_5)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 32ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_5)[0];
                             unsigned int ckpt_run_1_6[4];
                             unsigned int ckpt_send_1_36 = ((ckpt_odd != 0) ? ckpt_words[16] : ckpt_words[20]);
                             unsigned int ckpt_recv_2_36 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_36, 1);
@@ -1095,7 +1096,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_37 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_37, 1);
                             ckpt_run_1_6[1] = ((ckpt_odd != 0) ? ckpt_recv_2_37 : ckpt_words[17]);
                             ckpt_run_1_6[3] = ((ckpt_odd != 0) ? ckpt_words[21] : ckpt_recv_2_37);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 64))[0] = reinterpret_cast<int4*>(ckpt_run_1_6)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 64ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_6)[0];
                             unsigned int ckpt_run_1_7[4];
                             unsigned int ckpt_send_1_38 = ((ckpt_odd != 0) ? ckpt_words[24] : ckpt_words[28]);
                             unsigned int ckpt_recv_2_38 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_38, 1);
@@ -1105,8 +1106,8 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_39 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_39, 1);
                             ckpt_run_1_7[1] = ((ckpt_odd != 0) ? ckpt_recv_2_39 : ckpt_words[25]);
                             ckpt_run_1_7[3] = ((ckpt_odd != 0) ? ckpt_words[29] : ckpt_recv_2_39);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 96))[0] = reinterpret_cast<int4*>(ckpt_run_1_7)[0];
-                            long long ckpt_row_base_1_3 = ckpt_head_base + (long long)state_row_bot_1 * 128 + (long long)ckpt_col;
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_2 + 96ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_7)[0];
+                            long long ckpt_row_base_1_3 = ckpt_head_base + (long long)state_row_bot_1 * 128ll + (long long)ckpt_col;
                             unsigned int ckpt_run_1_8[4];
                             unsigned int ckpt_send_1_40 = ((ckpt_odd != 0) ? ckpt_words[2] : ckpt_words[6]);
                             unsigned int ckpt_recv_2_40 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_40, 1);
@@ -1126,7 +1127,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_43 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_43, 1);
                             ckpt_run_1_9[1] = ((ckpt_odd != 0) ? ckpt_recv_2_43 : ckpt_words[11]);
                             ckpt_run_1_9[3] = ((ckpt_odd != 0) ? ckpt_words[15] : ckpt_recv_2_43);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 32))[0] = reinterpret_cast<int4*>(ckpt_run_1_9)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 32ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_9)[0];
                             unsigned int ckpt_run_1_10[4];
                             unsigned int ckpt_send_1_44 = ((ckpt_odd != 0) ? ckpt_words[18] : ckpt_words[22]);
                             unsigned int ckpt_recv_2_44 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_44, 1);
@@ -1136,7 +1137,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_45 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_45, 1);
                             ckpt_run_1_10[1] = ((ckpt_odd != 0) ? ckpt_recv_2_45 : ckpt_words[19]);
                             ckpt_run_1_10[3] = ((ckpt_odd != 0) ? ckpt_words[23] : ckpt_recv_2_45);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 64))[0] = reinterpret_cast<int4*>(ckpt_run_1_10)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 64ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_10)[0];
                             unsigned int ckpt_run_1_11[4];
                             unsigned int ckpt_send_1_46 = ((ckpt_odd != 0) ? ckpt_words[26] : ckpt_words[30]);
                             unsigned int ckpt_recv_2_46 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_46, 1);
@@ -1146,7 +1147,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                             unsigned int ckpt_recv_2_47 = __shfl_xor_sync(0xFFFFFFFF, ckpt_send_1_47, 1);
                             ckpt_run_1_11[1] = ((ckpt_odd != 0) ? ckpt_recv_2_47 : ckpt_words[27]);
                             ckpt_run_1_11[3] = ((ckpt_odd != 0) ? ckpt_words[31] : ckpt_recv_2_47);
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 96))[0] = reinterpret_cast<int4*>(ckpt_run_1_11)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (ckpt_row_base_1_3 + 96ll))[0] = reinterpret_cast<int4*>(ckpt_run_1_11)[0];
                         }
                     }
                 }
@@ -1223,16 +1224,16 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                         int token_pair_2 = token_group_2 * 8 + lane_quad_1 * 2;
                         const int out_reg_base = token_group_2 * 4;
                         long long out_token_0 = bos_1 + (long long)(chunk_idx_1 * 32 + token_pair_2);
-                        long long out_token_1 = out_token_0 + 1;
+                        long long out_token_1 = out_token_0 + 1ll;
                         if (out_token_0 < eos_1) {
-                            long long out_idx_top_0 = (out_token_0 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_row_top_1;
-                            long long out_idx_bot_0 = (out_token_0 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_row_bot_1;
+                            long long out_idx_top_0 = (out_token_0 * (long long)num_heads + (long long)head_idx_1) * 128ll + (long long)state_row_top_1;
+                            long long out_idx_bot_0 = (out_token_0 * (long long)num_heads + (long long)head_idx_1) * 128ll + (long long)state_row_bot_1;
                             out[out_idx_top_0] = _tmem_load_6[out_reg_base];
                             out[out_idx_bot_0] = _tmem_load_6[out_reg_base + 2];
                         }
                         if (out_token_1 < eos_1) {
-                            long long out_idx_top_1 = (out_token_1 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_row_top_1;
-                            long long out_idx_bot_1 = (out_token_1 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_row_bot_1;
+                            long long out_idx_top_1 = (out_token_1 * (long long)num_heads + (long long)head_idx_1) * 128ll + (long long)state_row_top_1;
+                            long long out_idx_bot_1 = (out_token_1 * (long long)num_heads + (long long)head_idx_1) * 128ll + (long long)state_row_bot_1;
                             out[out_idx_top_1] = _tmem_load_6[out_reg_base + 1];
                             out[out_idx_bot_1] = _tmem_load_6[out_reg_base + 3];
                         }
@@ -1477,7 +1478,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                         int segment = v_item % 8;
                         long long token = bos_3 + (long long)(chunk_idx_2 * 32 + row);
                         int token_valid = ((token < eos_3) ? 1 : 0);
-                        long long v_src = token * v_stride_m3 + (long long)head_idx_2 * 128 + (long long)value_row_offset_2 + (long long)(segment * 8);
+                        long long v_src = token * v_stride_m3 + (long long)head_idx_2 * 128ll + (long long)value_row_offset_2 + (long long)(segment * 8);
                         int v_dst_row_addr = smem_v_addr + (unsigned int)(row * 64 * 2);
                         int v_dst_addr = (v_dst_row_addr + (segment * 8 * 2 ^ (v_dst_row_addr >> 7 & 7) << 4));
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
@@ -1655,7 +1656,7 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                         int gate_load_row = gate_load_item / 16;
                         int gate_load_segment = gate_load_item % 16;
                         long long gate_load_token = bos_4 + (long long)(chunk_idx_3 * 32 + gate_load_row);
-                        long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
+                        long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                             :: "r"(smem_g_raw_addr + prep_stage * 41984 + (unsigned int)(gate_load_item * 16)), "l"(g + gate_load_base), "r"((gate_load_token < eos_4) ? 16 : 0));
                     }
@@ -1758,8 +1759,8 @@ kernel_cake_kda_prefill_a64c003a5f27af3e1270(__nv_bfloat16* __restrict__ q, cons
                     int segment_3 = work_item % 16;
                     long long token_1 = bos_4 + (long long)(chunk_idx_3 * 32 + row_1);
                     int token_valid_1 = ((token_1 < eos_4) ? 1 : 0);
-                    long long q_gmem_base = token_1 * q_stride_m3 + (long long)head_idx_3 * 128 + (long long)(segment_3 * 8);
-                    long long k_gmem_base = token_1 * k_stride_m3 + (long long)head_idx_3 * 128 + (long long)(segment_3 * 8);
+                    long long q_gmem_base = token_1 * q_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(segment_3 * 8);
+                    long long k_gmem_base = token_1 * k_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(segment_3 * 8);
                     float q_raw_vec[8];
                     float k_raw_vec[8];
                     q_raw_vec[0] = 0.0f;

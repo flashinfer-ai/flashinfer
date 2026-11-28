@@ -445,7 +445,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                 asm volatile("nanosleep.u32 %0;" :: "r"(128));
                 unsigned long long _read_special_reg_0;
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(_read_special_reg_0) :: "memory");
-                if (_read_special_reg_0 - slack_t0 >= 3800) {
+                if (_read_special_reg_0 - slack_t0 >= 3800ull) {
                     slack_wait = 0;
                 }
             }
@@ -596,10 +596,10 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                     if (use_state_indices != 0) {
                         first_state_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx];
                     }
-                    long long first_state_base = (long long)first_state_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
-                    long long first_row_zero = 0;
+                    long long first_state_base = (long long)first_state_slot * state_slot_stride + ((long long)head_idx * 128ll + (long long)state_row) * 128ll;
+                    long long first_row_zero = 0ll;
                     if (checkpoint_every_n_tokens != 0) {
-                        first_row_zero = ((reinterpret_cast<long long*>(checkpoint_cu_starts_addr)[seq_idx] * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
+                        first_row_zero = ((reinterpret_cast<long long*>(checkpoint_cu_starts_addr)[seq_idx] * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 128ll;
                     }
                     #pragma unroll
                     for (int state_col_block = 0; state_col_block < 4; state_col_block++) {
@@ -711,7 +711,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 packed[_lp + 7] = *(uint32_t*)&_bf2;
                             }
                             reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32)))[0] = reinterpret_cast<int4*>(packed)[0];
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 8))[0] = reinterpret_cast<int4*>(packed + (4))[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 8ll))[0] = reinterpret_cast<int4*>(packed + (4))[0];
                             unsigned int packed_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -753,8 +753,8 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(first_frag[_lp*2 + 30], first_frag[_lp*2+1 + 30]));
                                 packed_1[_lp + 7] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 16))[0] = reinterpret_cast<int4*>(packed_1)[0];
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 16 + 8))[0] = reinterpret_cast<int4*>(packed_1 + (4))[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 16ll))[0] = reinterpret_cast<int4*>(packed_1)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (first_row_zero + (long long)(state_col_block * 32) + 16ll + 8ll))[0] = reinterpret_cast<int4*>(packed_1 + (4))[0];
                         }
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -882,7 +882,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                     for (int _ls = 0; _ls < 16; _ls++)
                         mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(prediction)[_ls], _scale2_1);
                     long long chunk_global_e = cu_chunk_offsets[seq_idx] + (long long)chunk_global_local;
-                    long long tape_ex_base = ((chunk_global_e * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 32;
+                    long long tape_ex_base = ((chunk_global_e * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 32ll;
                     #pragma unroll
                     for (int residual_half = 0; residual_half < 2; residual_half++) {
                         float residual_v[16];
@@ -941,7 +941,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v[_lp*2 + 14], residual_v[_lp*2+1 + 14]));
                                 _packed_8[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(tape_e + (tape_ex_base + (long long)(residual_half * 16) + 8))[0] = reinterpret_cast<int4*>(_packed_8)[0];
+                            reinterpret_cast<int4*>(tape_e + (tape_ex_base + (long long)(residual_half * 16) + 8ll))[0] = reinterpret_cast<int4*>(_packed_8)[0];
                         }
                         #pragma unroll
                         for (int _ls = 0; _ls < 8; _ls++)
@@ -990,7 +990,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v[_lp*2 + 14], residual_v[_lp*2+1 + 14]));
                                 _packed_10[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(tape_x + (tape_ex_base + (long long)(residual_half * 16) + 8))[0] = reinterpret_cast<int4*>(_packed_10)[0];
+                            reinterpret_cast<int4*>(tape_x + (tape_ex_base + (long long)(residual_half * 16) + 8ll))[0] = reinterpret_cast<int4*>(_packed_10)[0];
                         }
                         unsigned int residual_v_bf16[8];
                         #pragma unroll
@@ -1001,6 +1001,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                         tmem_st_x8_u32(taddr + 224 + (unsigned int)tmem_row_base + (unsigned int)(residual_half * 8), (const uint32_t*)residual_v_bf16);
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(v_free_addr + ((int)((unsigned int)(bin_chunk_base + chunk_idx) % 4)) * 8);
                     if (elect_sync()) {
@@ -1019,7 +1020,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     if (STORE_BACKWARD_TAPE != 0 && owned_chunk != 0) {
                         long long chunk_global_r = cu_chunk_offsets[seq_idx] + (long long)chunk_global_local;
-                        long long tape_r_base = ((chunk_global_r * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 32;
+                        long long tape_r_base = ((chunk_global_r * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 32ll;
                         #pragma unroll
                         for (int tape_r_vec = 0; tape_r_vec < 4; tape_r_vec++) {
                             unsigned int _packed_11[4];
@@ -1134,7 +1135,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                         if (use_state_indices != 0) {
                             turn_final_slot = reinterpret_cast<int*>(state_indices_addr)[turn_final_seq];
                         }
-                        long long turn_final_base = (long long)turn_final_slot * state_slot_stride + ((long long)turn_final_head * 128 + 0) * 128;
+                        long long turn_final_base = (long long)turn_final_slot * state_slot_stride + ((long long)turn_final_head * 128ll + 0ll) * 128ll;
                         int turn_final_prow = turn_final_row / 8;
                         int turn_final_pcol = turn_final_row % 8 * 4;
                         if (turn_final_warp == 0) {
@@ -1323,7 +1324,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                         for (int token_col_1 = 0; token_col_1 < 32; token_col_1++) {
                             long long out_token = bos_1 + (long long)(chunk_idx_1 * 32 + token_col_1);
                             if (out_token < eos_1) {
-                                long long out_idx = (out_token * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_row_1;
+                                long long out_idx = (out_token * (long long)num_heads + (long long)head_idx_1) * 128ll + (long long)state_row_1;
                                 out[out_idx] = _tmem_load_7[token_col_1];
                             }
                         }
@@ -1350,7 +1351,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                     if (use_state_indices != 0) {
                         turn_final_slot_1 = reinterpret_cast<int*>(state_indices_addr)[turn_final_seq_1];
                     }
-                    long long turn_final_base_1 = (long long)turn_final_slot_1 * state_slot_stride + ((long long)turn_final_head_1 * 128 + 0) * 128;
+                    long long turn_final_base_1 = (long long)turn_final_slot_1 * state_slot_stride + ((long long)turn_final_head_1 * 128ll + 0ll) * 128ll;
                     int turn_final_prow_1 = turn_final_row_1 / 8;
                     int turn_final_pcol_1 = turn_final_row_1 % 8 * 4;
                     if (turn_final_warp_1 == 0) {
@@ -1427,7 +1428,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                     if (use_state_indices != 0) {
                         turn_init_slot = reinterpret_cast<int*>(state_indices_addr)[turn_init_seq];
                     }
-                    long long turn_init_base = (long long)turn_init_slot * state_slot_stride + ((long long)turn_init_head * 128 + 0) * 128;
+                    long long turn_init_base = (long long)turn_init_slot * state_slot_stride + ((long long)turn_init_head * 128ll + 0ll) * 128ll;
                     int turn_init_outer = 0;
                     if (checkpoint_every_n_tokens != 0) {
                         turn_init_outer = (int)(reinterpret_cast<long long*>(checkpoint_cu_starts_addr)[turn_init_seq] * (long long)num_heads + (long long)turn_init_head);
@@ -1447,9 +1448,9 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                         #pragma unroll 1
                         for (int turn_init_it = 0; turn_init_it < 32; turn_init_it++) {
                             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                                :: "r"((smem_v18_addr_1 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128 + (long long)(turn_init_half * 2 * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
+                                :: "r"((smem_v18_addr_1 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128ll + (long long)(turn_init_half * 2 * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
                             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                                :: "r"((smem_v18_addr_2 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128 + (long long)((turn_init_half * 2 + 1) * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
+                                :: "r"((smem_v18_addr_2 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128ll + (long long)((turn_init_half * 2 + 1) * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
                         }
                         asm volatile("cp.async.commit_group;");
                         asm volatile("cp.async.wait_group 0;");
@@ -1558,7 +1559,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(turn_row0_words_0[_lp*2 + 0], turn_row0_words_0[_lp*2+1 + 0]));
                                     turn_row0_packed_0[_lp] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384 + (long long)(turn_row0_row + turn_row0_it * 8) * 128 + (long long)(turn_init_half * 2 * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_0)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384ll + (long long)(turn_row0_row + turn_row0_it * 8) * 128ll + (long long)(turn_init_half * 2 * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_0)[0];
                                 float turn_row0_words_1[8];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 3]))
@@ -1572,7 +1573,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(turn_row0_words_1[_lp*2 + 0], turn_row0_words_1[_lp*2+1 + 0]));
                                     turn_row0_packed_1[_lp] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384 + (long long)(turn_row0_row + turn_row0_it * 8) * 128 + (long long)((turn_init_half * 2 + 1) * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_1)[0];
+                                reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384ll + (long long)(turn_row0_row + turn_row0_it * 8) * 128ll + (long long)((turn_init_half * 2 + 1) * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_1)[0];
                             }
                         }
                         turn_cp_phase += 1;
@@ -1887,9 +1888,9 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                             int gate_load_row = gate_load_item / 16;
                             int gate_load_segment = gate_load_item % 16;
                             long long gate_load_token = bos_3 + (long long)(chunk_idx_2 * 32 + gate_load_row);
-                            long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
-                            long long q_load_base = gate_load_token * q_stride_m3 + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
-                            long long k_load_base = gate_load_token * k_stride_m3 + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
+                            long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
+                            long long q_load_base = gate_load_token * q_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
+                            long long k_load_base = gate_load_token * k_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
                             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                                 :: "r"(smem_g_raw_addr + (unsigned int)prep_ordinal % 4 * 41984 + (unsigned int)(gate_load_item * 16)), "l"(g + gate_load_base), "r"((gate_load_token < eos_3) ? 16 : 0));
                             int q_tail_addr = (smem_q_raw_prefetch_addr + (unsigned int)prep_ordinal % 4 * 41984 + (unsigned int)(gate_load_segment * 8 / 64 * 4096 + gate_load_row * 128 + gate_load_segment * 8 % 64 * 2 ^ (gate_load_segment * 8 / 64 * 4096 + gate_load_row * 128 + gate_load_segment * 8 % 64 * 2 >> 7 & 7) << 4));
@@ -1970,7 +1971,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 float gate_log0_1 = gate_log_pair_1.x;
                                 float gate_log1_1 = gate_log_pair_1.y;
                                 long long gate_token0 = bos_3 + (long long)(chunk_idx_2 * 32 + gate_row0_0_1);
-                                long long gate_token1 = gate_token0 + 1;
+                                long long gate_token1 = gate_token0 + 1ll;
                                 if (gate_token0 >= eos_3) {
                                     gate_log0_1 = 0.0f;
                                 }
@@ -2005,7 +2006,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                         int segment = work_item % 16;
                         long long token = bos_3 + (long long)(chunk_idx_2 * 32 + row);
                         int token_valid = ((token < eos_3) ? 1 : 0);
-                        long long gmem_base = (token * (long long)num_heads + (long long)head_idx_3) * 128 + (long long)(segment * 8);
+                        long long gmem_base = (token * (long long)num_heads + (long long)head_idx_3) * 128ll + (long long)(segment * 8);
                         float q_raw_vec[8];
                         float k_raw_vec[8];
                         unsigned int packed_2[4];
@@ -2915,7 +2916,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 for (int value_idx_4 = 0; value_idx_4 < 8; value_idx_4++) {
                                     restore_kd_values[value_idx_4] = unpack_bf16_2[value_idx_4];
                                 }
-                                long long tape_scaled_index = tape_scaled_base + (long long)restore_row * 128 + (long long)(restore_segment * 8);
+                                long long tape_scaled_index = tape_scaled_base + (long long)restore_row * 128ll + (long long)(restore_segment * 8);
                                 unsigned int packed_6[4];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -3052,7 +3053,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                                 for (int value_idx_7 = 0; value_idx_7 < 8; value_idx_7++) {
                                     restore_kd_values_1[value_idx_7] = unpack_bf16_4[value_idx_7];
                                 }
-                                long long tape_scaled_index_1 = tape_scaled_base + (long long)restore_row_1 * 128 + (long long)(restore_segment_1 * 8);
+                                long long tape_scaled_index_1 = tape_scaled_base + (long long)restore_row_1 * 128ll + (long long)(restore_segment_1 * 8);
                                 unsigned int packed_11[4];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -3362,7 +3363,7 @@ kernel_cake_kda_prefill_5349d111191031dfe29c(__nv_bfloat16* __restrict__ q, cons
                             int segment_1 = v_item % 16;
                             long long token_1 = bos_3 + (long long)(chunk_idx_2 * 32 + row_1);
                             int token_valid_1 = ((token_1 < eos_3) ? 1 : 0);
-                            long long v_src = token_1 * v_stride_m3 + (long long)head_idx_3 * 128 + (long long)(segment_1 * 8);
+                            long long v_src = token_1 * v_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(segment_1 * 8);
                             int v_dst = smem_v_addr + (unsigned int)prep_ordinal % 4 * 41984 + (unsigned int)((row_1 * 128 + segment_1 * 8) * 2);
                             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                                 :: "r"(v_dst), "l"(v + v_src), "r"((token_valid_1 != 0) ? 16 : 0));

@@ -218,7 +218,7 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
             }
             if (write_rows != 0) {
                 long long row_start = row_starts[part];
-                long long row_offset = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)(row * 128 + col);
+                long long row_offset = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)(row * 128 + col);
                 {
                     float4 _v4 = make_float4(carry_reg[0 + 0], carry_reg[0 + 1], carry_reg[0 + 2], carry_reg[0 + 3]);
                     *reinterpret_cast<float4*>(rows + row_offset) = _v4;
@@ -247,7 +247,6 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
             }
             mbarrier_wait(map_full_addr + (map_slot) * 8, _phase_map_full);
             unsigned int panel_base = smem_m_addr + map_slot * 32768;
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             #pragma unroll
             for (int inner = 0; inner < 128; inner++) {
                 float a = __shfl_sync(0xFFFFFFFF, carry_reg[inner % 4], inner / 4);
@@ -278,6 +277,7 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
                 accum[2] = __fmaf_rn(a, _bf16x2_add_f32_1[0], accum[2]);
                 accum[3] = __fmaf_rn(a, _bf16x2_add_f32_1[1], accum[3]);
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             map_slot += 1;
             if (map_slot == 2) { map_slot = 0; _phase_map_full ^= 1; }
@@ -287,7 +287,7 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
         }
         if (write_final_state != 0) {
             int slot = final_indices[sequence];
-            long long final_offset = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)(row * 128 + col);
+            long long final_offset = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)(row * 128 + col);
             if (write_final_state == 1) {
                 {
                     float4 _v4 = make_float4(carry_reg[0 + 0], carry_reg[0 + 1], carry_reg[0 + 2], carry_reg[0 + 3]);
@@ -319,7 +319,7 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
             single_state[0 + 3] = _v4.w;
         }
         int slot_1 = final_indices[sequence];
-        long long final_offset_1 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)(row * 128 + col);
+        long long final_offset_1 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)(row * 128 + col);
         if (write_final_state == 1) {
             {
                 float4 _v4 = make_float4(single_state[0 + 0], single_state[0 + 1], single_state[0 + 2], single_state[0 + 3]);

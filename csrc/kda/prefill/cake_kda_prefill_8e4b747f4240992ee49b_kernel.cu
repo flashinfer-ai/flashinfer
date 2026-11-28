@@ -372,11 +372,11 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
         // state_ready: 1 barriers, init_count=4
         // snapshot_done: 1 barriers, init_count=4
         // state_read_done: 1 barriers, init_count=4
-        // dpair_ready: 1 barriers, init_count=4
+        // dpair_ready: 1 barriers, init_count=128
         // --- pipeline 'ops_pipe' ---
         // state_inp_ready: 2 barriers, init_count=4
         // u_ready: 2 barriers, init_count=1
-        // u_inp_ready: 2 barriers, init_count=4
+        // u_inp_ready: 2 barriers, init_count=128
         // u2_acc_ready: 2 barriers, init_count=1
         // u2_inp_ready: 2 barriers, init_count=4
         // final_ready: 2 barriers, init_count=1
@@ -391,11 +391,11 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
         // state_ready_0: 1 barriers, init_count=4
         // snapshot_done_0: 1 barriers, init_count=4
         // state_read_done_0: 1 barriers, init_count=4
-        // dpair_ready_0: 1 barriers, init_count=4
+        // dpair_ready_0: 1 barriers, init_count=128
         // --- pipeline 'ops_pipe_0' ---
         // state_inp_ready_0: 2 barriers, init_count=4
         // u_ready_0: 2 barriers, init_count=1
-        // u_inp_ready_0: 2 barriers, init_count=4
+        // u_inp_ready_0: 2 barriers, init_count=128
         // u2_acc_ready_0: 2 barriers, init_count=1
         // u2_inp_ready_0: 2 barriers, init_count=4
         // final_ready_0: 2 barriers, init_count=1
@@ -408,9 +408,11 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(27), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(20), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(18), "r"((uint32_t)(1)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(16), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(16), "r"((uint32_t)(128)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(14), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(12), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(10), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(9), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(6), "r"((uint32_t)(2)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(4), "r"((uint32_t)(1)));
         mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
@@ -418,9 +420,10 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(15), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(11), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(9), "r"((uint32_t)(1)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(7), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(7), "r"((uint32_t)(128)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(5), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(3), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_32) : "r"(lane), "n"(1), "r"((uint32_t)(128)));
         if (lane < 16) {
             mbarrier_init(smem + 256 + lane * 8, _mbarrier_init_count_0_32);
         }
@@ -618,11 +621,8 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                             int publish_dpair = ((step_chunks <= chunk + 1) ? 1 : 0);
                             if (publish_dpair != 0) {
                                 smem_dpair_0[state_row] = dpair_acc;
-                                __syncwarp();
-                                if (elect_sync()) {
-                                    asm volatile("tcgen05.fence::before_thread_sync;");
-                                    mbarrier_arrive(dpair_ready_addr);
-                                }
+                                asm volatile("tcgen05.fence::before_thread_sync;");
+                                mbarrier_arrive(dpair_ready_addr);
                                 dpair_published += 1;
                             }
                         }
@@ -725,11 +725,9 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                         tmem_st_x8_u32(u_base + residual_half * 8, (const uint32_t*)residual_bf16);
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                    __syncwarp();
-                    if (elect_sync()) {
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        mbarrier_arrive(u_inp_ready_addr + (compute_ops_stage) * 8);
-                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(u_inp_ready_addr + (compute_ops_stage) * 8);
                     mbarrier_wait(u2_acc_ready_addr + (compute_ops_stage) * 8, _phase_ops_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float tmem_load[32];
@@ -1502,10 +1500,10 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                         mbarrier_wait(ops_free_addr + (load_ops_stage) * 8, _phase_ops_free);
                         mbarrier_arrive_expect_tx(ops_full_addr + (load_ops_stage) * 8, 19600);
                         int slot_bf16 = (int)load_ops_stage * 16384;
-                        cp_async_bulk_gmem2smem(smem_kd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab * 4096) * (unsigned long long)2), 8192, ops_full_addr + (load_ops_stage) * 8);
-                        cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab * 6144) * (unsigned long long)2), 8192, ops_full_addr + (load_ops_stage) * 8);
-                        cp_async_bulk_gmem2smem(smem_inv_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab * 1024) * (unsigned long long)2), 2048, ops_full_addr + (load_ops_stage) * 8);
-                        cp_async_bulk_gmem2smem(smem_vec_0_addr + (unsigned int)((int)load_ops_stage * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab * 292) * (unsigned long long)4), 1168, ops_full_addr + (load_ops_stage) * 8);
+                        cp_async_bulk_gmem2smem(smem_kd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab * 4096ll) * (unsigned long long)2), 8192, ops_full_addr + (load_ops_stage) * 8);
+                        cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab * 6144ll) * (unsigned long long)2), 8192, ops_full_addr + (load_ops_stage) * 8);
+                        cp_async_bulk_gmem2smem(smem_inv_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab * 1024ll) * (unsigned long long)2), 2048, ops_full_addr + (load_ops_stage) * 8);
+                        cp_async_bulk_gmem2smem(smem_vec_0_addr + (unsigned int)((int)load_ops_stage * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab * 292ll) * (unsigned long long)4), 1168, ops_full_addr + (load_ops_stage) * 8);
                         load_ops_stage += 1;
                         if (load_ops_stage == 2) { load_ops_stage = 0; _phase_ops_free ^= 1; }
                     }
@@ -1670,11 +1668,8 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                             int publish_dpair_1 = ((step_chunks_4 <= chunk_4 + 1) ? 1 : 0);
                             if (publish_dpair_1 != 0) {
                                 smem_dpair_0_0[state_row_2] = dpair_acc_1;
-                                __syncwarp();
-                                if (elect_sync()) {
-                                    asm volatile("tcgen05.fence::before_thread_sync;");
-                                    mbarrier_arrive(dpair_ready_0_addr);
-                                }
+                                asm volatile("tcgen05.fence::before_thread_sync;");
+                                mbarrier_arrive(dpair_ready_0_addr);
                                 dpair_published_1 += 1;
                             }
                         }
@@ -1777,11 +1772,9 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                         tmem_st_x8_u32(u_base_1 + residual_half_1 * 8, (const uint32_t*)residual_bf16_1);
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                    __syncwarp();
-                    if (elect_sync()) {
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        mbarrier_arrive(u_inp_ready_0_addr + (compute_ops_stage_1) * 8);
-                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(u_inp_ready_0_addr + (compute_ops_stage_1) * 8);
                     mbarrier_wait(u2_acc_ready_0_addr + (compute_ops_stage_1) * 8, _phase_ops_full_0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float tmem_load_3[32];
@@ -2550,10 +2543,10 @@ kernel_cake_kda_prefill_8e4b747f4240992ee49b(int* __restrict__ items, int num_he
                         mbarrier_wait(ops_free_0_addr + (load_ops_stage_1) * 8, _phase_ops_free_0);
                         mbarrier_arrive_expect_tx(ops_full_0_addr + (load_ops_stage_1) * 8, 19600);
                         int slot_bf16_1 = (int)load_ops_stage_1 * 16384;
-                        cp_async_bulk_gmem2smem(smem_kd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab_1 * 4096) * (unsigned long long)2), 8192, ops_full_0_addr + (load_ops_stage_1) * 8);
-                        cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab_1 * 6144) * (unsigned long long)2), 8192, ops_full_0_addr + (load_ops_stage_1) * 8);
-                        cp_async_bulk_gmem2smem(smem_inv_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab_1 * 1024) * (unsigned long long)2), 2048, ops_full_0_addr + (load_ops_stage_1) * 8);
-                        cp_async_bulk_gmem2smem(smem_vec_0_addr_0 + (unsigned int)((int)load_ops_stage_1 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab_1 * 292) * (unsigned long long)4), 1168, ops_full_0_addr + (load_ops_stage_1) * 8);
+                        cp_async_bulk_gmem2smem(smem_kd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab_1 * 4096ll) * (unsigned long long)2), 8192, ops_full_0_addr + (load_ops_stage_1) * 8);
+                        cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab_1 * 6144ll) * (unsigned long long)2), 8192, ops_full_0_addr + (load_ops_stage_1) * 8);
+                        cp_async_bulk_gmem2smem(smem_inv_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab_1 * 1024ll) * (unsigned long long)2), 2048, ops_full_0_addr + (load_ops_stage_1) * 8);
+                        cp_async_bulk_gmem2smem(smem_vec_0_addr_0 + (unsigned int)((int)load_ops_stage_1 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab_1 * 292ll) * (unsigned long long)4), 1168, ops_full_0_addr + (load_ops_stage_1) * 8);
                         load_ops_stage_1 += 1;
                         if (load_ops_stage_1 == 2) { load_ops_stage_1 = 0; _phase_ops_free_0 ^= 1; }
                     }

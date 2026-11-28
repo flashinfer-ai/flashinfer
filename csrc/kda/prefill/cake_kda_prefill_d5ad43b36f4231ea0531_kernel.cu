@@ -636,42 +636,42 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             if (write_rows != 0) {
                 long long row_start = row_starts[part];
                 if (row0 < 128) {
-                    long long row_index = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[0];
+                    long long row_index = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[0];
                     {
                         float2 _v2 = make_float2(carry_reg[0 + 0], carry_reg[0 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index) = _v2;
                     }
                 }
                 if (row0 + 1 < 128) {
-                    long long row_index_1 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[1];
+                    long long row_index_1 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[1];
                     {
                         float2 _v2 = make_float2(carry_reg[2 + 0], carry_reg[2 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index_1) = _v2;
                     }
                 }
                 if (row0 + 2 < 128) {
-                    long long row_index_2 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[2];
+                    long long row_index_2 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[2];
                     {
                         float2 _v2 = make_float2(carry_reg[4 + 0], carry_reg[4 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index_2) = _v2;
                     }
                 }
                 if (row0 + 3 < 128) {
-                    long long row_index_3 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[3];
+                    long long row_index_3 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[3];
                     {
                         float2 _v2 = make_float2(carry_reg[6 + 0], carry_reg[6 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index_3) = _v2;
                     }
                 }
                 if (row0 + 4 < 128) {
-                    long long row_index_4 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[4];
+                    long long row_index_4 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[4];
                     {
                         float2 _v2 = make_float2(carry_reg[8 + 0], carry_reg[8 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index_4) = _v2;
                     }
                 }
                 if (row0 + 5 < 128) {
-                    long long row_index_5 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[5];
+                    long long row_index_5 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[5];
                     {
                         float2 _v2 = make_float2(carry_reg[10 + 0], carry_reg[10 + 1]);
                         *reinterpret_cast<float2*>(rows + row_index_5) = _v2;
@@ -730,7 +730,6 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             __syncthreads();
             mbarrier_wait(map_full_addr + (map_slot) * 8, _phase_map_full);
             unsigned int panel_base = smem_m_addr + map_slot * 32768;
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             #pragma unroll
             for (int inner = 0; inner < 128; inner++) {
                 unsigned int packed_m[1];
@@ -760,6 +759,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 accum[4] = fma_f32x2_rn_ftz(make_float2(unit_words_0[0], unit_words_0[0]), map_pair, accum[4]);
                 accum[5] = fma_f32x2_rn_ftz(make_float2(unit_words_0[1], unit_words_0[1]), map_pair, accum[5]);
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             map_slot += 1;
             if (map_slot == 2) { map_slot = 0; _phase_map_full ^= 1; }
@@ -779,7 +779,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
         if (write_final_state != 0) {
             int slot = final_indices[sequence];
             if (row0 < 128) {
-                long long final_index = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[0];
+                long long final_index = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[0];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[0 + 0], carry_reg[0 + 1]);
@@ -799,7 +799,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 }
             }
             if (row0 + 1 < 128) {
-                long long final_index_1 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[1];
+                long long final_index_1 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[1];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[2 + 0], carry_reg[2 + 1]);
@@ -819,7 +819,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 }
             }
             if (row0 + 2 < 128) {
-                long long final_index_2 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[2];
+                long long final_index_2 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[2];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[4 + 0], carry_reg[4 + 1]);
@@ -839,7 +839,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 }
             }
             if (row0 + 3 < 128) {
-                long long final_index_3 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[3];
+                long long final_index_3 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[3];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[6 + 0], carry_reg[6 + 1]);
@@ -859,7 +859,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 }
             }
             if (row0 + 4 < 128) {
-                long long final_index_4 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[4];
+                long long final_index_4 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[4];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[8 + 0], carry_reg[8 + 1]);
@@ -879,7 +879,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 }
             }
             if (row0 + 5 < 128) {
-                long long final_index_5 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[5];
+                long long final_index_5 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[5];
                 if (write_final_state == 1) {
                     {
                         float2 _v2 = make_float2(carry_reg[10 + 0], carry_reg[10 + 1]);
@@ -933,7 +933,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
         }
         int slot_1 = final_indices[sequence];
         if (row0 < 128) {
-            long long final_index_6 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[0];
+            long long final_index_6 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[0];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[0 + 0], single_state[0 + 1]);
@@ -953,7 +953,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             }
         }
         if (row0 + 1 < 128) {
-            long long final_index_7 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[1];
+            long long final_index_7 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[1];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[2 + 0], single_state[2 + 1]);
@@ -973,7 +973,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             }
         }
         if (row0 + 2 < 128) {
-            long long final_index_8 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[2];
+            long long final_index_8 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[2];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[4 + 0], single_state[4 + 1]);
@@ -993,7 +993,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             }
         }
         if (row0 + 3 < 128) {
-            long long final_index_9 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[3];
+            long long final_index_9 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[3];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[6 + 0], single_state[6 + 1]);
@@ -1013,7 +1013,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             }
         }
         if (row0 + 4 < 128) {
-            long long final_index_10 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[4];
+            long long final_index_10 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[4];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[8 + 0], single_state[8 + 1]);
@@ -1033,7 +1033,7 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             }
         }
         if (row0 + 5 < 128) {
-            long long final_index_11 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[5];
+            long long final_index_11 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[5];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(single_state[10 + 0], single_state[10 + 1]);

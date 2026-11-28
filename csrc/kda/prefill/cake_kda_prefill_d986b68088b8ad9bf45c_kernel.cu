@@ -483,12 +483,12 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
             long long total_chunks = cu_chunk_offsets[num_sequences];
             long long fallback_head = total_chunks * (long long)num_heads + (long long)seq_idx * (long long)num_heads + (long long)head_idx;
             const int tmem_row_base = warp_in_wg * 32 << 16;
-            long long state_base = (((long long)seq_idx * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
+            long long state_base = (((long long)seq_idx * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 128ll;
             int state_slot = seq_idx;
             if (use_state_indices != 0) {
                 state_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx];
             }
-            state_base = (long long)state_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
+            state_base = (long long)state_slot * state_slot_stride + ((long long)head_idx * 128ll + (long long)state_row) * 128ll;
             long long checkpoint_row_start = 0;
             long long checkpoint_single_token = 0;
             if (checkpoint_every_n_tokens != 0) {
@@ -697,7 +697,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                 for (int _ls = 0; _ls < 16; _ls++)
                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(prediction)[_ls], _scale2_1);
                 long long chunk_global_e = cu_chunk_offsets[seq_idx] + (long long)chunk_global_local;
-                long long tape_ex_base = ((chunk_global_e * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 32;
+                long long tape_ex_base = ((chunk_global_e * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 32ll;
                 #pragma unroll
                 for (int residual_half = 0; residual_half < 2; residual_half++) {
                     float residual_v[16];
@@ -756,7 +756,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v[_lp*2 + 14], residual_v[_lp*2+1 + 14]));
                             _packed_8[_lp + 3] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<int4*>(tape_e + (tape_ex_base + (long long)(residual_half * 16) + 8))[0] = reinterpret_cast<int4*>(_packed_8)[0];
+                        reinterpret_cast<int4*>(tape_e + (tape_ex_base + (long long)(residual_half * 16) + 8ll))[0] = reinterpret_cast<int4*>(_packed_8)[0];
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
@@ -805,7 +805,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v[_lp*2 + 14], residual_v[_lp*2+1 + 14]));
                             _packed_10[_lp + 3] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<int4*>(tape_x + (tape_ex_base + (long long)(residual_half * 16) + 8))[0] = reinterpret_cast<int4*>(_packed_10)[0];
+                        reinterpret_cast<int4*>(tape_x + (tape_ex_base + (long long)(residual_half * 16) + 8ll))[0] = reinterpret_cast<int4*>(_packed_10)[0];
                     }
                     unsigned int residual_v_bf16[8];
                     #pragma unroll
@@ -816,6 +816,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                     tmem_st_x8_u32(taddr + 224 + (unsigned int)tmem_row_base + (unsigned int)(residual_half * 8), (const uint32_t*)residual_v_bf16);
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(v_free_addr + ((int)((unsigned int)chunk_idx % 5)) * 8);
                 if (elect_sync()) {
@@ -834,7 +835,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (STORE_BACKWARD_TAPE != 0 && owned_chunk != 0) {
                     long long chunk_global_r = cu_chunk_offsets[seq_idx] + (long long)chunk_global_local;
-                    long long tape_r_base = ((chunk_global_r * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 32;
+                    long long tape_r_base = ((chunk_global_r * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 32ll;
                     #pragma unroll
                     for (int tape_r_vec = 0; tape_r_vec < 4; tape_r_vec++) {
                         unsigned int _packed_11[4];
@@ -887,12 +888,12 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
             }
             if (store_final_state != 0) {
                 long long merge_slot_offset = reinterpret_cast<long long*>(state_indices_addr)[seq_idx];
-                long long merge_main_base = (((long long)(seq_idx + 1) * (long long)num_heads + (long long)head_idx) * 128 + (long long)state_row) * 128;
-                long long merge_pool_base = merge_slot_offset + ((long long)head_idx * 128 + (long long)state_row) * 128;
+                long long merge_main_base = (((long long)(seq_idx + 1) * (long long)num_heads + (long long)head_idx) * 128ll + (long long)state_row) * 128ll;
+                long long merge_pool_base = merge_slot_offset + ((long long)head_idx * 128ll + (long long)state_row) * 128ll;
                 #pragma unroll
                 for (int state_col_block_2 = 0; state_col_block_2 < 4; state_col_block_2++) {
                     float merge_values[32];
-                    if (merge_slot_offset >= 0) {
+                    if (merge_slot_offset >= 0ll) {
                         #pragma unroll
                         for (int merge_quarter = 0; merge_quarter < 4; merge_quarter++) {
                             {
@@ -925,7 +926,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                         : "=f"(tmem_load_2[0]), "=f"(tmem_load_2[1]), "=f"(tmem_load_2[2]), "=f"(tmem_load_2[3]), "=f"(tmem_load_2[4]), "=f"(tmem_load_2[5]), "=f"(tmem_load_2[6]), "=f"(tmem_load_2[7]), "=f"(tmem_load_2[8]), "=f"(tmem_load_2[9]), "=f"(tmem_load_2[10]), "=f"(tmem_load_2[11]), "=f"(tmem_load_2[12]), "=f"(tmem_load_2[13]), "=f"(tmem_load_2[14]), "=f"(tmem_load_2[15]), "=f"(tmem_load_2[16]), "=f"(tmem_load_2[17]), "=f"(tmem_load_2[18]), "=f"(tmem_load_2[19]), "=f"(tmem_load_2[20]), "=f"(tmem_load_2[21]), "=f"(tmem_load_2[22]), "=f"(tmem_load_2[23]), "=f"(tmem_load_2[24]), "=f"(tmem_load_2[25]), "=f"(tmem_load_2[26]), "=f"(tmem_load_2[27]), "=f"(tmem_load_2[28]), "=f"(tmem_load_2[29]), "=f"(tmem_load_2[30]), "=f"(tmem_load_2[31])
                         : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                    if (merge_slot_offset >= 0) {
+                    if (merge_slot_offset >= 0ll) {
                         #pragma unroll
                         for (int merge_item = 0; merge_item < 32; merge_item++) {
                             float _add_3;
@@ -952,8 +953,8 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                 }
                 if (seq_idx == 0) {
                     long long merge_first_offset = reinterpret_cast<long long*>(state_indices_addr)[num_sequences];
-                    if (merge_first_offset >= 0) {
-                        long long merge_first_main = ((long long)head_idx * 128 + (long long)state_row) * 128;
+                    if (merge_first_offset >= 0ll) {
+                        long long merge_first_main = ((long long)head_idx * 128ll + (long long)state_row) * 128ll;
                         #pragma unroll
                         for (int state_col_block_3 = 0; state_col_block_3 < 4; state_col_block_3++) {
                             float merge_first_values[32];
@@ -1281,7 +1282,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             merge_pair_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
                         if (merge_token < eos_1) {
-                            asm volatile("red.global.add.noftz.bf16x2 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&(out + ((merge_token * (long long)num_heads + (long long)head_idx_1) * 128 + merge_dim_pair))[0])), "r"((unsigned int)(merge_pair_bf16[0])) : "memory");
+                            asm volatile("red.global.add.noftz.bf16x2 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&(out + ((merge_token * (long long)num_heads + (long long)head_idx_1) * 128ll + merge_dim_pair))[0])), "r"((unsigned int)(merge_pair_bf16[0])) : "memory");
                         }
                     }
                 }
@@ -1606,9 +1607,9 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                         int gate_load_row = gate_load_item / 16;
                         int gate_load_segment = gate_load_item % 16;
                         long long gate_load_token = bos_3 + (long long)(chunk_idx_2 * 32 + gate_load_row);
-                        long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
-                        long long q_load_base = gate_load_token * q_stride_m3 + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
-                        long long k_load_base = gate_load_token * k_stride_m3 + (long long)head_idx_3 * 128 + (long long)(gate_load_segment * 8);
+                        long long gate_load_base = gate_load_token * g_token_stride + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
+                        long long q_load_base = gate_load_token * q_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
+                        long long k_load_base = gate_load_token * k_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(gate_load_segment * 8);
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                             :: "r"(smem_g_raw_addr + prep_stage * 41984 + (unsigned int)(gate_load_item * 16)), "l"(g + gate_load_base), "r"((gate_load_token < eos_3) ? 16 : 0));
                         int q_tail_addr = (smem_q_raw_prefetch_addr + prep_stage * 41984 + (unsigned int)(gate_load_segment * 8 / 64 * 4096 + gate_load_row * 128 + gate_load_segment * 8 % 64 * 2 ^ (gate_load_segment * 8 / 64 * 4096 + gate_load_row * 128 + gate_load_segment * 8 % 64 * 2 >> 7 & 7) << 4));
@@ -1689,7 +1690,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             float gate_log0_1 = gate_log_pair_1.x;
                             float gate_log1_1 = gate_log_pair_1.y;
                             long long gate_token0 = bos_3 + (long long)(chunk_idx_2 * 32 + gate_row0_0_1);
-                            long long gate_token1 = gate_token0 + 1;
+                            long long gate_token1 = gate_token0 + 1ll;
                             if (gate_token0 >= eos_3) {
                                 gate_log0_1 = 0.0f;
                             }
@@ -1723,7 +1724,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                     int segment = work_item % 16;
                     long long token = bos_3 + (long long)(chunk_idx_2 * 32 + row);
                     int token_valid = ((token < eos_3) ? 1 : 0);
-                    long long gmem_base = (token * (long long)num_heads + (long long)head_idx_3) * 128 + (long long)(segment * 8);
+                    long long gmem_base = (token * (long long)num_heads + (long long)head_idx_3) * 128ll + (long long)(segment * 8);
                     float q_raw_vec[8];
                     float k_raw_vec[8];
                     unsigned int packed[4];
@@ -2956,7 +2957,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             for (int value_idx_7 = 0; value_idx_7 < 8; value_idx_7++) {
                                 restore_kd_values[value_idx_7] = unpack_bf16_2[value_idx_7];
                             }
-                            long long tape_scaled_index = tape_scaled_base + (long long)restore_row * 128 + (long long)(restore_segment * 8);
+                            long long tape_scaled_index = tape_scaled_base + (long long)restore_row * 128ll + (long long)(restore_segment * 8);
                             unsigned int packed_6[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -3093,7 +3094,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                             for (int value_idx_10 = 0; value_idx_10 < 8; value_idx_10++) {
                                 restore_kd_values_1[value_idx_10] = unpack_bf16_4[value_idx_10];
                             }
-                            long long tape_scaled_index_1 = tape_scaled_base + (long long)restore_row_1 * 128 + (long long)(restore_segment_1 * 8);
+                            long long tape_scaled_index_1 = tape_scaled_base + (long long)restore_row_1 * 128ll + (long long)(restore_segment_1 * 8);
                             unsigned int packed_11[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -3272,7 +3273,7 @@ kernel_cake_kda_prefill_d986b68088b8ad9bf45c(__nv_bfloat16* __restrict__ q, cons
                         int segment_1 = v_item % 16;
                         long long token_1 = bos_3 + (long long)(chunk_idx_2 * 32 + row_1);
                         int token_valid_1 = ((token_1 < eos_3) ? 1 : 0);
-                        long long v_src = token_1 * v_stride_m3 + (long long)head_idx_3 * 128 + (long long)(segment_1 * 8);
+                        long long v_src = token_1 * v_stride_m3 + (long long)head_idx_3 * 128ll + (long long)(segment_1 * 8);
                         int v_dst = smem_v_addr + prep_stage * 41984 + (unsigned int)((row_1 * 128 + segment_1 * 8) * 2);
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                             :: "r"(v_dst), "l"(v + v_src), "r"((token_valid_1 != 0) ? 16 : 0));

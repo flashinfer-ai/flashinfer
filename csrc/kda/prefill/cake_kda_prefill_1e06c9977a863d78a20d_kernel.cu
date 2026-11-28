@@ -373,42 +373,42 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             if (write_rows != 0) {
                 long long row_start = row_starts[part];
-                long long row_index = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[0];
+                long long row_index = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[0];
                 {
                     float2 _v2 = make_float2(carry_reg[0 + 0], carry_reg[0 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index) = _v2;
                 }
-                long long row_index_0 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[1];
+                long long row_index_0 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[1];
                 {
                     float2 _v2 = make_float2(carry_reg[2 + 0], carry_reg[2 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_0) = _v2;
                 }
-                long long row_index_1 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[2];
+                long long row_index_1 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[2];
                 {
                     float2 _v2 = make_float2(carry_reg[4 + 0], carry_reg[4 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_1) = _v2;
                 }
-                long long row_index_2 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[3];
+                long long row_index_2 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[3];
                 {
                     float2 _v2 = make_float2(carry_reg[6 + 0], carry_reg[6 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_2) = _v2;
                 }
-                long long row_index_3 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[4];
+                long long row_index_3 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[4];
                 {
                     float2 _v2 = make_float2(carry_reg[8 + 0], carry_reg[8 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_3) = _v2;
                 }
-                long long row_index_4 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[5];
+                long long row_index_4 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[5];
                 {
                     float2 _v2 = make_float2(carry_reg[10 + 0], carry_reg[10 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_4) = _v2;
                 }
-                long long row_index_5 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[6];
+                long long row_index_5 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[6];
                 {
                     float2 _v2 = make_float2(carry_reg[12 + 0], carry_reg[12 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_5) = _v2;
                 }
-                long long row_index_6 = (row_start * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[7];
+                long long row_index_6 = (row_start * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[7];
                 {
                     float2 _v2 = make_float2(carry_reg[14 + 0], carry_reg[14 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_6) = _v2;
@@ -478,7 +478,6 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             __syncthreads();
             mbarrier_wait(map_full_addr + (map_slot) * 8, _phase_map_full);
             unsigned int panel_base = smem_m_addr + map_slot * 32768;
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             #pragma unroll
             for (int inner = 0; inner < 128; inner++) {
                 unsigned int packed_m[1];
@@ -510,6 +509,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 accum[6] = fma_f32x2_rn_ftz(make_float2(unit_words_0[2], unit_words_0[2]), map_pair, accum[6]);
                 accum[7] = fma_f32x2_rn_ftz(make_float2(unit_words_0[3], unit_words_0[3]), map_pair, accum[7]);
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             map_slot += 1;
             if (map_slot == 2) { map_slot = 0; _phase_map_full ^= 1; }
@@ -532,7 +532,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
         }
         if (write_final_state != 0) {
             int slot = final_indices[sequence];
-            long long final_index = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[0];
+            long long final_index = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[0];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[0 + 0], carry_reg[0 + 1]);
@@ -550,7 +550,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index))[0] = reinterpret_cast<unsigned*>(packed)[0];
             }
-            long long final_index_0 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[1];
+            long long final_index_0 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[1];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[2 + 0], carry_reg[2 + 1]);
@@ -568,7 +568,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_0))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
             }
-            long long final_index_1 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[2];
+            long long final_index_1 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[2];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[4 + 0], carry_reg[4 + 1]);
@@ -586,7 +586,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_1))[0] = reinterpret_cast<unsigned*>(packed_2)[0];
             }
-            long long final_index_2 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[3];
+            long long final_index_2 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[3];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[6 + 0], carry_reg[6 + 1]);
@@ -604,7 +604,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_2))[0] = reinterpret_cast<unsigned*>(packed_3)[0];
             }
-            long long final_index_3 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[4];
+            long long final_index_3 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[4];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[8 + 0], carry_reg[8 + 1]);
@@ -622,7 +622,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_3))[0] = reinterpret_cast<unsigned*>(packed_4)[0];
             }
-            long long final_index_4 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[5];
+            long long final_index_4 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[5];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[10 + 0], carry_reg[10 + 1]);
@@ -640,7 +640,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_4))[0] = reinterpret_cast<unsigned*>(packed_5)[0];
             }
-            long long final_index_5 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[6];
+            long long final_index_5 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[6];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[12 + 0], carry_reg[12 + 1]);
@@ -658,7 +658,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_5))[0] = reinterpret_cast<unsigned*>(packed_6)[0];
             }
-            long long final_index_6 = (long long)slot * final_slot_stride + (long long)task * 16384 + (long long)row_offset[7];
+            long long final_index_6 = (long long)slot * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[7];
             if (write_final_state == 1) {
                 {
                     float2 _v2 = make_float2(carry_reg[14 + 0], carry_reg[14 + 1]);
@@ -712,42 +712,42 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             if (write_rows != 0) {
                 long long row_start_1 = row_starts[part_stop - 1];
-                long long row_index_7 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[0];
+                long long row_index_7 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[0];
                 {
                     float2 _v2 = make_float2(carry_reg[0 + 0], carry_reg[0 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_7) = _v2;
                 }
-                long long row_index_7_1 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[1];
+                long long row_index_7_1 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[1];
                 {
                     float2 _v2 = make_float2(carry_reg[2 + 0], carry_reg[2 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_7_1) = _v2;
                 }
-                long long row_index_8 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[2];
+                long long row_index_8 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[2];
                 {
                     float2 _v2 = make_float2(carry_reg[4 + 0], carry_reg[4 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_8) = _v2;
                 }
-                long long row_index_9 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[3];
+                long long row_index_9 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[3];
                 {
                     float2 _v2 = make_float2(carry_reg[6 + 0], carry_reg[6 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_9) = _v2;
                 }
-                long long row_index_10 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[4];
+                long long row_index_10 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[4];
                 {
                     float2 _v2 = make_float2(carry_reg[8 + 0], carry_reg[8 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_10) = _v2;
                 }
-                long long row_index_11 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[5];
+                long long row_index_11 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[5];
                 {
                     float2 _v2 = make_float2(carry_reg[10 + 0], carry_reg[10 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_11) = _v2;
                 }
-                long long row_index_12 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[6];
+                long long row_index_12 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[6];
                 {
                     float2 _v2 = make_float2(carry_reg[12 + 0], carry_reg[12 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_12) = _v2;
                 }
-                long long row_index_13 = (row_start_1 * (long long)num_heads + (long long)task) * 16384 + (long long)row_offset[7];
+                long long row_index_13 = (row_start_1 * (long long)num_heads + (long long)task) * 16384ll + (long long)row_offset[7];
                 {
                     float2 _v2 = make_float2(carry_reg[14 + 0], carry_reg[14 + 1]);
                     *reinterpret_cast<float2*>(rows + row_index_13) = _v2;
@@ -797,7 +797,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             single_state[14 + 1] = _v2_31.y;
         }
         int slot_1 = final_indices[sequence];
-        long long final_index_7 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[0];
+        long long final_index_7 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[0];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[0 + 0], single_state[0 + 1]);
@@ -815,7 +815,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7))[0] = reinterpret_cast<unsigned*>(packed_8)[0];
         }
-        long long final_index_7_1 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[1];
+        long long final_index_7_1 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[1];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[2 + 0], single_state[2 + 1]);
@@ -833,7 +833,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7_1))[0] = reinterpret_cast<unsigned*>(packed_9)[0];
         }
-        long long final_index_8 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[2];
+        long long final_index_8 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[2];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[4 + 0], single_state[4 + 1]);
@@ -851,7 +851,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_8))[0] = reinterpret_cast<unsigned*>(packed_10)[0];
         }
-        long long final_index_9 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[3];
+        long long final_index_9 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[3];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[6 + 0], single_state[6 + 1]);
@@ -869,7 +869,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_9))[0] = reinterpret_cast<unsigned*>(packed_11)[0];
         }
-        long long final_index_10 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[4];
+        long long final_index_10 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[4];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[8 + 0], single_state[8 + 1]);
@@ -887,7 +887,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_10))[0] = reinterpret_cast<unsigned*>(packed_12)[0];
         }
-        long long final_index_11 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[5];
+        long long final_index_11 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[5];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[10 + 0], single_state[10 + 1]);
@@ -905,7 +905,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_11))[0] = reinterpret_cast<unsigned*>(packed_13)[0];
         }
-        long long final_index_12 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[6];
+        long long final_index_12 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[6];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[12 + 0], single_state[12 + 1]);
@@ -923,7 +923,7 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
             }
             reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_12))[0] = reinterpret_cast<unsigned*>(packed_14)[0];
         }
-        long long final_index_13 = (long long)slot_1 * final_slot_stride + (long long)task * 16384 + (long long)row_offset[7];
+        long long final_index_13 = (long long)slot_1 * final_slot_stride + (long long)task * 16384ll + (long long)row_offset[7];
         if (write_final_state == 1) {
             {
                 float2 _v2 = make_float2(single_state[14 + 0], single_state[14 + 1]);
