@@ -214,7 +214,7 @@
     "pre_unification/moe_hopper_fp8/hopper_moe_utils.py": "89bbfb185312c406c7e904930ecc3932a66aaade39d4193422c0d32bf4bb25a3",
     "pre_unification/moe_hopper_fp8/kernel_fp8_glu_fc12.py": "db392edb70159a9e49f0cca3dfc2eaa16d2a2c53999af3bfb1237e3ffb88a439",
     "pre_unification/moe_hopper_fp8/kernel_fp8_glu_fc12_swapab.py": "6530f772ef840b6714647ce610791f29fde9e7bd15c391452a742261aa62c5f0",
-    "pre_unification/moe_hopper_fp8/kernel_mxfp4_fp8_glu_fc12_swapab.py": "7bb7b0d38ee223e79407d26ac90f9227208ffddb6f51116bc99e69c384891286",
+    "pre_unification/moe_hopper_fp8/kernel_mxfp4_fp8_glu_fc12_swapab.py": "5b7e7ad65ac17b8e894a01541964f12313f63bd157242961b029970d99501d96",
     "pre_unification/moe_hopper_fp8/mega_reference_fp8.py": "7215c278e68369e94e8c217b7d44a8cea3037e03a15257e5d20a5564d3abcf9d",
     "pre_unification/moe_hopper_fp8/megamoe_kernel_fp8.py": "6b2a3a2f0aaab4b3856d7391432a2f4788a687f72031793d8455c7678cb9e078",
     "pre_unification/moe_hopper_fp8/mxfp4_cutedsl.py": "6de7fe5696c18d1a8d1eaea0c945da5314b1b86b3afae1883ac096df06b85296",

@@ -31,6 +31,25 @@ from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.nvfp4_autotune import (
 from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.nvfp4_tuner import (
     hopper_nvfp4_candidates,
 )
+from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.int4_autotune import (
+    autotune_hopper_int4_mega_moe,
+)
+from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.int4_tuner import (
+    hopper_int4_candidates,
+)
+from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.hopper_int4 import (
+    MegaMoEHopperInt4Config,
+    MegaMoEHopperInt4Frontend,
+    MegaMoEHopperInt4Inputs,
+    MegaMoEHopperInt4SymmBuffer,
+    TransformedInt4Weights,
+    _get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config,
+    _resolve_hopper_int4_mega_moe_config,
+    get_symm_buffer_for_hopper_int4_mega_moe,
+    hopper_int4_mega_launch_thunk,
+    hopper_int4_mega_moe,
+    resolve_hopper_int4_knobs,
+)
 from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.knob_cache import (
     knob_cache_path,
     lookup_knobs,
@@ -168,6 +187,19 @@ def __getattr__(name):  # PEP 562
 
 
 __all__ = [
+    "MegaMoEHopperInt4Config",
+    "MegaMoEHopperInt4Frontend",
+    "MegaMoEHopperInt4Inputs",
+    "MegaMoEHopperInt4SymmBuffer",
+    "TransformedInt4Weights",
+    "get_symm_buffer_for_hopper_int4_mega_moe",
+    "hopper_int4_mega_moe",
+    "hopper_int4_mega_launch_thunk",
+    "resolve_hopper_int4_knobs",
+    "autotune_hopper_int4_mega_moe",
+    "hopper_int4_candidates",
+    "_get_symm_buffer_for_hopper_int4_mega_moe_from_resolved_config",
+    "_resolve_hopper_int4_mega_moe_config",
     "MegaMoEHopperNvfp4Config",
     "MegaMoEHopperNvfp4Frontend",
     "MegaMoEHopperNvfp4Inputs",

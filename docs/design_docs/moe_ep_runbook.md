@@ -242,6 +242,12 @@ sweep has its own bench script,
 `benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
 (same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
 
+The [SM90 WINT4 x AFP8 backend](../../flashinfer/moe_ep/shims/sm90/cutedsl_megamoe/INT4.md)
+uses `bash tests/moe_ep/run_tests.sh oracle_sm90_int4` for single-GPU conversion
+and correctness, and `bash tests/moe_ep/run_tests.sh mega_sm90_int4` for public
+API multi-rank correctness and Graph replay. The latter defaults to 4 Hopper
+GPUs; set `NPROC_MULTIRANK=2` or `8` for the other supported EP sizes.
+
 The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
 Cake-generated parametric persistent kernel per deployment, JIT-compiled from
 `flashinfer/moe_ep/shims/sm120/cake_mxfp4/`) has its own target,
