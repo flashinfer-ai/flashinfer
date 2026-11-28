@@ -46,6 +46,7 @@ from .cudnn.utils import (
     cudnn_frontend_serves_frost_decode,
 )
 from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
+from .jit.core import logger
 from .jit import (
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -3560,8 +3561,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if key_block_scales is not None:
-                print(
-                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                logger.warning_once(
+                    "NVFP4 KV cache with NHD layout will be converted to HND, "
                     "incurring extra transpose and contiguous copy overhead. "
                     "Use kv_layout='HND' for better performance."
                 )
@@ -5029,8 +5030,8 @@ def trtllm_batch_decode_with_kv_cache(
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if is_nvfp4_kvcache:
-                print(
-                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                logger.warning_once(
+                    "NVFP4 KV cache with NHD layout will be converted to HND, "
                     "incurring extra transpose and contiguous copy overhead. "
                     "Use kv_layout='HND' for better performance."
                 )

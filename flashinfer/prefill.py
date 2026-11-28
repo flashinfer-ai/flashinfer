@@ -5622,8 +5622,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if key_block_scales is not None:
-                print(
-                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                logger.warning_once(
+                    "NVFP4 KV cache with NHD layout will be converted to HND, "
                     "incurring extra transpose and contiguous copy overhead. "
                     "Use kv_layout='HND' for better performance."
                 )
@@ -9727,8 +9727,8 @@ def trtllm_batch_context_with_kv_cache(
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
         if key_block_scales is not None:
-            print(
-                "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+            logger.warning_once(
+                "NVFP4 KV cache with NHD layout will be converted to HND, "
                 "incurring extra transpose and contiguous copy overhead. "
                 "Use kv_layout='HND' for better performance."
             )
