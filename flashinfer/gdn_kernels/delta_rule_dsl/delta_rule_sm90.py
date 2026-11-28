@@ -6,12 +6,18 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
-from ...utils import get_device_sm_count, _get_cache_buf
+from ...utils import _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile, get_cached_compile
 from .collective_inverse_hmma import CollectiveInverse
-from .helpers import SM90, round_down, select_tensor_10, state_dtype_to_cutlass
+from .helpers import (
+    SM90,
+    get_device_nsmid,
+    round_down,
+    select_tensor_10,
+    state_dtype_to_cutlass,
+)
 from .schedule import WorkDesc
 from .varlen_helper import (
     check_checkpoint_key_range,
@@ -2891,7 +2897,7 @@ def delta_rule_prefill_dsl_sm90(
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
-    workspace_size = get_device_sm_count(device) * 128
+    workspace_size = get_device_nsmid(device) * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 

@@ -21,6 +21,7 @@ from .collective_inverse_hmma import CollectiveInverse
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile, get_cached_compile
 from .helpers import (
+    get_device_nsmid,
     SM90,
     TF32,
     WarpMmaTF32Op,
@@ -4549,7 +4550,7 @@ def cp_delta_rule_prefill_dsl_sm90(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    workspace_size = get_device_sm_count(device) * 128
+    workspace_size = get_device_nsmid(device) * 128
     tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, device)
     stream = (
         _stream
