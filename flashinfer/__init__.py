@@ -118,6 +118,7 @@ from .quantization.nvfp4_quantization_utils import (
     resolve_nvfp4_4over6,
 )
 from .quantization.fp8_quantization import (
+    mxfp8_dequantize,
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
     mxfp8_quantize,

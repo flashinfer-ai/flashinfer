@@ -14,6 +14,7 @@
 
 """TraceTemplates for FP4 / FP8 quantization APIs."""
 
+import functools
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -613,6 +614,36 @@ mxfp8_quantize_trace = TraceTemplate(
     reference=_mxfp8_quantize_reference,
     init=_mxfp8_quantize_init,
 )
+
+
+@functools.cache
+def _mxfp8_dequantize_template(ndim):
+    dims = [f"dim{i}" for i in range(ndim - 1)] + ["K"]
+    return TraceTemplate(
+        op_type="quantization",
+        name_prefix=f"mxfp8_dequantize_{ndim}d",
+        description="Decode E4M3FN values on the CPU using one UE8M0 scale per 32 elements.",
+        axes={
+            **{d: Var() for d in dims[:-1]},
+            "K": Const(abbrev="k"),
+            "num_scale_elems": Var(),
+        },
+        inputs={
+            "input": Tensor(dims),
+            "scale_tensor": Tensor(["num_scale_elems"], dtype="uint8"),
+            "is_sf_swizzled_layout": Scalar("bool", optional=True),
+            "sf_swizzle_layout": Scalar("int32", optional=True),
+        },
+        outputs={"output": Tensor(dims, dtype="float32")},
+        tags=["status:verified", "quantization:mxfp8"],
+    )
+
+
+def mxfp8_dequantize_trace(**kwargs):
+    return _mxfp8_dequantize_template(kwargs["input"].ndim)
+
+
+mxfp8_dequantize_trace.templates = [_mxfp8_dequantize_template(2)]  # type: ignore[attr-defined]
 
 
 # ── NVFP4 KV-cache quantize (linear block-scale layout) ──────────────────────

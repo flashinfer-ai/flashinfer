@@ -243,6 +243,7 @@ FP8 Quantization
     :toctree: ../generated
 
     mxfp8_quantize
+    mxfp8_dequantize
     mxfp8_grouped_quantize
     silu_and_mul_mxfp8_experts_quantize
     mxfp8_dequantize_host

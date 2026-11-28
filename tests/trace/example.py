@@ -35,6 +35,7 @@ qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
+mxfp8_dequantize_2d_k4096.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 cute_dsl_fused_moe_topk2_e3_h768.json
 decode_cp_a2a_lse_reduce_tokens_d512.json
@@ -680,6 +681,7 @@ from flashinfer.quantization.fp4_quantization import (
     silu_and_mul_nvfp4_quantize,
 )
 from flashinfer.quantization.fp8_quantization import (
+    mxfp8_dequantize,
     mxfp8_grouped_quantize,
     mxfp8_quantize,
     silu_and_mul_mxfp8_experts_quantize,
@@ -696,7 +698,8 @@ with contextlib.suppress(Exception):
 with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
-    mxfp8_quantize(quant_input_bf16)
+    quant_fp8, quant_sf = mxfp8_quantize(quant_input_bf16)
+    mxfp8_dequantize(quant_fp8, quant_sf)
 # Match silu_and_mul_h16384 with a gated [M, 2K] input and packed [M, K/2] output.
 with contextlib.suppress(Exception):
     silu_and_mul_nvfp4_quantize(
