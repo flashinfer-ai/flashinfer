@@ -678,8 +678,25 @@ def compute_reference_moe_fp4(
     device = hidden_states.device
 
     hidden_states = hidden_states.float()
-    gemm1_weights = gemm1_weights.float()
-    gemm2_weights = gemm2_weights.float()
+
+    fp32_cache_budget_bytes = 8 * 1024**3
+    fp32_cache: dict[tuple[int, int], torch.Tensor] = {}
+    fp32_cache_bytes = 0
+
+    def _expert_weight_fp32(which: int, weights: torch.Tensor, idx: int):
+        nonlocal fp32_cache_bytes
+        if weights.dtype == torch.float32:
+            return weights[idx]
+        cached = fp32_cache.get((which, idx))
+        if cached is not None:
+            return cached
+        w = weights[idx].float()
+        nbytes = w.numel() * w.element_size()
+        if fp32_cache_bytes + nbytes <= fp32_cache_budget_bytes:
+            fp32_cache[(which, idx)] = w
+            fp32_cache_bytes += nbytes
+        return w
+
     if gemm1_alpha is None:
         gemm1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
     else:
@@ -708,7 +725,7 @@ def compute_reference_moe_fp4(
                 # This expert is not on this EP rank, skip
                 continue
 
-            w1 = gemm1_weights[local_idx]
+            w1 = _expert_weight_fp32(0, gemm1_weights, local_idx)
             gemm1_out = gemm1_alpha[local_idx] * (token_input @ w1.T)
 
             per_token_scale = None
@@ -766,7 +783,7 @@ def compute_reference_moe_fp4(
                         act_out, fc2_input_scale, sf_vec_size=16
                     )
 
-            w2 = gemm2_weights[local_idx]
+            w2 = _expert_weight_fp32(1, gemm2_weights, local_idx)
             gemm2_out = act_out @ w2.T
 
             output_scale = scale * gemm2_alpha[local_idx]
@@ -814,28 +831,16 @@ def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
     return torch.stack(quantized), torch.cat([sf.reshape(-1) for sf in scales])
 
 
-def create_moe_tensors(
+def create_moe_activation_tensors(
     num_tokens: int,
     hidden_size: int,
-    intermediate_size: int,
     num_experts: int,
-    num_local_experts: int,
     top_k: int,
     device: str = "cuda",
     seed: int = 42,
-    gated: bool = True,
     use_per_token_activation: bool = False,
-    interleave_gated_weights: bool = True,
-    use_nontrivial_alphas: bool = True,
-    vary_block_scales: bool = False,
-    swap_ab: bool = False,
 ):
-    """Create properly quantized MoE tensors for testing.
-
-    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
-    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
-    callers should use :func:`create_b12x_moe_tensors` for that configuration.
-    """
+    """Create the NVFP4 activation and routing tensors for MoE tests."""
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization import (
         SfLayout,
@@ -846,7 +851,6 @@ def create_moe_tensors(
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
     torch.manual_seed(seed)
     sf_vec_size = 16
@@ -905,6 +909,54 @@ def create_moe_tensors(
     routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     routing_weights = routing_weights.float()
     selected_experts = selected_experts.to(torch.int32)
+
+    return {
+        "x": x_quantized,
+        "x_sf": x_sf,
+        "x_bf16": x_bf16,
+        "x_ref": x_ref,
+        "x_per_token_scale": x_per_token_scale,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+    }
+
+
+def create_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+    gated: bool = True,
+    use_per_token_activation: bool = False,
+    interleave_gated_weights: bool = True,
+    use_nontrivial_alphas: bool = True,
+    vary_block_scales: bool = False,
+    swap_ab: bool = False,
+):
+    """Create properly quantized MoE tensors for testing.
+
+    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
+    nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
+    callers should use :func:`create_b12x_moe_tensors` for that configuration.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    sf_vec_size = 16
+
+    activation_tensors = create_moe_activation_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        device=device,
+        seed=seed,
+        use_per_token_activation=use_per_token_activation,
+    )
 
     # GEMM1 weights: gated SwiGLU has 2*intermediate rows (interleaved
     # linear+gate); non-gated ReLU^2 has a single intermediate-row projection.
@@ -990,13 +1042,7 @@ def create_moe_tensors(
     fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     return {
-        "x": x_quantized,
-        "x_sf": x_sf,
-        "x_bf16": x_bf16,
-        "x_ref": x_ref,
-        "x_per_token_scale": x_per_token_scale,
-        "token_selected_experts": selected_experts,
-        "token_final_scales": routing_weights,
+        **activation_tensors,
         "w1_weight": w1_q,
         "w1_weight_sf": w1_weight_sf,
         "w1_weight_bf16": w1_bf16,
