@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_1_STAGES 1
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_AMAX_PARTIALS_OFF 32
-#define SMEM_AMAX_PARTIALS_STAGE_BYTES 32
-#define SMEM_AMAX_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -79,7 +69,7 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_fb07b71766fb1fd61345(__nv_bfloa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
     float* amax_partials = reinterpret_cast<float*>(smem_raw + 32);
@@ -285,6 +275,7 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_fb07b71766fb1fd61345(__nv_bfloa
         amax = _shfl_sync_11;
         amax = fmaxf(amax, 1e-12f);
         float scale = __fdiv_rn(amax, 448.0f);
+        float inv_scale = __frcp_rn(scale);
         if (tid == 0) {
             *(reinterpret_cast<float*>(act_scale + row) + (0)) = scale;
         }
@@ -293,10 +284,10 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_fb07b71766fb1fd61345(__nv_bfloa
             if (chunk_2 < 336) {
                 unsigned int words[4];
                 for (int w = 0; w < 4; w++) {
-                    float q_a = __fdiv_rn(a_vals[i_2 * 16 + w * 4], scale);
-                    float q_b = __fdiv_rn(a_vals[i_2 * 16 + w * 4 + 1], scale);
-                    float q_c = __fdiv_rn(a_vals[i_2 * 16 + w * 4 + 2], scale);
-                    float q_d = __fdiv_rn(a_vals[i_2 * 16 + w * 4 + 3], scale);
+                    float q_a = a_vals[i_2 * 16 + w * 4] * inv_scale;
+                    float q_b = a_vals[i_2 * 16 + w * 4 + 1] * inv_scale;
+                    float q_c = a_vals[i_2 * 16 + w * 4 + 2] * inv_scale;
+                    float q_d = a_vals[i_2 * 16 + w * 4 + 3] * inv_scale;
                     uint16_t _cvt_satfinite_e4m3x2_f32_13;
                     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_13) : "f"(q_b), "f"(q_a));
                     uint16_t _cvt_satfinite_e4m3x2_f32_14;
@@ -305,7 +296,7 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_fb07b71766fb1fd61345(__nv_bfloa
                     asm("mov.b32 %0, {%1, %2};" : "=r"(_mov_b32_pack_u16x2_12) : "h"(_cvt_satfinite_e4m3x2_f32_13), "h"(_cvt_satfinite_e4m3x2_f32_14));
                     words[w] = _mov_b32_pack_u16x2_12;
                 }
-                reinterpret_cast<int4*>(act_q + ((row * 5376 + chunk_2 * 16) / 4))[0] = reinterpret_cast<int4*>(words)[0];
+                reinterpret_cast<int4*>(act_q + (row * 5376 + chunk_2 * 16) / 4)[0] = reinterpret_cast<int4*>(words)[0];
             }
         }
         __syncthreads();
