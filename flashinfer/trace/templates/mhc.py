@@ -82,6 +82,41 @@ mhc_pre_big_fuse_trace = TraceTemplate(
 )
 
 
+mhc_pre_trace = TraceTemplate(
+    op_type="mhc_pre",
+    name_prefix="mhc_pre",
+    description=(
+        "Full mHC pre map including the projection GEMM: takes the "
+        "projection matrix fn itself rather than externally computed "
+        "logits/square sums."
+    ),
+    axes={
+        **_MHC_PRE_AXES,
+        "hc_hidden": Const(
+            abbrev="", description="Flattened projection width (hc * hidden_size)."
+        ),
+    },
+    inputs={
+        "residual": Tensor(["num_tokens", "hc", "hidden_size"], dtype="bfloat16"),
+        "fn": Tensor(["mhc_mix", "hc_hidden"], dtype="float32"),
+        "hc_scale": Tensor(["scale_size"], dtype="float32"),
+        "hc_base": Tensor(["mhc_mix"], dtype="float32"),
+        "rms_eps": Scalar("float32", optional=True),
+        "mhc_pre_eps": Scalar("float32", optional=True),
+        "mhc_sinkhorn_eps": Scalar("float32", optional=True),
+        "mhc_post_mult_value": Scalar("float32", optional=True),
+        "sinkhorn_repeat": Scalar("int32", optional=True),
+        "backend": Scalar("string", optional=True),
+    },
+    outputs={
+        "post_mix": Tensor(["num_tokens", "hc", "one"], dtype="float32"),
+        "comb_mix": Tensor(["num_tokens", "hc", "hc"], dtype="float32"),
+        "layer_input": Tensor(["num_tokens", "hidden_size"], dtype_from="residual"),
+    },
+    tags=["fused"],
+)
+
+
 mhc_pre_big_fuse_with_prenorm_trace = TraceTemplate(
     op_type="mhc_pre_big_fuse",
     name_prefix="mhc_pre_big_fuse_with_prenorm",
