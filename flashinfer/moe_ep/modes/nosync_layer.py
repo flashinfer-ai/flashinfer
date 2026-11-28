@@ -3,8 +3,9 @@
 ``MoEEpLayer(..., backend=<unchanged>, nosync=NosyncOptions())`` builds the layer the
 deployment configures, exactly as without the option, and next to it the SM120 MXFP4 x MXFP8
 nosync MegaMoE kernel (``sm120_mxfp4_mxfp8_bf16_nosync``). A call whose tokens per rank stay
-within ``NosyncOptions.max_tokens_per_rank`` on every rank runs the nosync kernel; every other
-call runs the configured layer. The option needs pre-quantized MXFP4 weights, the input of the
+within ``NosyncOptions.max_tokens_per_rank`` and whose routes average at most
+``NosyncOptions.max_tokens_per_expert`` tokens per expert runs the nosync kernel; every other call
+runs the configured layer. The option needs pre-quantized MXFP4 weights, the input of the
 cake and cutedsl SM120 MegaMoE backends, whose packed FP4 tensors it shares. Where the nosync
 kernel cannot run (not compute capability 12.0, weights that are not MXFP4 such as the BF16
 weights of a ``SplitConfig`` layer, a cake layer with its in-kernel shared expert, an unsupported
@@ -39,10 +40,21 @@ __all__ = ["MoEEpNosyncLayer", "NosyncOptions"]
 
 @dataclass
 class NosyncOptions:
-    """Run calls of at most ``max_tokens_per_rank`` tokens per rank on the nosync kernel.
+    """Run small calls on the nosync kernel.
 
-    ``max_tokens_per_rank`` (at most 128, the range where the kernel is measured faster than
-    the cake and cutedsl backends) must be the same on every rank. ``transport`` and
+    A call runs the nosync kernel when every rank holds at most ``max_tokens_per_rank`` tokens
+    (at most 224, the kernel's capacity) and the call's tokens on all ranks times ``top_k``
+    average at most ``max_tokens_per_expert`` per expert; the layer bounds the total by the
+    largest rank's count times the EP size. Both must be the same on every rank. The defaults
+    (224 per rank, 128 per expert) are where the kernel stops winning, measured on RTX 6000D (EP8
+    on one host, EP16 across two, cold L2, balanced routing, DeepSeek-V4.1-Flash and
+    GLM-5.3-Flash): up to 224 tokens per rank it is 6-25% faster than cake but for one point
+    within 0.2%, from 256 cake is up to 5% faster and from 384 21-25%. The crossing follows the
+    tokens per rank at both EP sizes (28-114 tokens per expert there), so the per-expert bound
+    only caps the averages. Where the kernel stops winning depends on the model, the routing and
+    how the ranks are connected, so for the best performance measure it on the deployment
+    (``benchmarks/bench_megamoe_mxfp4_sm120.py``) and set both.
+    ``transport`` and
     ``tokens_per_item`` are the nosync kernel's
     (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
     ``None`` (default) takes the per-pair table the configured cake backend resolved
@@ -55,11 +67,26 @@ class NosyncOptions:
     is the cake or cutedsl SM120 MXFP4 backend; set them for any other backend.
     """
 
-    max_tokens_per_rank: int = 128
+    max_tokens_per_rank: int = 224
+    max_tokens_per_expert: int = 128
     transport: str | tuple[int, ...] | None = None
     tokens_per_item: int | None = None
     top_k: int | None = None
     swiglu_limit: float | None = None
+
+
+def nosync_token_limit(
+    max_tokens_per_rank: int,
+    max_tokens_per_expert: int,
+    num_experts: int,
+    ep_size: int,
+    top_k: int,
+) -> int:
+    """Largest per-rank token bound a call may have to run the nosync kernel (0: never): the
+    per-rank cap, and ``bound * ep_size * top_k / num_experts <= max_tokens_per_expert``."""
+    return min(
+        max_tokens_per_rank, max_tokens_per_expert * num_experts // (ep_size * top_k)
+    )
 
 
 def _configured(backend: Any, name: str) -> Any:
@@ -149,6 +176,8 @@ class MoEEpNosyncLayer(nn.Module):
             raise MoEEpConfigError(
                 f"NosyncOptions.max_tokens_per_rank must be in [1, {MAX_TOKENS_PER_RANK}]"
             )
+        if options.max_tokens_per_expert < 1:
+            raise MoEEpConfigError("NosyncOptions.max_tokens_per_expert must be >= 1")
         if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
             12,
             0,
@@ -171,6 +200,18 @@ class MoEEpNosyncLayer(nn.Module):
             raise MoEEpConfigError(
                 "NosyncOptions needs top_k and swiglu_limit for this backend (set "
                 "NosyncOptions(top_k=..., swiglu_limit=...), inf for unclamped SwiGLU)"
+            )
+        token_limit = nosync_token_limit(
+            min(fleet_params.max_tokens_per_rank, options.max_tokens_per_rank),
+            options.max_tokens_per_expert,
+            fleet_params.num_experts,
+            bootstrap.world_size,
+            top_k,
+        )
+        if token_limit < 1:
+            return (
+                f"one token per rank averages more than {options.max_tokens_per_expert} "
+                "tokens per expert"
             )
         intermediate = weights.w13.shape[1] // 2
         hidden = fleet_params.token_hidden_size
@@ -211,7 +252,7 @@ class MoEEpNosyncLayer(nn.Module):
                 "kernel holds a copy of the packed weights (%.2f GiB on this rank)",
                 extra / 2**30,
             )
-        self._limit = params.max_tokens_per_rank
+        self._limit = token_limit
         mega = MegaConfig(
             megakernel=config,
             quantize_input=_configured_quantize_input(self.base, backend),

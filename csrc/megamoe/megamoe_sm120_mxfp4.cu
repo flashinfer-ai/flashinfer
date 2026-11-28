@@ -1,7 +1,8 @@
 // SM120 MXFP4 MegaMoE launch/binding. The symmetric buffer layout is computed by the nosync
 // backend's workspace.py (buffer_layout); `offsets` and `dims` carry it here. Built twice:
 // the P2P module, and with FLASHINFER_MEGAMOE_SM120_GIN=1 (NCCL Device API) for buffers with NIC
-// (GIN) pairs, whose NCCL window and device communicator come from megamoe_sm120_gin_session.cu.
+// (GIN) pairs, whose NCCL window and device communicator come from megamoe_sm120_gin_session.cu;
+// each of those again with FLASHINFER_MEGAMOE_SM120_MAX_WORLD=32 for groups of more than 8 ranks.
 #include <cuda_runtime.h>
 
 #include <flashinfer/megamoe/sm120_mxfp4_mega_moe.cuh>
@@ -32,16 +33,21 @@ enum Sm120Offset : int {
   kOffInbox,
   kOffStageComb,
   kOffCombGin,
-  kOffSlotMap,
-  kOffStageSlot,
   kOffCidx,
+  kOffStageRoute,
   kNumSm120Offsets
 };
 
+// Default work-item width from the routed rows each local expert averages, e = T * TOPK / EL:
+// 16 below e 16, else 32. An empirical default, not the optimum: forced 8 / 16 / 32 / 64 sweeps on
+// RTX 6000D (CX8 hosts, EP8 on one, EP16 across two), cold L2, balanced routing,
+// DeepSeek-V4.1-Flash and GLM-5.3-Flash, 1-1024 tokens per rank. 8 was never faster than 16, nor 64
+// than 32 (32 is 4-17% faster from 256 tokens per rank). Re-sweep (tokens_per_item) for the model,
+// EP size, network and routing you deploy.
+constexpr int kTile32Rows = 16;  // routed rows per local expert from which items cover 32 tokens
+
 // Every CTA of the grid must be resident at once (CTAs wait on each other's flags), so the grid is
 // the device's full occupancy and the launch is cooperative.
-constexpr int kTile16Rows = 3;  // routed rows per local expert from which items cover 16 tokens
-
 template <int kTileN>
 static int sm120_grid_size(int dev) {
   static int grids[64] = {};
@@ -51,9 +57,14 @@ static int sm120_grid_size(int dev) {
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev), cudaSuccess);
   TVM_FFI_ICHECK(coop) << "SM120 MegaMoE needs cooperative launch support";
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), cudaSuccess);
-  TVM_FFI_ICHECK_EQ(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                        &occ, s::sm120_mega_moe_kernel<kTileN>, s::kWarps * 32, 0),
+  TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(s::sm120_mega_moe_kernel<kTileN>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         s::tile_smem_bytes<kTileN>()),
                     cudaSuccess);
+  TVM_FFI_ICHECK_EQ(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, s::sm120_mega_moe_kernel<kTileN>,
+                                                    s::kWarps * 32, s::tile_smem_bytes<kTileN>()),
+      cudaSuccess);
   return grids[dev] = occ * sms;
 }
 
@@ -63,7 +74,7 @@ static void sm120_launch(s::Args& a, int dev, cudaStream_t stream) {
   TVM_FFI_ICHECK_EQ(
       cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(s::sm120_mega_moe_kernel<kTileN>),
                                   dim3(sm120_grid_size<kTileN>(dev)), dim3(s::kWarps * 32), params,
-                                  0, stream),
+                                  s::tile_smem_bytes<kTileN>(), stream),
       cudaSuccess);
 }
 
@@ -84,10 +95,18 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   const int experts = static_cast<int>(dims[0]), topk = static_cast<int>(dims[1]);
   const int hidden = static_cast<int>(dims[2]), inter = static_cast<int>(dims[3]);
   const int capacity = static_cast<int>(dims[4]);
-  TVM_FFI_ICHECK(world >= 1 && world <= s::kMaxWorld);
+  TVM_FFI_ICHECK(world >= 1 && world <= s::kMaxWorld)
+      << world << " ranks on a module built for at most " << s::kMaxWorld;
   TVM_FFI_ICHECK(rank_idx >= 0 && rank_idx < world);
   TVM_FFI_ICHECK(num_tokens >= 1 && num_tokens <= capacity);
+  TVM_FFI_ICHECK(capacity <= s::kMaxTokens && topk <= s::kMaxTopk)
+      << "capacity " << capacity << " / top-k " << topk << " over the kernel's " << s::kMaxTokens
+      << " / " << s::kMaxTopk;
   TVM_FFI_ICHECK_EQ(experts % world, 0);
+  TVM_FFI_ICHECK_GE(offsets[kOffCtr + 1] - offsets[kOffCtr], int64_t(s::kCtrInts) * 4)
+      << "the buffer layout's counter block is smaller than this build's";
+  TVM_FFI_ICHECK(experts / world <= s::kMaxEl)
+      << experts / world << " local experts on a module built for at most " << s::kMaxEl;
 
   s::Args a{};
   char* local = static_cast<char*>(symm_buffer.data_ptr());
@@ -126,15 +145,13 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
     a.gin.off_comb_gin = offsets[kOffCombGin];
     a.gin.off_stage_row = offsets[kOffStageRow];
     a.gin.off_stage_comb = offsets[kOffStageComb];
-    a.gin.off_slotmap = offsets[kOffSlotMap];
-    a.gin.off_stage_slot = offsets[kOffStageSlot];
     a.gin.stage_row = reinterpret_cast<uint8_t*>(local + offsets[kOffStageRow]);
     a.gin.inbox = reinterpret_cast<uint8_t*>(local + offsets[kOffInbox]);
     a.gin.stage_comb = reinterpret_cast<__nv_bfloat16*>(local + offsets[kOffStageComb]);
     a.gin.comb_gin = reinterpret_cast<__nv_bfloat16*>(local + offsets[kOffCombGin]);
-    a.gin.slotmap = reinterpret_cast<int*>(local + offsets[kOffSlotMap]);
-    a.gin.stage_slot = reinterpret_cast<int*>(local + offsets[kOffStageSlot]);
     a.gin.cidx = reinterpret_cast<int*>(local + offsets[kOffCidx]);
+    a.gin.off_stage_route = offsets[kOffStageRoute];
+    a.gin.stage_route = reinterpret_cast<int*>(local + offsets[kOffStageRoute]);
 #else
     TVM_FFI_ICHECK(false) << "GIN pairs need the FLASHINFER_MEGAMOE_SM120_GIN module";
 #endif
@@ -158,15 +175,12 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   ffi::CUDADeviceGuard device_guard(y.device().device_id);
   const int dev = y.device().device_id;
   cudaStream_t stream = get_stream(y.device());
-  // Work-item width (tokens_per_item: 8, 16, 24 or 32; 0 = default). Default: by the routed rows
-  // each local expert averages, T * TOPK / EL (the rows a rank receives, spread over its experts),
-  // 16 tokens (two MMAs per weight fragment) from 3 rows, else 8. Measured with cold L2 (decode
-  // reads every layer's weights from DRAM) on RTX 6000D, EP4 / EP8, DeepSeek-V4-Flash,
-  // DeepSeek-V4.1-Flash and GLM-5.3-Flash (top-6 / top-8), 16-128 tokens per rank: 16 matches 8
-  // below 3 rows and is up to 12% faster above; 24 and 32 load more activation fragments per
-  // weight fragment and are 0-6% slower than 16 (one point 1% faster: V4.1-Flash EP8, 128 tokens).
-  const int width = tokens_per_item ? static_cast<int>(tokens_per_item)
-                                    : (a.T * a.TOPK >= kTile16Rows * a.EL ? 16 : 8);
+  // Work-item width (tokens_per_item: 8, 16, 24, 32 or 64; 0 = the default above). Items
+  // wider than 8 stage their activations once per CTA and skip their empty groups of 8, so a wider
+  // item cuts the weight passes of experts with many rows.
+  const int width = tokens_per_item                      ? static_cast<int>(tokens_per_item)
+                    : a.T * a.TOPK >= kTile32Rows * a.EL ? 32
+                                                         : 16;
   switch (width) {
     case 8:
       sm120_launch<8>(a, dev, stream);
@@ -180,8 +194,11 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
     case 32:
       sm120_launch<32>(a, dev, stream);
       break;
+    case 64:
+      sm120_launch<64>(a, dev, stream);
+      break;
     default:
-      TVM_FFI_ICHECK(false) << "tokens_per_item must be 8, 16, 24 or 32, got " << width;
+      TVM_FFI_ICHECK(false) << "tokens_per_item must be 8, 16, 24, 32 or 64, got " << width;
   }
 }
 

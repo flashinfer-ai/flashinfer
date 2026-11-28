@@ -355,15 +355,29 @@ def _sm120_nccl():
     return nccl_installation()
 
 
+# Groups of up to 8 ranks (one host) load the default build; larger groups, up to 32 ranks across
+# hosts, a build with room for 32 ranks and 64 local experts per rank (kMaxWorld / kMaxEl)
+SM120_MAX_WORLD = 8
+SM120_WIDE_MAX_WORLD = 32
+
+
+def _sm120_world_flags(wide: bool) -> tuple[str, list[str]]:
+    if not wide:
+        return "", []
+    return "_w32", [f"-DFLASHINFER_MEGAMOE_SM120_MAX_WORLD={SM120_WIDE_MAX_WORLD}"]
+
+
 def gen_megamoe_sm120_mxfp4_module(
-    fast_math: bool, gin_type: int | None = None
+    fast_math: bool, gin_type: int | None = None, wide: bool = False
 ) -> JitSpec:
     """SM120 MXFP4 nosync MegaMoE. Shapes are runtime arguments: one module per fast-math policy,
     P2P only (``gin_type`` None) or with NIC (GIN) pairs built for one NCCL GIN backend, so that
-    the kernel inlines only that backend's put / signal code."""
+    the kernel inlines only that backend's put / signal code. ``wide``: the build for groups of 9
+    to 32 ranks."""
     csrc = _csrc_dir()
+    tag, world_flags = _sm120_world_flags(wide)
     uri = "megamoe_sm120_mxfp4"
-    cflags = ["-std=c++17"]
+    cflags = ["-std=c++17", *world_flags]
     ldflags: list[str] = []
     includes: list[str | Path] = [csrc, jit_env.FLASHINFER_CSRC_DIR]
     if gin_type is not None:
@@ -382,7 +396,7 @@ def gen_megamoe_sm120_mxfp4_module(
         ]
         ldflags = [str(library), f"-Wl,-rpath,{library.parent}"]
         includes.append(include)
-    uri += "_fm" if fast_math else ""
+    uri += tag + ("_fm" if fast_math else "")
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / "megamoe_sm120_mxfp4.cu"
@@ -397,10 +411,12 @@ def gen_megamoe_sm120_mxfp4_module(
     )
 
 
-def gen_megamoe_sm120_gin_session_module() -> JitSpec:
-    """SM120 MegaMoE NIC transport session: NCCL window, LSA peer pointers, device communicator."""
+def gen_megamoe_sm120_gin_session_module(wide: bool = False) -> JitSpec:
+    """SM120 MegaMoE NIC transport session: NCCL window, LSA peer pointers, device communicator.
+    ``wide``: the session of the 32-rank kernel build (it asks NCCL for 3 * 32 GIN signals)."""
     include, library = _sm120_nccl()
-    uri = "megamoe_sm120_gin_session"
+    tag, world_flags = _sm120_world_flags(wide)
+    uri = "megamoe_sm120_gin_session" + tag
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / "megamoe_sm120_gin_session.cu"
@@ -410,7 +426,7 @@ def gen_megamoe_sm120_gin_session_module() -> JitSpec:
     return gen_jit_spec(
         uri,
         [source],
-        extra_cuda_cflags=["-std=c++17", *sm120a_nvcc_flags],
+        extra_cuda_cflags=["-std=c++17", *world_flags, *sm120a_nvcc_flags],
         extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}"],
         extra_include_paths=[include, jit_env.FLASHINFER_CSRC_DIR],
     )

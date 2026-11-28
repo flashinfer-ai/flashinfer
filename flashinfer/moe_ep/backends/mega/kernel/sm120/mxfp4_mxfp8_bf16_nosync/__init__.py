@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """SM120 MXFP4 x MXFP8 nosync MegaMoE backend: one persistent kernel per layer
-(routing exchange, dispatch, FC1 + SwiGLU, FC2, combine) for up to 128 tokens per
+(routing exchange, dispatch, FC1 + SwiGLU, FC2, combine) for up to 224 tokens per
 rank over PCIe peer-to-peer, or NCCL GIN for the pairs the transport assigns to
 the NIC. Deployments add it to their configured backend with
 ``MoEEpLayer(..., nosync=NosyncOptions())``, which runs it for small calls only.
