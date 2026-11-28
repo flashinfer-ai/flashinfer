@@ -267,17 +267,32 @@ def gen_pcie_ipc_comm_debug_module(
     )
 
 
-def gen_pcie_ipc_comm_module() -> JitSpec:
+def gen_pcie_ipc_comm_module(spin_timeout_ns: int = 0) -> JitSpec:
     # No architecture restriction: the kernels use only plain PTX loads/stores
     # and CUDA IPC, both of which predate every architecture flashinfer builds
     # for. The target is a PCIe machine without NVLink, which is orthogonal to
     # the SM version.
+    #
+    # ``spin_timeout_ns`` > 0 bounds every wait on a peer: past the deadline the
+    # kernel reports and traps instead of spinning forever. It is a separate
+    # module, so the default (and AOT) build keeps the unbounded wait unchanged.
+    if spin_timeout_ns <= 0:
+        return gen_jit_spec(
+            "pcie_ipc_comm",
+            [
+                jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+            ],
+            extra_ldflags=["-lcuda"],
+        )
     return gen_jit_spec(
-        "pcie_ipc_comm",
+        f"pcie_ipc_comm_spin_timeout_{spin_timeout_ns}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f"-DFLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS={spin_timeout_ns}ULL"
+        ],
     )
 
 
@@ -304,6 +319,53 @@ def gen_ulysses_a2a_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "ulysses_all_to_all.cu",
         ],
+    )
+
+
+def gen_ulysses_lowp_module() -> JitSpec:
+    # Byte-parity contract: the golden reference (SageAttention fork) compiles
+    # with --use_fast_math (the gen_jit_spec default, do NOT override) and
+    # targets sm_120a.  The explicit 120a gencode matters: the default
+    # compilation context normalizes SM 12.0 to compute_120f, whose FMA
+    # semantics can drift from the anchored sm_120a golden by ULPs.
+    #
+    # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
+    # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
+    # source file covers both architectures. Only emit requested targets:
+    # each AOT provider must contain binaries compatible with its own arch.
+    # A multi-device JIT context may still request both architectures.
+    from .core import check_cuda_arch, sm89_nvcc_flags, sm120a_nvcc_flags
+
+    # Preserve gen_jit_spec's retry when import-time device detection was empty.
+    check_cuda_arch()
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    nvcc_flags = []
+    if (8, "9") in targets:
+        nvcc_flags.extend(sm89_nvcc_flags)
+    if targets & {(12, "0"), (12, "0a"), (12, "0f")}:
+        nvcc_flags.extend(sm120a_nvcc_flags)
+    if not nvcc_flags:
+        raise RuntimeError("Ulysses Lowp requires an SM89 or SM120 compilation target.")
+    return gen_jit_spec(
+        "ulysses_lowp",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_ulysses_lowp_sm90_module() -> JitSpec:
+    # SM90 (Hopper H100/H200) variant: Q_GROUP=16, K_GROUP=128 to match
+    # SageAttention2's WGMMA-based SM90 kernel tile sizes.
+    from .core import sm90a_nvcc_flags
+
+    return gen_jit_spec(
+        "ulysses_lowp_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags,
     )
 
 
@@ -399,9 +461,10 @@ def gen_cake_alltoall_module(target: CakeAlltoAllTarget) -> JitSpec:
 def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
     """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
 
-    Includes the CFT counted-write path, which is compiled in when the CUDA
-    toolkit provides the logical-endpoint API (13.4+) and resolved from the
-    driver at runtime, and the Lamport path for small steps.
+    Includes the fence and sentinel paths, and a CFT counted-write path that
+    ``NVLinkOneSidedAlltoAll`` does not use. The CFT path and the
+    logical-endpoint ops are compiled in when the CUDA toolkit provides the
+    logical-endpoint API (13.4+) and resolved from the driver at runtime.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
@@ -412,7 +475,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
         "nvlink_one_sided_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_sentinel.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"
@@ -442,6 +505,15 @@ def _dcp_alltoall_helix_sources() -> list:
         / "kernels"
         / "helixAllToAll.cu",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "envUtils.cpp",
+        # logger.cpp and stringUtils.cpp define Logger::getLogger and fmtstr_, which
+        # envUtils/tllmException/helixAllToAll reference; a Windows DLL link needs
+        # every symbol resolved (an ELF shared object defers them to load time).
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "cpp"
+        / "common"
+        / "stringUtils.cpp",
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal"
         / "cpp"

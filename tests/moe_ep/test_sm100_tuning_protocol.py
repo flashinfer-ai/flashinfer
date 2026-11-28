@@ -11,16 +11,17 @@ import torch
 from flashinfer import autotune_v2
 from flashinfer.autotuner import AutoTuner
 from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2_reload
-from flashinfer.moe_ep import BootstrapConfig, FleetParams
+from flashinfer.moe_ep import BootstrapConfig, FinalizeMode, FleetParams
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
 from flashinfer.moe_ep.core.tuning_state import AutoTuningState
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     Sm100BlockScaledMoeConfig,
     Sm100GenphaseMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     autotune as native,
+    correctness,
     knob_cache,
     tuning,
     tuning_protocol,
@@ -30,6 +31,70 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100 import automatic
 
 class Workspace(SimpleNamespace):
     _build_kernel = staticmethod(lambda cfg: None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [0, 1, 512, 8192])
+@pytest.mark.parametrize("sample_size", [1, 64])
+def test_reference_row_sampling_under_model_default_dtype(
+    monkeypatch, dtype, num_tokens, sample_size
+):
+    def on_cpu(factory):
+        def call(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(torch, "arange", on_cpu(torch.arange))
+    monkeypatch.setattr(torch, "linspace", on_cpu(torch.linspace))
+    config = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        experts_per_rank=1,
+        quant_kind="nvfp4",
+        combine_dtype="bf16",
+        batch_invariant=False,
+        gate_up_clamp=None,
+        apply_routing_weights_before_fc2=False,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+    row_ids = torch.arange(num_tokens, dtype=torch.int64)
+    x = torch.stack((row_ids % 256, row_ids // 256), dim=1).to(torch.uint8)
+    workspace = SimpleNamespace(
+        config=config,
+        x=x,
+        x_sf=torch.zeros((num_tokens, 1), dtype=torch.uint8),
+        topk_idx=torch.zeros((num_tokens, 1), dtype=torch.int32),
+        topk_weights=torch.ones((num_tokens, 1), dtype=torch.float32),
+    )
+    weights = (torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1)))
+    monkeypatch.setattr(
+        correctness,
+        "compute_megamoe_reference_block_scaled",
+        lambda inputs, *args, **kwargs: inputs.float(),
+    )
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        indices, expected = correctness.sampled_reference(
+            workspace, weights, weights, num_tokens, sample_size=sample_size
+        )
+    finally:
+        torch.set_default_dtype(original)
+    assert indices.dtype == torch.int64
+    assert len(indices) == min(num_tokens, sample_size)
+    if num_tokens:
+        assert int(indices[0]) == 0
+        assert int(indices[-1]) == (num_tokens - 1 if len(indices) > 1 else 0)
+        assert bool((indices[1:] > indices[:-1]).all())
+        if len(indices) > 1:
+            # Each index rounds its ideal position down by less than one row.
+            steps = len(indices) - 1
+            for sample, row in enumerate(indices.tolist()):
+                assert row * steps <= sample * (num_tokens - 1) < (row + 1) * steps
+    torch.testing.assert_close(expected, x[indices].bfloat16())
 
 
 @pytest.fixture(params=["standard", "genphase"])
@@ -184,7 +249,7 @@ def test_unsupported_bucket_controls_fail_before_launch(state, options):
 
 
 def test_measurement_defaults_and_explicit_policy(state):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.measurement import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.measurement import (
         measurement_settings,
     )
 
@@ -252,7 +317,9 @@ def test_standard_grid_is_complete_unique_and_fixed_numerics(kind):
         cfg = dataclasses.replace(cfg, mma_tiler_mnk=(256, 128, 256))
     candidates = tuning.sm100_standard_candidates(cfg, allow_nondeterministic=True)
     assert len({json.dumps(c, sort_keys=True) for c in candidates}) == len(candidates)
-    assert {c["mma_tiler_mnk"][1] for c in candidates} == {128, 256}
+    assert {c["mma_tiler_mnk"][1] for c in candidates} == (
+        {64, 128, 256} if kind == "nvfp4" else {128, 256}
+    )
     assert {c["reduce_topk_in_kernel"] for c in candidates} == {False, True}
     assert {c["fc2_use_bulk"] for c in candidates} == {False, True}
     for knobs in candidates:
@@ -322,7 +389,7 @@ def test_standard_getter_knobs_install_into_fixed_workspace_config(kind, finaliz
     cfg = cls(
         256,
         2,
-        kernel_name=f"sm100_{'nvfp4_nvfp4' if kind == 'nvfp4' else 'mxfp8_mxfp8'}_bf16_cutedsl_next",
+        kernel_name=f"sm100_{'nvfp4_nvfp4' if kind == 'nvfp4' else 'mxfp8_mxfp8'}_bf16_cutedsl",
         knobs="auto",
         finalize_mode=moe_ep.FinalizeMode[finalize_mode],
         **options,
@@ -337,9 +404,120 @@ def test_standard_getter_knobs_install_into_fixed_workspace_config(kind, finaliz
     assert fixed._workspace_config(fleet) == dataclasses.replace(initial, **knobs)
 
 
+def test_standard_fixed_workspace_profiles(monkeypatch, tmp_path):
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "test-device")
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=512)
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 2)
+
+    def backend(knobs, **kwargs):
+        result = create_mega_kernel(dataclasses.replace(cfg, knobs=knobs, **kwargs))
+        result.bind_ep_bootstrap(BootstrapConfig(rank=0, world_size=1))
+        return result
+
+    automatic = backend("auto")
+    base = automatic._workspace_config(fleet)
+    candidates = tuning.sm100_standard_candidates(base)
+    full, decode = candidates[1], candidates[-1]
+    reduced = {**decode, "reduce_topk_in_kernel": True}
+    for live, knobs in ((128, full), (16, decode), (4, reduced)):
+        assert knob_cache.record_knobs(knobs, base, live_tokens=live, p50_us=1.0)
+
+    fixed = backend(None)
+    profile = dataclasses.replace(fleet, tuning_live_tokens=16)
+    assert fixed.supports_live_token_tuning
+    assert fixed.live_token_buckets(fleet) == [16, 128]
+    assert fixed._workspace_config(fleet) == dataclasses.replace(base, **full)
+    selected = fixed._workspace_config(profile)
+    assert selected == dataclasses.replace(base, **decode)
+    assert selected.max_tokens_per_rank == 128
+    assert (
+        fixed._workspace_config(dataclasses.replace(fleet, tuning_live_tokens=4))
+        == base
+    )
+    assert backend(full)._workspace_config(profile) == dataclasses.replace(base, **full)
+    assert automatic._workspace_config(profile) == base
+    assert automatic.live_token_buckets(fleet) == []
+
+    persistent = backend(
+        None,
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=torch.tensor([16], dtype=torch.int32),
+        enable_in_kernel_fc2_reduce=True,
+    )
+    assert persistent.live_token_buckets(fleet) == [4]
+    assert persistent._workspace_config(profile).reduce_topk_in_kernel
+
+    # An existing selection stays paired with its workspace pool key.
+    assert knob_cache.record_knobs(full, base, live_tokens=16, p50_us=0.9)
+    assert fixed._workspace_config(profile) is selected
+    assert backend(None)._workspace_config(profile) == dataclasses.replace(base, **full)
+
+
+@pytest.mark.parametrize("live_tokens", [None, 16])
+def test_standard_cached_workspace_agrees_before_pool_lookup(
+    monkeypatch, tmp_path, live_tokens
+):
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel import workspace_pool
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(knob_cache, "device_identity", lambda: "test-device")
+    group = object()
+    fleet = FleetParams(8, 128, 512, tuning_live_tokens=live_tokens)
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        256, 2, enable_in_kernel_fc2_reduce=True
+    )
+
+    def bind(rank):
+        backend = create_mega_kernel(cfg)
+        backend.bind_ep_bootstrap(BootstrapConfig(2, rank, process_group=group))
+        return backend
+
+    left, right = bind(0), bind(1)
+    base = left._standard_base_config(fleet)
+    knobs = {key: getattr(base, key) for key in tuning.STANDARD_KNOB_KEYS}
+    bucket = fleet.max_tokens_per_rank if live_tokens is None else live_tokens
+    assert base.reduce_topk_in_kernel
+    assert knob_cache.record_knobs(knobs, base, live_tokens=bucket, p50_us=1.0)
+    first = left._workspace_config(fleet)
+    knobs["reduce_topk_in_kernel"] = False
+    assert knob_cache.record_knobs(knobs, base, live_tokens=bucket, p50_us=1.0)
+    second = right._workspace_config(fleet)
+    assert first.reduce_topk_in_kernel and not second.reduce_topk_in_kernel
+
+    peer = None, dataclasses.replace(second, rank=0)
+
+    def gather(reports, report, *, group):
+        assert group is left.ep_comm_group
+        reports[:] = [report, (None, peer)]
+
+    collective = Mock(side_effect=gather)
+    pool = Mock(return_value=object())
+    monkeypatch.setattr(torch.distributed, "all_gather_object", collective)
+    monkeypatch.setattr(workspace_pool, "acquire_workspace", pool)
+    with pytest.raises(MoEEpConfigError, match="configuration differs across EP ranks"):
+        left.prepare_workspace(left._ep_bootstrap, fleet)
+    collective.assert_called_once()
+    pool.assert_not_called()
+
+    collective.reset_mock()
+    assert right.prepare_workspace(right._ep_bootstrap, fleet) is pool.return_value
+    collective.assert_called_once()
+    pool.assert_called_once()
+    assert second in pool.call_args.args[0]
+
+
 def test_genphase_auto_ignores_fixed_profile_count(monkeypatch):
     from flashinfer import moe_ep
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     cfg = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         256, 3, kernel_variant="genphase", knobs="auto"
@@ -465,6 +643,33 @@ def _subgroup_worker(rank, rendezvous):
 
                 with pytest.raises(RuntimeError, match="candidate preparation failed"):
                     native._prepare_collectively(prepare, 2, group)
+
+                from flashinfer.moe_ep import (
+                    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+                )
+                from flashinfer.moe_ep.core.kernel import workspace_pool
+                from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+                bootstrap = BootstrapConfig(
+                    world_size=2, rank=rank - 1, process_group=group
+                )
+                fleet = FleetParams(8, 128, 512)
+                config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 2)
+                standard = create_mega_kernel(
+                    dataclasses.replace(config, knobs=None if rank == 1 else {})
+                )
+                standard.bind_ep_bootstrap(bootstrap)
+                geometry = dataclasses.replace(
+                    standard._workspace_config(fleet), rank=0
+                )
+                geometries = [None, None]
+                dist.all_gather_object(geometries, geometry, group=group)
+                assert geometries == [geometry, geometry]
+                pool = Mock()
+                patch.setattr(workspace_pool, "acquire_workspace", pool)
+                with pytest.raises(MoEEpConfigError, match="differs across EP ranks"):
+                    standard.prepare_workspace(bootstrap, fleet)
+                pool.assert_not_called()
             dist.barrier()
         finally:
             dist.destroy_process_group()
@@ -529,7 +734,7 @@ def test_cli_measurement_reuses_online_warmup_defaults(state):
 
 
 def test_native_cold_policy_has_one_call_per_flush(state):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.measurement import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.measurement import (
         measurement_settings,
     )
 
@@ -539,3 +744,33 @@ def test_native_cold_policy_has_one_call_per_flush(state):
         settings = measurement_settings(automatic.tuning_context())
         assert settings["calls_per_sample"] == 1
         assert settings["cold_l2"] and settings["cuda_graph_profile_replays"] == 1
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_standard_n64_preserves_cache_contract(kind):
+    cfg = Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=128,
+        num_topk=2,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    candidates = tuning.sm100_standard_candidates(cfg)
+    small = [k for k in candidates if k["mma_tiler_mnk"][1] == 64]
+    key = knob_cache._key(cfg, device="test")
+    if kind == "nvfp4":
+        assert small
+        assert key["backend_revision"] == "sm100-standard-auto-v1"
+        assert key["problem"]["token_padding_block"] == 64
+        for knobs in small:
+            assert knobs["fc2_tma_stages"] == (1 if knobs["fc2_use_bulk"] else None)
+            changed = dataclasses.replace(cfg, **knobs)
+            assert knob_cache._key(changed, device="test") == key
+    else:
+        assert not small
+        assert key["backend_revision"] == "sm100-standard-auto-v1"
+        assert key["problem"]["token_padding_block"] == 64
+        assert all("token_padding_block" not in knobs for knobs in candidates)

@@ -348,6 +348,11 @@ gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
         "non_blocking": Scalar("bool", optional=True),
         "fixed_split_size": Scalar("int32", optional=True),
         "disable_split_kv": Scalar("bool", optional=True),
+        "has_sinks": Scalar(
+            "bool",
+            optional=True,
+            description="Declared presence of attention sinks at every run of the plan.",
+        ),
         "seq_lens": Tensor(["batch_size"], dtype="int32", optional=True),
         "block_tables": Tensor(
             ["batch_size", "max_num_blocks_per_seq"],
@@ -500,6 +505,148 @@ def _prims_ts_sparse_pattern_trace(
     )
 
 
+def _prims_ts_trace_scale_values(kwargs, names, *, bound):
+    """Resolve scale bindings without inspecting device-resident values."""
+    from flashinfer.attention.prims_ts._scales import normalize_scale
+
+    state = getattr(kwargs.get("self"), "_plan_state", None) if bound else None
+    device = getattr(state, "device", None)
+    if device is None:
+        query = kwargs.get("q", kwargs.get("query"))
+        device = getattr(query, "device", torch.device("cpu"))
+    values = {}
+    for name in names:
+        planned = getattr(state, name, None)
+        value = kwargs.get(name)
+        if value is None:
+            value = planned
+        elif state is not None and isinstance(value, torch.Tensor) != isinstance(
+            planned, torch.Tensor
+        ):
+            raise ValueError(f"{name} must retain its planned float or tensor type")
+        if (
+            isinstance(value, torch.Tensor)
+            and device.type != "cuda"
+            and value.device.type in ("cpu", "meta")
+        ):
+            # CPU/meta inputs describe schemas without running attention. Real
+            # CUDA calls retain the runtime scale/device contract below.
+            if (
+                value.numel() != 1
+                or value.ndim > 1
+                or value.dtype != torch.float32
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous float32 tensor of shape () or (1,)"
+                )
+            if value.ndim == 0:
+                value = value.view(1)
+        elif value is not None:
+            value = normalize_scale(value, name, device)
+        values[name] = value
+    return values
+
+
+class _PrimsTSScaleTraceTemplate(TraceTemplate):
+    """Describe independent scale operands and inherit bound plan defaults."""
+
+    def __init__(self, base, names, scale_types, *, bound):
+        self._base = base
+        self._scale_names = names
+        self._bound = bound
+        self._scale_suffix = "_scales_" + "".join(
+            "t" if device else "f" for device in scale_types
+        )
+        axes, inputs = dict(base.axes), dict(base.inputs)
+        axes["global_scale_size"] = Const(
+            abbrev="", value=1, description="One global FP32 attention scale."
+        )
+        for name, device in zip(names, scale_types, strict=True):
+            if device:
+                inputs[name] = Tensor(
+                    ["global_scale_size"],
+                    dtype="float32",
+                    description=(
+                        "Contiguous CUDA FP32 global scale, read on device. "
+                        + (
+                            "Omitting the run argument inherits plan()'s tensor."
+                            if bound
+                            else ""
+                        )
+                    ).rstrip(),
+                )
+        super().__init__(
+            op_type=base.op_type,
+            name_prefix=base.name_prefix + self._scale_suffix,
+            axes=axes,
+            inputs=inputs,
+            outputs=dict(base.outputs),
+            constraints=list(base.constraints),
+            tags=list(base.tags),
+            description=base.description,
+            reference=base.reference,
+            check=base.check,
+            init=base.init,
+        )
+
+    def definition_name(self, axis_values):
+        # Preserve storage-specific names such as packed NVFP4 decode.
+        return self._base.definition_name(axis_values) + self._scale_suffix
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def global_scale_size(namespace):
+            # TraceApply skips build_fi_trace_fn and forwards this namespace to
+            # the solution: inherit plan operands and normalize scalar tensors.
+            namespace.update(
+                _prims_ts_trace_scale_values(
+                    namespace, self._scale_names, bound=self._bound
+                )
+            )
+            return 1
+
+        return {**extractors, "global_scale_size": global_scale_size}
+
+    def build_fi_trace_fn(self, fi_api):
+        build = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            values = _prims_ts_trace_scale_values(
+                kwargs, self._scale_names, bound=self._bound
+            )
+            return build(save_dir=save_dir, name=name, **{**kwargs, **values})
+
+        return fi_trace
+
+
+@lru_cache(maxsize=None)
+def _prims_ts_scale_trace_variant(base, names, scale_types, *, bound):
+    if not any(scale_types):
+        return base
+    return _PrimsTSScaleTraceTemplate(base, names, scale_types, bound=bound)
+
+
+def _prims_ts_scale_trace(
+    base, kwargs, *, names=("softmax_scale", "output_scale"), bound=False
+):
+    values = _prims_ts_trace_scale_values(kwargs, names, bound=bound)
+    scale_types = tuple(isinstance(values[name], torch.Tensor) for name in names)
+    return _prims_ts_scale_trace_variant(base, names, scale_types, bound=bound)
+
+
+def _prims_ts_scale_trace_templates(
+    bases, *, names=("softmax_scale", "output_scale"), bound=False
+):
+    """Publish the same canonical scale variants returned by the dispatcher."""
+    return [
+        _prims_ts_scale_trace_variant(base, names, scale_types, bound=bound)
+        for base in bases
+        for scale_types in ((False, False), (False, True), (True, False), (True, True))
+    ]
+
+
 def _make_prims_ts_block_sparse_trace(
     *,
     sparse_format: str,
@@ -556,6 +703,7 @@ def _make_prims_ts_block_sparse_trace(
         "kv_block_size": Scalar("int32", optional=wrapper),
         "mask_type": Scalar("string", optional=True),
         "sm_scale": Scalar("float32", optional=True),
+        "output_scale": Scalar("float32", optional=True),
     }
     if wrapper:
         inputs["validate"] = Scalar(
@@ -657,21 +805,29 @@ def prims_ts_block_sparse_trace_dispatch(**kwargs):
     """Select a contiguous one-shot schema from its explicit mode arguments."""
 
     if not kwargs.get("use_block_sparse", True):
-        return _PRIMS_TS_DENSE_TRACE
+        return _prims_ts_scale_trace(
+            _PRIMS_TS_DENSE_TRACE, kwargs, names=("sm_scale", "output_scale")
+        )
     sparse_format = kwargs.get("sparse_format", "bsr")
     use_proxy_routes = kwargs.get("use_proxy_routes", False)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)],
         kwargs.get("share_pattern_across_kv_heads", False),
         bound=False,
     )
+    return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
-prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
-    for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
-    for shared in (False, True)
-] + [_PRIMS_TS_DENSE_TRACE]
+prims_ts_block_sparse_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    [
+        _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+        for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
+        for shared in (False, True)
+    ]
+    + [_PRIMS_TS_DENSE_TRACE],
+    names=("sm_scale", "output_scale"),
+    bound=False,
+)
 
 
 def _make_prims_ts_paged_block_sparse_trace(
@@ -763,6 +919,7 @@ def _make_prims_ts_paged_block_sparse_trace(
             "kv_block_size": Scalar("int32", optional=wrapper),
             "mask_type": Scalar("string", optional=True),
             "sm_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
         }
     )
     if wrapper:
@@ -851,18 +1008,23 @@ def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
     """Select the tuple or combined paged-KV block-sparse schema."""
 
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined],
         kwargs.get("share_pattern_across_kv_heads", False),
         bound=False,
     )
+    return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
-prims_ts_paged_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
-    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
-    for shared in (False, True)
-]
+prims_ts_paged_block_sparse_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    [
+        _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+        for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
+        for shared in (False, True)
+    ],
+    names=("sm_scale", "output_scale"),
+    bound=False,
+)
 
 
 _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
@@ -901,23 +1063,38 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
 
     state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
     if not getattr(state, "use_block_sparse", True):
-        return _PRIMS_TS_DENSE_WRAPPER_TRACE
+        return _prims_ts_scale_trace(
+            _PRIMS_TS_DENSE_WRAPPER_TRACE,
+            kwargs,
+            names=("sm_scale", "output_scale"),
+            bound=True,
+        )
     route_mode = (
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]
     )
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode],
         getattr(state, "share_pattern_across_kv_heads", False),
         bound=True,
     )
+    return _prims_ts_scale_trace(
+        base, kwargs, names=("sm_scale", "output_scale"), bound=True
+    )
 
 
-prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
-    for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
-    for shared in (False, True)
-] + [_PRIMS_TS_DENSE_WRAPPER_TRACE]
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    _prims_ts_scale_trace_templates(
+        [
+            _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+            for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
+            for shared in (False, True)
+        ]
+        + [_PRIMS_TS_DENSE_WRAPPER_TRACE],
+        names=("sm_scale", "output_scale"),
+        bound=True,
+    )
+)
 
 
 _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
@@ -933,18 +1110,27 @@ def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
         kwargs, "BlockSparsePagedTSWrapper"
     )
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined],
         getattr(state, "share_pattern_across_kv_heads", False),
         bound=True,
     )
+    return _prims_ts_scale_trace(
+        base, kwargs, names=("sm_scale", "output_scale"), bound=True
+    )
 
 
-prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
-    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
-    for shared in (False, True)
-]
+prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    _prims_ts_scale_trace_templates(
+        [
+            _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+            for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
+            for shared in (False, True)
+        ],
+        names=("sm_scale", "output_scale"),
+        bound=True,
+    )
+)
 
 
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
@@ -1127,11 +1313,13 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
     return isinstance(kwargs.get(cache_param), torch.Tensor), out_dtype, q_mode
 
 
-# fi_trace retains builders by template identity, so repeated traces must reuse
-# their templates, including each supported encoded fragment size.
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, out_dtype: str | None, q_mode: str, encoded_page_size: int = 0
+    *,
+    combined: bool,
+    out_dtype: str | None,
+    q_mode: str,
+    encoded_page_size: int = 0,
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
@@ -1205,7 +1393,10 @@ def _make_attention_ts_decode_trace(
             description="Semantic fragment size addressed by encoded locators.",
         )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1235,7 +1426,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1257,6 +1448,7 @@ def _make_attention_ts_decode_trace(
         constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
+    return template
 
 
 # Representative native/encoded layouts suffice for discovery. Other supported
@@ -1286,16 +1478,17 @@ def attention_ts_decode_trace_dispatch(**kwargs):
     combined, out_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
-    return _make_attention_ts_decode_trace(
+    base = _make_attention_ts_decode_trace(
         combined=combined,
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
     )
+    return _prims_ts_scale_trace(base, kwargs)
 
 
-attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _ATTENTION_TS_DECODE_TRACES.values()
+attention_ts_decode_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _ATTENTION_TS_DECODE_TRACES.values(), bound=False
 )
 
 
@@ -1432,7 +1625,10 @@ def _make_prims_ts_decode_wrapper_trace(
         }
     )
     constraints = [
-        "head_dim in (64, 128, 256)",
+        "head_dim in (64, 128, 256, 512)",
+        "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and "
+        "kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None "
+        "and v_sf_cache is not None)",
         "page_size in (4, 8, 16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
         "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
@@ -1460,7 +1656,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
@@ -1500,6 +1696,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
+    return template
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1637,7 +1834,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     encoded_page_size = (
         int(state.page_size) if state.page_size != storage_page_size else 0
     )
-    return _get_prims_ts_decode_wrapper_trace(
+    base = _get_prims_ts_decode_wrapper_trace(
         combined=combined,
         out_dtype=out_dtype,
         q_mode=q_mode,
@@ -1652,14 +1849,77 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         # Preserve caller permission, not whether this shape actually splits.
         split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
     )
+    return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
-prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values()
+prims_ts_decode_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values(), bound=True
 )
 
 
-def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query: bool):
+def _with_prims_ts_mla_cp(
+    template: TraceTemplate,
+    *,
+    cp_world: int,
+    cp_interleave_size: int,
+    zero_empty_rows: bool,
+    one_shot: bool = False,
+) -> TraceTemplate:
+    """Record CP specialization separately from the runtime rank/global lengths."""
+    template.axes["cp_world"] = Const(abbrev="", value=cp_world)
+    template.axes["cp_interleave_size"] = Const(abbrev="", value=cp_interleave_size)
+    template.inputs["cp_rank"] = Scalar("int32", optional=True)
+    template.inputs[
+        "seq_lens_kv"
+    ].description = "Global logical request lengths, including the current Q tokens."
+    template.constraints.append("0 <= cp_rank < cp_world")
+    if one_shot:
+        template.inputs["cp_world"] = Scalar("int32", optional=True)
+        template.inputs["cp_interleave_size"] = Scalar("int32", optional=True)
+        template.inputs["zero_empty_rows"] = Scalar("bool", optional=True)
+    if cp_world != 1 or cp_interleave_size != 1:
+        template.name_prefix += f"_cp{cp_world}_i{cp_interleave_size}"
+    if cp_world > 1:
+        template.axes["zero_empty_rows"] = Const(abbrev="", value=int(zero_empty_rows))
+        if not zero_empty_rows:
+            template.name_prefix += "_no_zero_empty_rows"
+        template.constraints = [
+            "min(seq_lens_kv) >= 0" if item == "min(seq_lens_kv) >= 1" else item
+            for item in template.constraints
+            if item != "max(seq_lens_kv) <= max_kv_len"
+        ]
+        if "min(seq_lens_kv) >= 0" not in template.constraints:
+            template.constraints.append("min(seq_lens_kv) >= 0")
+        if not one_shot:
+            template.constraints.append(
+                "max(seq_lens_kv) // (cp_world * cp_interleave_size) * cp_interleave_size"
+                " + min(max(max(seq_lens_kv) % (cp_world * cp_interleave_size)"
+                " - cp_rank * cp_interleave_size, 0), cp_interleave_size) <= max_kv_len"
+            )
+        template.tags.append("context_parallel")
+        template.description += (
+            " Global token t belongs to (t // cp_interleave_size) % cp_world."
+            " Page tables and max_kv_len describe rank-local capacity. Local lengths"
+            " must not exceed that capacity. Causal row i uses global prefix"
+            " seq_lens_kv[b] - actual_Q + i + 1; packed actual_Q is its qo_indptr delta."
+        )
+        template.description += (
+            " Empty local prefixes produce zero output and, when requested, base-2 LSE -inf."
+            if zero_empty_rows
+            else " Empty-row results are unspecified; sanitize them before consumption or exclude them from merging."
+        )
+    return template
+
+
+@lru_cache(maxsize=None)
+def _make_prims_ts_decode_mla_one_shot_trace(
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
+):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
@@ -1691,13 +1951,13 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=f"prims_ts_decode_mla_one_shot{cache_suffix}{q_suffix}",
         description=(
             "One-shot PrimTS MLA decode over FlashInfer dense page tables. "
             "Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; "
-            "the wrapper derives omitted static Q/KV bounds before launch."
+            "the caller supplies the packed Q bound; omitted local KV capacity is derived before launch."
         ),
         axes=axes,
         inputs={
@@ -1740,11 +2000,22 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
+    return _with_prims_ts_mla_cp(
+        template,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
+        one_shot=True,
+    )
 
 
 _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_one_shot_trace(
-        rank4_cache=rank4_cache, packed_query=packed_query
+        rank4_cache=rank4_cache,
+        packed_query=packed_query,
+        cp_world=1,
+        cp_interleave_size=1,
+        zero_empty_rows=True,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
@@ -1753,15 +2024,22 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
 
 def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     kv_cache = kwargs.get("kv_cache")
-    key = (
-        isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
-        kwargs.get("qo_indptr") is not None,
+    base = _make_prims_ts_decode_mla_one_shot_trace(
+        rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
+        packed_query=kwargs.get("qo_indptr") is not None,
+        cp_world=int(kwargs.get("cp_world", 1)),
+        cp_interleave_size=int(kwargs.get("cp_interleave_size", 1)),
+        zero_empty_rows=(
+            bool(kwargs.get("zero_empty_rows", True))
+            if kwargs.get("cp_world", 1) > 1
+            else True
+        ),
     )
-    return _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key]
+    return _prims_ts_scale_trace(base, kwargs)
 
 
-prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES.values()
+prims_ts_decode_mla_one_shot_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES.values(), bound=False
 )
 
 
@@ -1775,6 +2053,9 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1854,7 +2135,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
@@ -1923,6 +2204,12 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             *threshold_tags,
         ],
     )
+    return _with_prims_ts_mla_cp(
+        template,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
+    )
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1955,6 +2242,9 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1967,6 +2257,9 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
     )
 
 
@@ -1984,6 +2277,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)
+    cp_world = int(getattr(state, "cp_world", 1))
     required_metadata = (
         "block_tables",
         "seq_lens_kv",
@@ -1995,7 +2289,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         names=required_metadata,
     )
     kv_cache = kwargs.get("kv_cache")
-    return _get_prims_ts_decode_mla_wrapper_trace(
+    base = _get_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=packed_query,
         mask_type=str(state.mask_type),
@@ -2007,11 +2301,17 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         softmax_rescale_threshold_log2=float(
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
+        cp_world=cp_world,
+        cp_interleave_size=int(getattr(state, "cp_interleave_size", 1)),
+        zero_empty_rows=(
+            bool(getattr(state, "zero_empty_rows", True)) if cp_world > 1 else True
+        ),
     )
+    return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
-prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values()
+prims_ts_decode_mla_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values(), bound=True
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────
@@ -4065,6 +4365,7 @@ def _trtllm_batch_decode_token_sparse_reference(
 def _trtllm_batch_decode_token_sparse_init(
     *,
     num_tokens: int,
+    batch_size: int | None = None,
     num_heads: int = 16,
     head_dim: int = 256,
     sparse_top_k: int = 512,
@@ -4077,7 +4378,10 @@ def _trtllm_batch_decode_token_sparse_init(
     Each query token is a request over one-token pages of one KV head. Its K
     and V slot lists are distinct random slots; the first token uses all
     ``sparse_top_k`` of them and the others a random count.
+    If provided, ``batch_size`` must equal ``num_tokens``.
     """
+    if batch_size is not None and batch_size != num_tokens:
+        raise ValueError("token-sparse decode requires batch_size == num_tokens")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 4 * sparse_top_k)
     query = torch.randn(

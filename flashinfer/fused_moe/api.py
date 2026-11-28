@@ -684,17 +684,48 @@ class TrtllmFp4Config:
 
 @dataclass(frozen=True)
 class CakeWarpDecodeConfig:
-    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+    """Cake NVFP4 warp-decode backend for exact SM100 and SM103.
 
     This backend is intentionally narrow: it accepts only the
     activation-qualified expert geometries documented by
-    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
-    It is never part of the default backend list; users opt in with
-    ``CakeWarpDecodeConfig(backend="cake")``.
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, BF16 routing weights, and
+    unpacked precomputed routing.
+
+    The default backend list ends with
+    ``CakeWarpDecodeConfig(default_candidate=True)``. ``MoELayer`` times every
+    eligible candidate on the first call for each token bucket and keeps a
+    later candidate only when it is strictly faster, so this entry is selected
+    only when it measures faster than every earlier eligible backend. It is
+    eligible only for weight packs with a ``"cake"`` view and for activation
+    packs it can serve; other calls select exactly as without it. Like the
+    TRT-LLM routing kernels, this entry drops a ``topk_ids`` value outside
+    ``[0, num_experts)``, such as ``-1`` padding, on the device without a host
+    sync: the slot adds nothing to the output. During CUDA Graph
+    capture it is eligible only for a token count it already served in an
+    eager call, and while an autotune process group tunes
+    (:func:`flashinfer.autotuner.set_autotune_process_group`) it is not
+    eligible. Setting ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` before a
+    ``MoELayer`` is built leaves this entry out of that layer (see
+    :func:`flashinfer.api_logging.cake_auto_candidates_enabled`). The default
+    entry resolves ``ExecutionConfig(enable_pdl=None)`` from the device, still
+    rejects ``enable_pdl=False``, and loads its kernel module on first use; if
+    that load fails, the entry is left out and the other candidates serve the
+    call.
+
+    An explicit ``CakeWarpDecodeConfig(backend="cake")`` is not affected by
+    that switch, requires ``ExecutionConfig(enable_pdl=True)``, and drops a
+    ``topk_ids`` value outside ``[0, num_experts)`` in the same way.
 
     The physical weight and activation layouts are exactly those produced by
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
     representation usable by both runners.
+
+    A routing slot whose ``topk_ids`` value lies outside ``[0, num_experts)``,
+    such as a ``-1`` padding slot, is dropped inside the kernels: it adds
+    nothing to the output and its weight is ignored, even if NaN or Inf. A
+    token may have several dropped slots, and a token without a valid slot
+    outputs zeros. No host check reads ``topk_ids``, so CUDA Graph replays may
+    change the ids freely.
 
     CUDA Graph capture requires a warmed workspace. Graph replays and eager
     calls that share a workspace must be ordered by the caller; captured calls
@@ -703,6 +734,8 @@ class CakeWarpDecodeConfig:
     """
 
     backend: Literal["cake"] = "cake"
+    # Marks the default backend list's entry; see the class docstring.
+    default_candidate: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.backend != "cake":
@@ -801,6 +834,8 @@ class CakeWarpDecodeConfig:
         )
 
     def __repr__(self) -> str:
+        if self.default_candidate:
+            return "CakeWarpDecodeConfig(backend='cake', default_candidate=True)"
         return "CakeWarpDecodeConfig(backend='cake')"
 
 
@@ -1136,13 +1171,35 @@ def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
     }
 
 
+def _block_major_k_fp4_weights(view: dict, *, block_bytes: int) -> dict:
+    """Store the packed FP4 weights of ``view`` BlockMajorK.
+
+    ``[experts, Mn, K_bytes]`` becomes ``[experts, K_bytes / block_bytes, Mn,
+    block_bytes]``. The rows of a weight tile are then contiguous within each
+    K block, so a GEMM pipeline stage reads a few contiguous regions instead
+    of one short segment per row.
+    """
+    view = dict(view)
+    for name in ("gemm1_weights", "gemm2_weights"):
+        weights = view[name]
+        num_experts, mn, k_bytes = weights.shape
+        view[name] = (
+            weights.view(num_experts, mn, k_bytes // block_bytes, block_bytes)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+    return view
+
+
 @dataclass(frozen=True)
 class PrimsTsConfig:
     """Explicit Prims-TS backend for SM100 and SM103.
 
     Opt-in only: this config is never part of the default backend list.
     NVFP4×NVFP4, MXFP4×MXFP8, and MXFP4×BF16 reuse
-    :class:`TrtllmFp4Config`. BF16×BF16 reuses :class:`TrtllmBf16Config`.
+    :class:`TrtllmFp4Config`; MXFP4×MXFP8 then stores the weights BlockMajorK
+    in 64-byte K blocks, so that whole weight tiles stream from contiguous
+    memory. BF16×BF16 reuses :class:`TrtllmBf16Config`.
     MXFP8×MXFP8 and FP8PerTensor×FP8PerTensor reuse
     :class:`TrtllmFp8BlockConfig` and :class:`TrtllmFp8PerTensorConfig`.
     DeepSeekFp8×DeepSeekFp8 reuses the TRT-LLM scales and activations, then
@@ -1176,13 +1233,26 @@ class PrimsTsConfig:
 
         Register the returned dictionary with
         ``MoEWeightPack.prepare_for("prims_ts", view)``. Except for
-        DeepSeekFp8, the same dictionary may also be registered for the
-        matching TRT-LLM backend key.
+        DeepSeekFp8 and MXFP4×MXFP8, the same dictionary may also be
+        registered for the matching TRT-LLM backend key. The Prims-TS backend
+        also accepts the MajorK TRT-LLM MXFP4×MXFP8 view.
         """
         pair = quant.pair
+        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            view = TrtllmFp4Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                quant=quant,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+            return _block_major_k_fp4_weights(view, block_bytes=64)
         if pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
-            (QuantFormat.MXFP4, QuantFormat.MXFP8),
             (QuantFormat.MXFP4, QuantFormat.BF16),
         ):
             return TrtllmFp4Config.prepare_weights(
@@ -2573,7 +2643,15 @@ class CuteDslConfig:
     """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    ``swap_ab=True`` selects the Blackwell activations-on-B implementation and
+    its 16-row gated weight layout. Prepare weights with the same option.
+    ``prepare_weights`` is static: even when called through a config instance,
+    pass ``swap_ab=True`` explicitly to select that layout.
+    W4A16 always uses activations on B; False selects its in-kernel transpose
+    for compatibility with the original 64-row layout.
     """
+
+    swap_ab: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2592,12 +2670,14 @@ class CuteDslConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+        swap_ab: bool = False,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
         (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
+        ``swap_ab`` must match the layer's ``CuteDslConfig.swap_ab``.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2616,6 +2696,7 @@ class CuteDslConfig:
             activation=activation,
             device=device,
             nvfp4_4over6=nvfp4_4over6,
+            swap_ab=swap_ab,
         )
 
     @staticmethod
@@ -2637,7 +2718,83 @@ class CuteDslConfig:
         return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
+        if self.swap_ab:
+            return "CuteDslConfig(swap_ab=True)"
         return "CuteDslConfig()"
+
+
+@dataclass(frozen=True)
+class FireflyNvfp4Config:
+    """Firefly: NVFP4×NVFP4 routed MoE on SM100 / SM103 in CuTe DSL
+    (experimental backend :mod:`flashinfer.experimental.firefly`).
+
+    Pre-routed packs only (``PackedPrecomputed`` or ``UnpackedPrecomputed``;
+    ids outside this rank's experts, negative ids included, are skipped):
+    ``uint8 [M, H/2]`` values and linear ``float8_e4m3fn [M, H/16]`` block
+    scales, with ``float32 [M]`` per-token scales under
+    ``QuantConfig(per_token_scale=True)``, or a unit global scale under
+    ``per_token_scale=False`` / ``None`` (per-tensor: fold a calibrated
+    activation scale into the view's ``w1_gs``, as into other backends'
+    ``w1_alpha``); BF16 output, ``do_finalize=True`` (fused or not). Activations:
+    SwiGLU (alpha, beta, limit), SwiGLUStep, GeGLU, GeGLUTanh, SiTU without
+    ``clamp_limit``, ReLU2. Expert parallelism; no NVFP4 4over6 recipe.
+    Shapes: H % 256 == 0, I % 128 == 0, 1 <= top_k <= min(E, 32), E <= 1024.
+    Each token's ``topk_ids`` must name distinct experts, as a top-k selection
+    does (not checked: repeated ids cause no out-of-bounds access, but their
+    result is unspecified).
+    The GEMM2 input is quantized with block scales only (no per-token scale),
+    except on the per-token direct path, where it also gets one: M <= 4 with a
+    gated activation, I = 512 or 768 and H >= 512.
+
+    The weight view differs from ``cute_dsl``'s: build it with
+    :meth:`prepare_weights` and register it under ``"firefly_nvfp4"``. Never
+    part of the default backend list; opting in is listing
+    ``FireflyNvfp4Config()`` among the candidates (warns once as an
+    experimental backend).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        # datacenter Blackwell with tcgen05 (firefly.moe.SUPPORTED_ARCHS)
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+    ):
+        """Build the ``firefly_nvfp4`` weight view from canonical BF16 weights.
+
+        ``w1_bf16`` is ``[E, 2I, H]`` with the rows [up, gate] for a gated
+        activation (``[E, I, H]`` for ReLU2), ``w2_bf16`` ``[E, H, I]``; the
+        same arguments as :meth:`CuteDslConfig.prepare_weights` (``nvfp4_4over6``
+        must resolve to ``None``). One global scale per expert from its amax.
+        Register the result with ``MoEWeightPack.prepare_for("firefly_nvfp4", ...)``.
+        """
+        from ..experimental.firefly.weights import prepare_view
+
+        return prepare_view(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            nvfp4_4over6=nvfp4_4over6,
+        )
+
+    def __repr__(self) -> str:
+        return "FireflyNvfp4Config()"
 
 
 @dataclass(frozen=True)
@@ -2750,9 +2907,15 @@ class SM12xNvfp4Config:
     scales are taken from the optional view keys ``"w1_input_global_scale"``
     and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
     ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
-    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
-    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
-    supported.
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default alpha
+    and beta and a finite positive limit, ``SiTU`` with a finite linear
+    scale and no clamp limit, and ``ReLU2``. On 188-SM devices, compatible
+    calls select between the monolithic kernel and native modular operators
+    by shape. Non-default SwiGLU limits, SiTU and explicit PDL requests use
+    the modular operators; gated calls to those operators require
+    ``intermediate_size % 128 == 0``. Default SwiGLU retains the monolithic
+    path when only 64-column alignment is available. Expert parallelism and
+    fused shared experts are not supported.
     """
 
     @classmethod
@@ -3266,8 +3429,433 @@ class FrostLowLatencyConfig:
         )
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records and the PDL wait / trigger placement follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE GEMMs)
+# and TRTLLM-Gen's routing and finalize kernels; the token gather folded into GEMM1 follows the CuTe-DSL MoE kernels' and
+# cuDNN Frost's GATHER variants; the slot-ordered combine follows Frost low-latency's in-kernel slot fold and the CUTLASS
+# backend's unfused finalize. Each is a placement of the class's dataflow: the same bits, placed as those kernels place
+# theirs.
+@dataclass(frozen=True)
+class BatchInvariantBf16Config:
+    """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
+    (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
+    ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
+    on SM100 / SM103 / SM107.
+
+    Every output bit is a function of the token's own row, its ``top_k`` experts and routing weights and the expert
+    weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
+    dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
+    invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
+    slot-order fp32 fold of the class; ``MoEFinalizeConfig(do_finalize=False)`` leaves it to the caller and returns the
+    layer's triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``: GEMM2's bf16 rows grouped by expert
+    in expert order and, inside a group, in token-slot order (a function of the routing alone, so the rows are
+    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits,
+    where the other backends return bf16: the fold widens a bf16 weight exactly, so a receiver that needs bf16 rounds
+    them itself; fp32 for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights) and the flat
+    ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold over the triple is the
+    finalized output bit for bit: ``flashinfer.fused_moe.batch_invariant.api.combine_unfinalized(*triple)`` computes it
+    with the combine kernel of the finalized forward. ``use_fused_finalize`` is ignored (the combine is never an atomic
+    finalize).
+    All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
+    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` (``top_k = 1``), ``TopKSigmoid`` and
+    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights under any
+    ``RoutingConfig``: a routing term the from-logits mode has no class for (the group shape rule, ``Llama4`` with
+    ``top_k > 1``, ``MiniMax2``) is refused at a from-logits call, never at construction. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
+    experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
+    fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
+    row is not a defined routing. A NaN logit is never selected and contributes nothing to the normalisation: the row
+    maximum skips it, its softmax term is ``+0`` (not the clamped ``exp`` of a ``-inf`` logit) and its selection score is
+    NaN under every method, so the other experts' weights are the row's with the NaN experts absent; when fewer than
+    ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has not
+    taken, with a NaN weight: the row's output is NaN and every id stays in range. A pre-routed expert id outside
+    ``[0, num_experts)`` is a dropped slot: neither gathered nor computed, it contributes ``+0`` to its token's combine
+    whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
+    Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
+    back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
+    checks come first: ``MoELayer`` runs every candidate's support check at construction (this backend refuses
+    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts;
+    the routing term is checked at the from-logits call) and
+    reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
+    filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
+    backend); what reaches the runner (an unimplemented method from logits, a bias or expert groups against the method,
+    a weight view of another activation or configuration, the runner driven directly) raises
+    ``BatchInvariantUnsupportedError``.
+
+    Expert parallelism: a shard (``ExpertConfig(local_expert_offset=offset, local_num_experts=E_local)``, weights prepared
+    for its ``E_local`` experts) routes over the ``num_experts`` global experts (from logits, or the caller's global ids)
+    and computes the slots whose expert lies in ``[offset, offset + E_local)``; every other slot is dropped (the term
+    ``+0`` in its token's fold, ``-1`` in the unfinalized map), so the rank's output is the dense class's fold restricted
+    to its experts: within one placement of the experts over the ranks every guarantee holds per rank, and the rows of
+    the unfinalized form are bit for bit the dense run's rows for those slots. The dense output is recovered bit for bit
+    by folding the ranks' unfinalized rows in slot order (the class's combine); a sum of the ranks' finalized partials is
+    another association and is not promised to equal it.
+
+    Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
+    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16 (``E`` the local experts of a shard); the activation
+    names the chain of the view; activations are bf16 ``[num_tokens, H]`` as given.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the gate / up rows interleaved for a gated activation, as given for an ungated one,
+        and the activation's chain (``activation`` defaults to ``SwiGLU()``). A supplied ``num_local_experts`` /
+        ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry (``ValueError`` otherwise)."""
+        from .batch_invariant.api import MoEWeights
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantBf16Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantBf16Config.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
+        w1 = w1.to(device=device) if device is not None else w1
+        w2 = w2.to(device=device) if device is not None else w2
+        return MoEWeights.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, None]:
+        """bf16 activations as given (no scale)."""
+        return hidden_states.to(torch.bfloat16).contiguous(), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantBf16Config()"
+
+
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp8 per-tensor decode tactics; the fused
+# activation and e4m3 requantisation at the static per-tensor multiplier in GEMM1's epilogue follows Prims-TS's fused
+# activation and TRTLLM-Gen's fp8 per-tensor contract, whose surface this backend mirrors; the PDL wait / trigger
+# placement and the launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation,
+# combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits,
+# placed as those kernels place theirs.
+@dataclass(frozen=True)
+class BatchInvariantFp8PerTensorConfig:
+    """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
+    SM100 / SM103 / SM107.
+
+    The surface is :class:`TrtllmFp8PerTensorConfig`'s: ``QuantConfig(weight=QuantFormat.FP8PerTensor,
+    activation=QuantFormat.FP8PerTensor)``, ``prepare_weights`` from the bf16 experts with the two calibrated E4M3
+    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``: ``q = x * s``), ``prepare_activations``
+    quantizing the bf16 activations with the input multiplier (an e4m3 ``[num_tokens, H]`` and no scale tensor), all three
+    routing input modes. The class declares every rounding: the experts quantized with one multiplier per expert and GEMM
+    (``448 / amax``), the dequantization scales the correctly rounded reciprocals of the multipliers, GEMM1's activation on
+    the alpha-scaled fp32 accumulators followed by the ``mul.rn`` by the intermediate multiplier and one saturating RNE
+    conversion to e4m3, GEMM2's ``cvt_bf16(mul(acc, alpha2))``, the slot-order fp32 combine. Every output bit is a function of
+    the token's own e4m3 row, its ``top_k`` experts and routing weights, the expert bytes and the scales; ``do_finalize=True``
+    only (the unfinalized triple is refused) and the dense expert set only (an expert-parallel shard,
+    ``local_expert_offset`` / ``local_num_experts``, is refused); unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default candidate (name it in
+    ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16: torch.Tensor,
+        w2_bf16: torch.Tensor,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized to e4m3 per expert, the gate / up rows interleaved for a gated
+        activation, the dequantization scales of the two multipliers and of the experts, the activation's chain
+        (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_fp8 import MoEWeightsE4M3
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1_bf16.dim() != 3 or w2_bf16.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp8PerTensorConfig.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1_bf16.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantFp8PerTensorConfig.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1_bf16.shape)}, w2 {tuple(w2_bf16.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
+        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
+        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        return MoEWeightsE4M3.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            hidden_states_scale_global,
+            intermediate_scale_global,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16: torch.Tensor, *, hidden_states_scale_global
+    ) -> Tuple[torch.Tensor, None]:
+        """The static input quantization ``cvt.rn.satfinite.e4m3(mul(x, hidden_states_scale_global))`` (the class's declared
+        chain as torch ops; graph-capturable with a device scale)."""
+        from .batch_invariant.reference_fp8 import quantize_e4m3_static
+
+        x = hidden_states_bf16.to(torch.bfloat16).contiguous()
+        m = torch.as_tensor(
+            hidden_states_scale_global, dtype=torch.float32, device=x.device
+        )
+        if m.numel() != 1:
+            raise ValueError(
+                "BatchInvariantFp8PerTensorConfig.prepare_activations: hidden_states_scale_global must be one fp32 value, "
+                f"got shape {tuple(m.shape)}"
+            )
+        # a 0-d multiplier: a one-element tensor of any rank must not broadcast the activations to its rank
+        return quantize_e4m3_static(x, m.reshape(())), None
+
+    def __repr__(self) -> str:
+        return "BatchInvariantFp8PerTensorConfig()"
+
+
+def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]:
+    """The quantization pair of the fp4 backend a ``quant`` selects (``None``: NVFP4 x NVFP4); an unserved pair is refused."""
+    if quant is None:
+        return (QuantFormat.NVFP4, QuantFormat.NVFP4)
+    from .batch_invariant.runner_fp4 import BatchInvariantFp4Runner, unsupported_pair
+
+    if quant.pair not in BatchInvariantFp4Runner.supported_quant_variants:
+        raise unsupported_pair(quant)
+    return quant.pair
+
+
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE
+# GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's fp4 decode tactics; the static-intermediate
+# class (GEMM1's epilogue quantizing the fp32 gated value per 16-column block with a per-expert static scale) follows the
+# fp4-intermediate recipe of the CuTe-DSL, TRTLLM-Gen, CUTLASS and Frost backends, with every op correctly rounded; the
+# dense packing of the expanded rows with the scale factors at the padded atom positions and the token tile's scale rows
+# gathered by one cp.async warp follow CuTe-DSL's gathered-operand pipeline; the PDL wait / trigger placement and the
+# launch's tile bound on the persistent grid follow Prims-TS and TRTLLM-Gen; the routing, permutation, combine and the
+# ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same bits, placed as those
+# kernels place theirs.
+@dataclass(frozen=True)
+class BatchInvariantFp4Config:
+    """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
+    as :class:`TrtllmFp4Config` groups them, ``QuantConfig(weight=..., activation=...)`` selecting the pair: ``quant``
+    defaults to the NVFP4 x NVFP4 pair in ``prepare_weights`` / ``prepare_activations`` (``quant=None``), and the MXFP4 x
+    MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``). The pairs served, on SM100 / SM103 / SM107, one class
+    per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
+    NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
+    per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
+    one UE8M0 scale per 32 elements on both operands, no global and no per-token scale). A pair the backend does not serve
+    (MXFP4 x MXFP8 among them) is skipped by the layer's candidate filter and refused by ``prepare_weights`` /
+    ``prepare_activations`` and by the runner with :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`, naming
+    the served pairs. The kernel classes keep their registry names (``fingerprint("fused_moe_nvfp4", ...)``,
+    ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
+    layer configured for the other.
+
+    The guarantee, the routing input modes and the error contract are the bf16 backend's (:class:`BatchInvariantBf16Config`):
+    a token's output bits depend on its own row, its ``top_k`` experts and routing weights and the expert weights only; the
+    backend never falls back and is not a default candidate. Unlike the bf16 backend it serves the finalized output alone
+    (``do_finalize=True``: the slot-order combine is part of the class; ``do_finalize=False`` is refused) and the full expert
+    set (no expert-parallel shards: ``local_expert_offset`` / ``local_num_experts`` naming a shard are refused). The
+    dataflow of the NVFP4 pair
+    (the proofs are the ``MoENvfp4`` Lean module of the mode): the input row quantized per token by the mode's NVFP4
+    quantizer (TransformerEngine's recipe), GEMM1 as the dense NVFP4 GEMM class per expert with the chain
+    ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token
+    by the same class, GEMM2 with ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction
+    class of each expert weight shape is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step
+    elsewhere), so the architecture family is a dimension of ``fingerprint("fused_moe_nvfp4", ...)`` (SM100 and SM103 are one family). The fp4 classes' bits are a
+    property of the architecture family: the fold's instruction class and, for the activation chains with an exponential or a
+    division, the part's SFU primitives (``ex2.approx.ftz`` / ``rcp.approx.ftz``, measured into tables the tests pin per
+    part), so the output is deterministic and batch-invariant within a family and not, in general, equal across families
+    (``flashinfer/batch_invariant/README.md``: the hardware hypothesis and the pinned digests); the ReLU family and PowLU
+    have no SFU step and are the declared sequences.
+
+    Weights (NVFP4 x NVFP4): ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or
+    ``[E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor
+    NVFP4 quantizer (global scale ``448 * 6 / amax``, 128x4 swizzled scales); ``H`` and ``I`` multiples of 32, the expert
+    weight shapes unsplit by the dense class's chunk rule. Activations: bf16 ``[num_tokens, H]`` as given
+    (``prepare_activations``: the class quantizes them per token itself), or packed fp4 ``uint8 [num_tokens, H / 2]`` with
+    ``hidden_states_scale`` (the 128x4 swizzled scales of ``nvfp4_quantize(..., per_token_activation=True,
+    batch_invariant=True)``, their pad columns zero as every FlashInfer quantizer writes them, or the linear
+    ``[num_tokens, H / 16]`` layout) and ``per_token_scale`` (unit scales when absent: the per-tensor pack of
+    :class:`TrtllmFp4Config`).
+
+    ``intermediate`` selects the intermediate's quantization, two classes of the NVFP4 pair: ``"per_token"`` (the default,
+    ``moe.nvfp4.<act>``: the bf16 intermediate quantized per token by the mode's quantizer) or ``"static"``
+    (``moe.nvfp4.<act>.static``: GEMM1's epilogue quantizes the fp32 gated value per 16-column block with the expert's static
+    global scale -- the recipe of the TRTLLM-Gen, CuTe-DSL, CUTLASS and Frost backends, with every op correctly rounded -- and
+    GEMM2 carries the per-expert constant ``1 / scale``; no bf16 intermediate, one launch less). The static scales are
+    ``prepare_weights(..., intermediate="static", intermediate_scales=[E] f32 multipliers)``, default ones (the open backends'
+    unified-layer value, FlashInfer's ``fc2_input_scale`` convention); the weight view carries the class, and a pack prepared for
+    the other class is refused.
+
+    MXFP4 x MXFP4 (the proofs are the ``MoEMxfp4`` Lean module): the input row quantized by the mode's MXFP4 quantizer
+    (``mxfp4.quant``), GEMM1 as the dense MXFP4 GEMM class per expert with the bf16 class's chain on the raw accumulators (the
+    block scales are applied inside the instruction), the bf16 intermediate quantized by the same class, GEMM2 with
+    ``cvt_bf16(acc)``, the slot-order combine; the instruction class is the part's (the sm_107 K = 128 step on SM107), so the
+    architecture family is a dimension of ``fingerprint("fused_moe_mxfp4", ...)`` (SM100 and SM103 are one family). Weights: the canonical bf16 layouts above,
+    quantized per expert by the MXFP4 quantizer (128x4 swizzled UE8M0 scales), ``H`` and ``I`` multiples of 32. Activations:
+    bf16 rows as given, or packed fp4 ``uint8 [num_tokens, H / 2]`` with ``hidden_states_scale`` (the 128x4 swizzled scales of
+    ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
+    (``QuantConfig(per_token_scale=True)`` is refused for this pair). ``intermediate`` and ``intermediate_scales`` are the NVFP4
+    pair's and are refused for MXFP4.
+    """
+
+    intermediate: str = "per_token"
+
+    def __post_init__(self) -> None:
+        if self.intermediate not in ("per_token", "static"):
+            raise ValueError(
+                f"BatchInvariantFp4Config.intermediate must be 'per_token' or 'static', got {self.intermediate!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        *,
+        quant: Optional["QuantConfig"] = None,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+        intermediate: str = "per_token",
+        intermediate_scales: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view for the pair ``quant`` selects, to register under
+        ``BatchInvariantFp4Runner.backend_key``: ``quant`` defaults to the NVFP4 x NVFP4 pair (``None``), and the MXFP4 x
+        MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``; a pack prepared
+        for one pair is refused by a layer configured for the other); the activation's chain is part of the view (``activation`` defaults to
+        ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
+        rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
+        (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
+        per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
+        elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
+        ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
+        ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
+        view is built. The experts are quantized one at a time into the preallocated pack on ``device`` (the weights' by
+        default), each expert's slice moved there and cast to bf16 right before its quantization: the peak memory beyond
+        the inputs is the fp4 pack plus one expert's temporaries for CPU-resident and fp32 weights too (never a full-size
+        bf16 or fp32 copy of the experts)."""
+        from ..batch_invariant.support import unsupported
+        from .batch_invariant.api_fp4 import MoEWeightsFp4
+        from .batch_invariant.runner_fp4 import PAIRS
+        from .batch_invariant.spec import activation_of
+
+        pair = _fp4_pair(quant)
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantFp4Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise unsupported(
+                    PAIRS[pair].cls,
+                    f"{name} {given} with weights of {name} {actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)",
+                    "dimensions that agree with the weights' geometry (or none)",
+                )
+        if intermediate_scales is not None and intermediate != "static":
+            raise unsupported(
+                PAIRS[pair].cls,
+                f"intermediate_scales with intermediate={intermediate!r}",
+                "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
+            )
+        # the move to the device and the cast to bf16 are per expert inside the preparation (no full-size copy here)
+        return MoEWeightsFp4.prepare(
+            PAIRS[pair],
+            w1,
+            w2,
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+            intermediate=intermediate,
+            intermediate_scales=intermediate_scales,
+            device=device,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The activation pack of the pair ``quant`` selects, the pair's own form
+        (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`): ``quant`` defaults to the
+        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4,
+        activation=QuantFormat.MXFP4)``). Both served pairs: bf16
+        activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
+        part of the op."""
+        from .batch_invariant.runner_fp4 import PAIRS
+
+        # the served pairs' table drives the form: an unserved pair was refused by _fp4_pair, a served one names its form
+        return PAIRS[_fp4_pair(quant)].prepare_activations(hidden_states)
+
+    def __repr__(self) -> str:
+        return (
+            "BatchInvariantFp4Config()"
+            if self.intermediate == "per_token"
+            else f"BatchInvariantFp4Config(intermediate={self.intermediate!r})"
+        )
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3304,15 +3892,19 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    FireflyNvfp4Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp4Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3349,12 +3941,15 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    FireflyNvfp4Config,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp4Config,
 )
 
 
@@ -3420,6 +4015,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CudnnFrostMxfp8Config(),
         CudnnFrostNvfp4Config(),
         CudnnFrostMxfp8Mxfp4Config(),
+        # Last, so it never displaces an earlier backend on a timing tie.
+        CakeWarpDecodeConfig(default_candidate=True),
     )
 )
 
@@ -3455,6 +4052,14 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
+        if (
+            len({c.swap_ab for c in self.backend if isinstance(c, CuteDslConfig)}) > 1
+            and self.activation.is_gated
+        ):
+            raise ValueError(
+                "Mixed CuteDslConfig swap_ab modes need separate gated weight "
+                "views; use a separate MoELayer for each mode."
+            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
@@ -3660,6 +4265,17 @@ class MoEActivationPack:
     routing_bias: Optional[Tensor] = field(
         default=None, kw_only=True
     )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+    # Optional contiguous, 16-byte aligned [M, H] bfloat16 buffer on the
+    # device of the activations, for the finalized output.
+    # Runners that write it in place (Prims-TS) write it here and return it;
+    # the others allocate their own. Callers use the returned tensor.
+    output: Optional[Tensor] = field(default=None, kw_only=True)
+    # Whether the output rows of tokens without a local expert (no top-k id in
+    # this rank's local expert range) are written as zeros. False is for
+    # callers that never read those rows, such as an all-to-all combine that
+    # reads only rows with a local expert: the runners that honor it
+    # (Prims-TS) then leave them as they are, the others still write zeros.
+    zero_rows_without_local_expert: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         """Fail fast on mode/field mismatches at construction time.
@@ -3796,8 +4412,8 @@ class MoEWeightPack:
     ``get_view(key)``.
 
     Holding multiple materializations is intentional — that's the memory cost
-    the user pays for cross-backend autotune.  Each view is the exact kwargs
-    dict that runner's ``forward`` expects for weight-side arguments.
+    the user pays for cross-backend autotune.  Each view contains the weight
+    tensors and layout metadata consumed by its runner.
 
     Every ``XxxConfig.prepare_weights`` takes the same canonical source
     layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
@@ -3806,14 +4422,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

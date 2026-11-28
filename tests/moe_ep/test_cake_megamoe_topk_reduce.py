@@ -3,7 +3,7 @@
 Host-side tests run without a GPU: device selection follows the exact compute
 capability, the capability is queried once per device, and the one generated
 source carries exactly the four CTA shapes the binding launches.  The GPU tests
-(``arch_blackwell``) check the reducer's results bit for bit against an ordered
+(on a device with an exact reducer build) check the reducer's results bit for bit against an ordered
 FP32 reference on every token tier and tier boundary, at arbitrary workspace
 capacities and at 128-byte aligned inputs inside larger buffers; that each live
 token count launches the CTA shape its architecture's tiers pick; and the
@@ -18,10 +18,10 @@ import pytest
 import torch
 
 from flashinfer.jit import cake_megamoe_topk_reduce as reducer
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
-_ARCHS = ("sm_100a", "sm_103a")
-_CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
+_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
+_CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3), "sm_107a": (10, 7)}
 _HIDDEN = 4096
 _TOP_K = 6
 # Deployment shapes (num_tokens, capacity) plus capacities outside {256, 4096}.
@@ -43,6 +43,9 @@ _SHAPE_THREADS = {
     "t512x4": 512,
     "t512x4_pf256": 512,
     "t1024x4_pf256": 1024,
+    "t64x8_badd_l2ef": 64,
+    "t256x2_badd_l2ef": 256,
+    "t256x4_badd_l2ef": 256,
 }
 # Live-token tiers of each architecture: (largest num_tokens of the tier, CTA
 # shape); the last tier has no bound.
@@ -61,9 +64,97 @@ _TIERS = {
         (1024, "t512x4_pf256"),
         (None, "t1024x4_pf256"),
     ),
+    "sm_107a": (
+        (64, "t256x2_badd_l2ef"),
+        (212, "t256x4_badd_l2ef"),
+        (None, "t64x8_badd_l2ef"),
+    ),
 }
-# Both architectures' tier boundaries: the last and first token count of each tier.
-_TIER_EDGES = (48, 49, 96, 97, 192, 193, 256, 257, 1024, 1025, 2048, 2049)
+# Every architecture's tier boundaries: the last and first token count of each tier.
+_TIER_EDGES = (
+    *(48, 49, 64, 65, 96, 97, 192, 193),
+    *(212, 213, 256, 257, 1024, 1025, 2048, 2049),
+)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("id_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("top_k", (1, 6, 32))
+def test_batch_invariant_ordered_masked_fold(id_dtype, top_k):
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in _CAPABILITIES.values()
+    ):
+        pytest.skip("requires SM100/SM103/SM107")
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.token_comm import (
+        CombineFormat,
+    )
+
+    # Every BF16 code appears, including +/-0, subnormals, infinities and all
+    # NaN encodings. Other slots expose cancellation and stale masked cells.
+    codes = (
+        torch.arange(65536, dtype=torch.int32, device="cuda")
+        .to(torch.int16)
+        .view(torch.bfloat16)
+        .view(16, 4096)
+    )
+    partials = codes[:, None, :].repeat(1, top_k, 1)
+    ids = torch.zeros(16, top_k, device="cuda", dtype=id_dtype)
+    if top_k > 1:
+        partials[:, 1] = -partials[:, 1]
+    if top_k > 2:
+        ids[::2, 2] = -1
+        ids[1::2, 2] = 8
+        partials[:, 2] = float("nan")
+    expected = torch.empty_like(codes)
+    output = torch.empty_like(codes)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = tuple(from_dlpack(t) for t in (partials, expected, ids))
+    reference = TopkReduce(
+        4096, top_k, CombineFormat.parse("bf16"), num_experts=8, batch_invariant=True
+    )
+    compiled = cute.compile(
+        reference, args[0], None, args[1], None, stream, topk_indices=args[2]
+    )
+    compiled(args[0], None, args[1], None, stream, topk_indices=args[2])
+    reducer.run_cake_megamoe_topk_reduce(
+        partials, output, 16, batch_invariant=True, topk_ids=ids, num_experts=8
+    )
+    assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+    # Independently reproduce the ordered finite fold with one FP32 add per
+    # slot; torch.sum is deliberately avoided because it may reassociate.
+    acc = torch.zeros_like(codes, dtype=torch.float32)
+    for slot in range(top_k):
+        valid = (ids[:, slot] >= 0) & (ids[:, slot] < 8)
+        value = torch.where(valid[:, None], partials[:, slot], 0).float()
+        acc = acc + value
+    finite = torch.isfinite(acc)
+    assert torch.equal(
+        output[finite].view(torch.int16),
+        acc.to(torch.bfloat16)[finite].view(torch.int16),
+    )
+    # A graph replay reads changed payloads/IDs; masked NaNs cannot leak.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        reducer.run_cake_megamoe_topk_reduce(
+            partials, output, 16, batch_invariant=True, topk_ids=ids, num_experts=8
+        )
+    ids.fill_(-1)
+    partials.fill_(float("nan"))
+    graph.replay()
+    assert torch.count_nonzero(output.view(torch.int16)) == 0
+    output.fill_(1)
+    reducer.run_cake_megamoe_topk_reduce(
+        partials, output, 0, batch_invariant=True, topk_ids=ids, num_experts=8
+    )
+    assert torch.all(output == 1)
 
 
 def _expected_kernel(arch: str, num_tokens: int) -> str:
@@ -80,8 +171,8 @@ def fresh_capability_cache():
     reducer._device_capability.cache_clear()
 
 
-def test_supported_capabilities_are_exact_blackwell_targets():
-    assert reducer.supported_capabilities() == ((10, 0), (10, 3))
+def test_supported_capabilities_are_exact_targets():
+    assert reducer.supported_capabilities() == ((10, 0), (10, 3), (10, 7))
     assert tuple(reducer._ARCHS) == _ARCHS
 
 
@@ -150,13 +241,14 @@ def test_unknown_arch_is_rejected():
 def test_module_uri_is_arch_specific():
     uris = {arch: reducer.get_cake_megamoe_topk_reduce_uri(arch) for arch in _ARCHS}
     assert uris == {
-        "sm_100a": "cake_megamoe_topk_reduce_sm100a",
-        "sm_103a": "cake_megamoe_topk_reduce_sm103a",
+        "sm_100a": "cake_megamoe_topk_reduce_v2_sm100a",
+        "sm_103a": "cake_megamoe_topk_reduce_v2_sm103a",
+        "sm_107a": "cake_megamoe_topk_reduce_v2_sm107a",
     }
 
 
 def test_each_module_compiles_its_own_token_tiers():
-    for arch, define in (("sm_100a", "100"), ("sm_103a", "103")):
+    for arch, define in (("sm_100a", "100"), ("sm_103a", "103"), ("sm_107a", "107")):
         flags = reducer._ARCHS[arch]["nvcc_flags"]
         assert f"-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH={define}" in flags
 
@@ -165,11 +257,15 @@ def test_tier_tables_cover_every_token_count():
     assert tuple(_KERNEL_PREFIX + shape for shape in _SHAPE_THREADS) == (
         reducer._KERNEL_SYMBOLS
     )
+    launched = set()
     for tiers in _TIERS.values():
         bounds = [bound for bound, _ in tiers]
         assert bounds[-1] is None
         assert bounds[:-1] == sorted(bounds[:-1])
-        assert {shape for _, shape in tiers} == set(_SHAPE_THREADS)
+        assert len(set(bounds)) == len(bounds)
+        launched |= {shape for _, shape in tiers}
+    # Every shape in the source is some architecture's tier.
+    assert launched == set(_SHAPE_THREADS)
 
 
 def test_one_generated_source_carries_every_cta_shape():
@@ -187,7 +283,7 @@ def test_one_generated_source_carries_every_cta_shape():
         assert len(re.findall(rf"\b{symbol}\(", source)) == 1
         assert f"__launch_bounds__({threads}) void\n{symbol}(" in source
         assert f"{symbol}<<<" in binding
-    # Arch-neutral: no SM100-only or SM103-only instructions.
+    # Arch-neutral: no instruction specific to one of the targets.
     assert "tcgen05" not in source
     assert "mbarrier" not in source
     # Every device helper in the source is called by a kernel.
@@ -209,12 +305,43 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.int16)
 
 
+def _special_partials(
+    capacity: int, device: torch.device, generator: torch.Generator
+) -> torch.Tensor:
+    """BF16 partials mixing normals with the values where the FP32 adds could
+    differ: subnormals, tiny normals whose sums cancel into the FP32 subnormal
+    range, signed zeros, near-maximum magnitudes (six-term sums overflow to
+    infinity), infinities and NaN."""
+    shape = (capacity, _TOP_K, _HIDDEN)
+    pick = torch.rand(shape, device=device, generator=generator)
+    low = torch.randint(0, 1 << 15, shape, device=device, generator=generator)
+    sign = torch.randint(0, 2, shape, device=device, generator=generator) << 15
+    normal = (
+        torch.randn(shape, device=device, generator=generator)
+        .bfloat16()
+        .view(torch.int16)
+        .int()
+        & 0xFFFF
+    )
+    bits = torch.where(pick < 0.20, sign | (1 + low % 0x7F), normal)
+    bits = torch.where(
+        (pick >= 0.20) & (pick < 0.32), sign | (0x80 + low % 0x100), bits
+    )
+    bits = torch.where((pick >= 0.32) & (pick < 0.38), sign, bits)
+    bits = torch.where(
+        (pick >= 0.38) & (pick < 0.43), sign | (0x7F00 + low % 0x80), bits
+    )
+    bits = torch.where((pick >= 0.43) & (pick < 0.435), sign | 0x7F80, bits)
+    bits = torch.where((pick >= 0.435) & (pick < 0.438), 0x7FC0, bits)
+    return (bits - ((bits >> 15) << 16)).short().view(torch.bfloat16)
+
+
 def _require_reducer_device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
     if torch.cuda.get_device_capability(device) not in reducer.supported_capabilities():
-        pytest.skip("reducer requires exact SM100a or SM103a")
+        pytest.skip("reducer requires exact SM100a, SM103a or SM107a")
     return device
 
 
@@ -239,7 +366,8 @@ def _profiled_kernel_names(fn) -> list[str]:
     return cuda_kernel_names(fn)
 
 
-@pytest.mark.arch_blackwell
+# No arch marker: ``arch_blackwell`` skips compute capability 10.7 (conftest), and
+# ``_require_reducer_device`` already selects the exact capabilities with a build.
 class TestReduceOnDevice:
     @pytest.mark.parametrize(
         ("num_tokens", "capacity"),
@@ -263,6 +391,26 @@ class TestReduceOnDevice:
         assert torch.isnan(out[num_tokens:]).all()
         assert reducer.is_cake_megamoe_topk_reduce_module_loaded(device)
         assert reducer.supports_device(device)
+
+    @pytest.mark.parametrize("num_tokens", (1, 2, 8, 64, 65, 128, 213, 300, 2100))
+    def test_matches_ordered_reference_on_special_values(self, num_tokens):
+        device = _require_reducer_device()
+        capacity = num_tokens + 5
+        generator = torch.Generator(device=device).manual_seed(num_tokens + 6032)
+        partials = _special_partials(capacity, device, generator)
+        out = torch.full(
+            (capacity, _HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        reducer.run_cake_megamoe_topk_reduce(partials, out, num_tokens)
+        torch.cuda.synchronize()
+        expected = _ordered_reference(partials, num_tokens)
+        nan = torch.isnan(expected)
+        assert nan.any() and torch.isinf(expected).any()
+        # Bitwise wherever the reference is a number (subnormals, signed
+        # zeros and infinities included); NaN exactly where it is NaN.
+        assert torch.equal(torch.isnan(out[:num_tokens]), nan)
+        assert torch.equal(_bits(out[:num_tokens])[~nan], _bits(expected)[~nan])
+        assert torch.isnan(out[num_tokens:]).all()
 
     @pytest.mark.parametrize("num_tokens", (1, 37, 97, 256, 1025))
     @pytest.mark.parametrize("offset_bytes", (128, 384))

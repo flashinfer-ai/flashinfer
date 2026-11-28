@@ -291,9 +291,10 @@ def test_dense_route_available_rejects_out_of_contract_points(catalog_variant):
     catalog = _runtime._catalog()
     routes = catalog["routes"]
     bounds = catalog["policy"]["fused_qle2048_max_kv"]
+    small_q = catalog["policy"]["fused_qle2048_small_q_max_kv"]
     above = (
-        max(int(v) for v in bounds.values()) + 13
-    )  # unaligned, past both fused Q <= 2048 bounds
+        max(int(v) for v in (*bounds.values(), *small_q.values())) + 13
+    )  # unaligned, past every fused Q <= 2048 bound (the small-Q band's too)
     assert all(
         int(v) == 256 for v in routes["fp8:partial:le2048"]["kv_alignment"].values()
     )

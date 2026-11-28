@@ -3018,13 +3018,8 @@ def _make_sm12x_nvfp4_case(
                 continue
             token, slot = (ids == e).nonzero(as_tuple=True)
             h = x[token] @ (dequantized[0][e].float() * global_scales[0][e]).T
-            if activation.is_gated:
-                # Checkpoint w1 rows are [up, gate]; the prepared view reorders them.
-                up, gate = h.split(intermediate_size, dim=-1)
-                a = torch.nn.functional.silu(gate) * up
-            else:
-                a = torch.relu(h).square()
-            a = _nvfp4_fake_quant(a.to(torch.bfloat16).float(), g2)
+            a = compute_reference_activation(h, activation, intermediate_size)
+            a = _nvfp4_fake_quant(a.float(), g2)
             y = a @ (dequantized[1][e].float() * global_scales[1][e]).T
             out.index_add_(0, token, y * act.topk_weights[token, slot, None])
         return out.to(torch.bfloat16)
@@ -3040,6 +3035,7 @@ def _sm12x_nvfp4_config(
     intermediate_size: int,
     max_num_tokens: int,
     backends: tuple = (SM12xNvfp4Config(),),
+    enable_pdl: bool = False,
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
@@ -3048,7 +3044,9 @@ def _sm12x_nvfp4_config(
         activation=activation,
         backend=BackendOptions(backends),
         finalize=MoEFinalizeConfig(do_finalize=True),
-        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_num_tokens),
+        execution=ExecutionConfig(
+            enable_pdl=enable_pdl, tune_max_num_tokens=max_num_tokens
+        ),
     )
 
 
@@ -3064,17 +3062,83 @@ def _assert_w4a4_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert rel < 0.03, rel
 
 
-def test_sm12x_nvfp4_rejects_non_default_swiglu():
+@pytest.mark.parametrize("activation", [SwiGLU(alpha=2.0), SwiGLU(beta=1.0)])
+def test_sm12x_nvfp4_rejects_non_default_swiglu_scalars(activation):
     config = _sm12x_nvfp4_config(
-        SwiGLU(limit=7.0),
+        activation,
         num_experts=4,
         top_k=2,
         intermediate_size=128,
         max_num_tokens=8,
     )
     runner = SM12xNvfp4Runner(config, torch.device("cpu"))
-    with pytest.raises(NotImplementedError, match="default SwiGLU"):
+    with pytest.raises(NotImplementedError, match="default SwiGLU alpha and beta"):
         runner._check_activation_parameters()
+
+
+@pytest.mark.parametrize(
+    "activation,tokens,hidden,inter,experts,topk,enable_pdl,native",
+    [
+        (SwiGLU(), 4, 256, 128, 8, 2, False, False),
+        (SwiGLU(), 256, 2048, 768, 128, 8, False, False),
+        (SwiGLU(), 576, 2048, 768, 128, 8, False, True),
+        (SwiGLU(), 1366, 4096, 2048, 256, 6, False, False),
+        (SwiGLU(), 4096, 4096, 2048, 256, 6, False, True),
+        (SwiGLU(), 190, 512, 1024, 4, 2, False, False),
+        (SwiGLU(), 192, 512, 1024, 4, 2, False, True),
+        (SwiGLU(), 190, 512, 896, 4, 2, False, True),
+        (SwiGLU(), 128, 1024, 192, 64, 4, False, False),
+        (ReLU2(), 8, 2688, 1856, 128, 6, False, True),
+        (SwiGLU(limit=10.0), 4, 256, 128, 8, 2, False, True),
+        (SiTU(), 4, 256, 128, 8, 2, False, True),
+        (SwiGLU(), 4, 256, 128, 8, 2, True, True),
+    ],
+)
+def test_sm12x_nvfp4_dispatch_policy(
+    activation, tokens, hidden, inter, experts, topk, enable_pdl, native
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.heuristic import (
+        select_fp4_fc1_act_q1_tile,
+    )
+
+    config = _sm12x_nvfp4_config(
+        activation,
+        num_experts=experts,
+        top_k=topk,
+        intermediate_size=inter,
+        max_num_tokens=tokens,
+        enable_pdl=enable_pdl,
+    )
+    runner = SM12xNvfp4Runner(config, torch.device("cpu"))
+    runner._num_sms = 188
+    runner._fc1_module = SimpleNamespace(
+        select_tactic=lambda **kwargs: (select_fp4_fc1_act_q1_tile(**kwargs), None)
+    )
+    runner._check_activation_parameters()
+    x = torch.empty((tokens, hidden), device="meta")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="meta")
+    assert runner._use_native(x, ids) is native
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize(
+    "activation,enable_pdl",
+    [(SwiGLU(limit=7.0), False), (SiTU(), False), (SwiGLU(), True)],
+)
+def test_sm12x_nvfp4_rejects_unavailable_modular_gated_alignment(
+    activation, enable_pdl
+):
+    config = _sm12x_nvfp4_config(
+        activation,
+        num_experts=4,
+        top_k=2,
+        intermediate_size=192,
+        max_num_tokens=8,
+        enable_pdl=enable_pdl,
+    )
+    runner = SM12xNvfp4Runner(config, torch.device("cuda"))
+    with pytest.raises(NotImplementedError, match="modular gated activations"):
+        runner._check_support()
 
 
 @sm12x_nvfp4_bf16_required
@@ -3124,6 +3188,64 @@ def test_sm12x_nvfp4_reads_the_shared_cutile_view(activation):
     ):
         assert tensor.data_ptr() == view[key].data_ptr(), key
     _assert_w4a4_close(runner.forward(inputs), reference(act))
+
+
+@pytest.mark.parametrize("num_tokens", (8, 257))
+def test_sm12x_nvfp4_native_layer_on_noncurrent_device(monkeypatch, num_tokens):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    device = torch.device("cuda:1")
+    activation = SwiGLU(limit=7.0)
+    with torch.cuda.device(device):
+        if not _sm12x_nvfp4_bf16_is_supported():
+            pytest.skip("requires an SM12x input device, CUDA 13 and CuTe DSL")
+        view, make_activations, reference = _make_sm12x_nvfp4_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=4,
+            top_k=2,
+        )
+        weights = MoEWeightPack()
+        weights.prepare_for(SM12xNvfp4Runner.backend_key, view)
+        layer = MoELayer(
+            _sm12x_nvfp4_config(
+                activation,
+                num_experts=4,
+                top_k=2,
+                intermediate_size=512,
+                max_num_tokens=num_tokens,
+            ),
+            device,
+        )
+        act = make_activations(0)
+        expected = reference(act)
+        runner = next(r for r in layer.runners if isinstance(r, SM12xNvfp4Runner))
+        assert runner._requires_native()
+        monkeypatch.setattr(runner._fc1_module, "_COMPILED", {})
+        monkeypatch.setattr(runner._fc2_module, "_COMPILED", {})
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    other_stream = torch.cuda.Stream(device=0)
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        for _ in range(2):
+            assert torch.cuda.current_device() == 0
+            actual = layer(act, weights).clone()
+            assert torch.cuda.current_device() == 0
+            stream.synchronize()
+            _assert_w4a4_close(actual, expected)
+    assert layer.winner_backend == SM12xNvfp4Runner.backend_key
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), torch.cuda.stream(other_stream):
+        actual = layer(act, weights)
+        assert torch.cuda.current_device() == 0
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        graph.replay()
+        assert torch.cuda.current_device() == 0
+    stream.synchronize()
+    _assert_w4a4_close(actual, expected)
 
 
 _SM12X_NVFP4_GEOMETRIES = (
@@ -3266,15 +3388,26 @@ def test_sm12x_nvfp4_ignores_out_of_range_expert_ids(num_tokens):
 
 @sm12x_nvfp4_bf16_required
 @pytest.mark.parametrize(
-    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation,enable_pdl,input_scale",
     (
-        (4, 2560, 640, 512, 10, SwiGLU()),
-        (256, 2048, 768, 128, 8, SwiGLU()),
-        (8, 2688, 1856, 128, 6, ReLU2()),
+        (4, 2560, 640, 512, 10, SwiGLU(), False, 1.0),
+        (256, 2048, 768, 128, 8, SwiGLU(), False, 1.0),
+        (8, 2688, 1856, 128, 6, ReLU2(), False, 1.0),
+        (257, 512, 512, 16, 2, SwiGLU(limit=10.0), False, 16.0),
+        (257, 512, 512, 16, 2, SiTU(), True, 1.0),
+        (8, 512, 512, 16, 2, SwiGLU(), True, 1.0),
+        (1024, 512, 512, 8, 2, SwiGLU(), False, 1.0),
     ),
 )
 def test_sm12x_nvfp4_cuda_graph_replays_new_inputs_and_routing(
-    num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    top_k,
+    activation,
+    enable_pdl,
+    input_scale,
 ):
     view, make_activations, reference = _make_sm12x_nvfp4_case(
         activation,
@@ -3293,10 +3426,12 @@ def test_sm12x_nvfp4_cuda_graph_replays_new_inputs_and_routing(
             top_k=top_k,
             intermediate_size=intermediate_size,
             max_num_tokens=num_tokens,
+            enable_pdl=enable_pdl,
         ),
         torch.device("cuda"),
     )
     act = make_activations(0)
+    act.hidden_states_q.mul_(input_scale)
     _assert_w4a4_close(layer(act, weights), reference(act))
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -3304,11 +3439,60 @@ def test_sm12x_nvfp4_cuda_graph_replays_new_inputs_and_routing(
         captured = layer(act, weights)
     for step in (1, 2):
         update = make_activations(step)
+        update.hidden_states_q.mul_(input_scale)
         act.hidden_states_q.copy_(update.hidden_states_q)
         act.topk_ids.copy_(update.topk_ids)
         act.topk_weights.copy_(update.topk_weights)
         graph.replay()
         torch.cuda.synchronize()
+        _assert_w4a4_close(captured, reference(update))
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("enable_pdl", (False, True))
+def test_sm12x_nvfp4_padded_bucket_graph(enable_pdl):
+    view, make_activations, reference = _make_sm12x_nvfp4_case(
+        SwiGLU(),
+        num_tokens=17,
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=8,
+        top_k=2,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(CuTileNvfp4Runner.backend_key, view)
+    config = _sm12x_nvfp4_config(
+        SwiGLU(),
+        num_experts=8,
+        top_k=2,
+        intermediate_size=512,
+        max_num_tokens=64,
+        enable_pdl=enable_pdl,
+    )
+    runner = SM12xNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    act = make_activations(0)
+    inputs = runner.pack_inputs(act, weights)
+    assert inputs.num_tokens == 17
+    assert inputs[1].shape[0] > inputs.num_tokens
+    assert (inputs[2][17:] == -1).all()
+    assert runner._use_native(inputs[1], inputs[2]) is enable_pdl
+    _assert_w4a4_close(runner.forward(inputs), reference(act))
+    scratch = runner._native_workspaces.get(tuple(inputs[1].shape))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner.forward(inputs)
+    for step in (1, 2):
+        update = make_activations(step)
+        inputs[1][:17].copy_(update.hidden_states_q)
+        inputs[2][:17].copy_(update.topk_ids)
+        inputs[3][:17].copy_(update.topk_weights)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert captured.shape == (17, 512)
+        assert runner._native_workspaces.get(tuple(inputs[1].shape)) is scratch
         _assert_w4a4_close(captured, reference(update))
 
 

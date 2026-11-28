@@ -24,7 +24,8 @@ from ...separate_reduction import (
     normalized_lse_weight,
     attention_sink_scale,
 )
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import STANDALONE_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.math import final_lse
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
@@ -61,6 +62,7 @@ def _parallel_reduction_row_state(
     batch_idx,
     cfg,
     split_divisor=None,
+    cp_rank=0,
 ):
     """Return logical row coordinates and its runtime active split count.
 
@@ -95,7 +97,7 @@ def _parallel_reduction_row_state(
         batch_idx,
     )
     tile_k = cache_seqs[batch_idx]
-    query_is_valid = query_is_valid & (tile_k > Int32(0))
+    query_is_valid = query_is_valid & (local_kv_length(cfg, tile_k, cp_rank) > Int32(0))
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
@@ -125,6 +127,8 @@ def _parallel_reduction_row_state(
             logical_q_idx,
             logical_seq_len_q,
         )
+    tile_k = local_kv_length(cfg, tile_k, cp_rank)
+    row_k = local_kv_length(cfg, row_k, cp_rank)
     tile_k_tile_total = (tile_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     row_k_tile_total = (row_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     active_split_kv = runtime_row_prefix_active_split_count(
@@ -276,6 +280,7 @@ def run_parallel_reduction_kernel(
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
     split_divisor=None,
+    cp_rank=0,
 ):
     """Reduce one D=512 row cooperatively across a padded CTA cluster.
 
@@ -332,6 +337,7 @@ def run_parallel_reduction_kernel(
             batch_idx,
             cfg,
             split_divisor=split_divisor,
+            cp_rank=cp_rank,
         )
 
     element_idx = tidx * Int32(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD)
@@ -436,7 +442,7 @@ def run_parallel_reduction_kernel(
                         weight *= sink_scale
                     smem_local_scale[local_slot_idx] = weight
 
-    prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+    prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
     # Every thread owns one contiguous BF16 vec4 GMEM fragment and immediately
     # converts it to FP32 registers. The shared scales directly normalize the
@@ -588,7 +594,7 @@ def run_parallel_reduction_kernel(
                     lane_peer_lse, merged_lse
                 )
 
-        prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+        prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
         merged_output = cutlass.Array(
             Float32,

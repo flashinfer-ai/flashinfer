@@ -4,7 +4,7 @@ No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing
 for the SM107 block-scaled backends.
 
-Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe``
+Deliberately does NOT import ``flashinfer.moe_ep.shims.sm107.cutedsl_megamoe``
 internals that pull cutlass: the ``unit`` run_tests.sh target collects this
 file in one shared pytest process.  Shim/kernel validation coverage lives in
 ``test_sm107_block_scaled_kernel_vs_reference.py`` (own process, Rubin only).
@@ -19,6 +19,7 @@ import pytest
 from flashinfer.moe_ep import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
@@ -36,7 +37,16 @@ from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backe
     Sm107Mxfp8Mxfp4MegaKernelBackend,
 )
 
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+    Sm107Mxfp4MegaKernelBackend,
+)
+
 _BACKENDS = (
+    (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107Mxfp4MegaKernelBackend,
+        "sm107_mxfp4_mxfp4_bf16_cutedsl",
+    ),
     (
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm107Mxfp8Mxfp4MegaKernelBackend,

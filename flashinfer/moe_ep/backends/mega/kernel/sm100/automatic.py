@@ -9,21 +9,18 @@ if TYPE_CHECKING:
     import torch
 
     from flashinfer.autotuner import TuningContext
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.block_scaled import (
         BlockScaledSymmBuffer,
         TransformedBlockScaledWeights,
     )
-    from .mxfp8_mxfp8_bf16_cutedsl.backend import Mxfp8CutedslMegaKernelBackend
     from .standard_cutedsl import _StandardBlockScaledBackend
 
-    BlackwellBackend: TypeAlias = (
-        Mxfp8CutedslMegaKernelBackend | _StandardBlockScaledBackend
-    )
+    BlackwellBackend: TypeAlias = _StandardBlockScaledBackend
 
 
 def tuning_context() -> TuningContext:
     from flashinfer.autotuner import AutoTuner
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning_protocol import (
         NAMESPACE,
         validate_context,
     )
@@ -46,7 +43,7 @@ def needs_selection(workspace: BlockScaledSymmBuffer, context: TuningContext) ->
 
 
 def tuning_identity(context: TuningContext, workspace: BlockScaledSymmBuffer) -> tuple:
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.measurement import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.measurement import (
         measurement_settings,
     )
 
@@ -131,10 +128,10 @@ def prepare_auto_configuration(
         select = any(pending for _, pending in decisions)
     if not select:
         return
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
         autotune_sm100_block_scaled_mega_moe,
     )
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import knob_keys
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import knob_keys
 
     cfg = workspace.config
     state = workspace._tuning_state
@@ -159,7 +156,7 @@ def prepare_auto_configuration(
         # Captured explicit handles retain their prepared configuration.
         return
     if winner is None and state.winner is not None:
-        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.autotune import (
             _prepare_collectively,
         )
 

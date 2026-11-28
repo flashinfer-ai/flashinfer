@@ -19,13 +19,14 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.math import final_lse
 from .config import (
     REDUCTION_THREADS_PER_ROW,
     REDUCTION_VALUES_PER_THREAD,
     REDUCTION_VECTOR_BYTES,
 )
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import STANDALONE_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.ops import (
@@ -57,6 +58,7 @@ def run_reduction_kernel(
     rows_per_cta: cutlass.Constexpr[int],
     split_divisor=None,
     runtime_seq_len_q=None,
+    cp_rank=0,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -141,7 +143,7 @@ def run_reduction_kernel(
     # Producer splits are sized from the group's largest K domain, while each
     # logical row consumes only the prefix containing its visible K tiles.
     tile_k = cache_seqs[batch_idx]
-    query_is_valid = query_is_valid & (tile_k > Int32(0))
+    query_is_valid = query_is_valid & (local_kv_length(cfg, tile_k, cp_rank) > Int32(0))
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
@@ -174,6 +176,8 @@ def run_reduction_kernel(
             logical_q_idx,
             logical_seq_len_q,
         )
+    tile_k = local_kv_length(cfg, tile_k, cp_rank)
+    row_k = local_kv_length(cfg, row_k, cp_rank)
     tile_k_tile_total = (tile_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     row_k_tile_total = (row_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     # A causal row consumes the prefix of configured-span ranges intersecting
@@ -244,7 +248,7 @@ def run_reduction_kernel(
 
     # Independent writer warps publish scales before any row consumes
     # them.  Invalid/padded rows participate so this remains a full CTA barrier.
-    prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+    prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
     element_idx = row_thread_idx * Int32(REDUCTION_VALUES_PER_THREAD)
     acc_vec = vector_from_scalars(

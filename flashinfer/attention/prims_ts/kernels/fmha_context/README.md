@@ -45,10 +45,11 @@ Batch is exact; fixed contiguous Q/KV extents are exact, while packed/paged
 request lengths stay within the provided Q/KV bounds. Every `run()` supplies
 current tensors/metadata and launches the prepared execution.
 
-The contiguous plan fixes `packed` (BSHD or THD); paged plans also fix page size
+The contiguous plan fixes `packed_query` (BSHD or THD); paged plans also fix page size
 and optional `uniform_packed_lengths`, `has_q_offset`, and zero-V-tail promises.
-Plans retain host scalar defaults without device scale tensors. Variable-window
-plans allocate fallback CTA-minimum metadata; paged plans need no scratch.
+Plans retain float or CUDA tensor defaults for each global scale independently.
+Variable-window plans allocate fallback CTA-minimum metadata; paged plans need
+no scratch.
 Validation can read metadata values on the host. Trusted/captured execution uses
 `validate=False` and stable addresses, with callers owning all preconditions.
 
@@ -89,8 +90,17 @@ or `total_q` and `total_k` for packed storage—must each be at most
 reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
-Q and `out`, and contiguous-path K/V, must be compact, 16-byte-aligned CUDA
-tensors on one device. Paged K/V accepts positive, non-overlapping page/head/token
+Q, K, V, and `out` must be 16-byte-aligned CUDA tensors on one device.
+Q, K, and `out` must be compact on the contiguous path. Contiguous-context V
+permits padding between token rows and batches: its head/feature strides must
+be `(Dv, 1)`, its token stride must be at least `Hkv * Dv`, and a fixed-batch
+stride must be at least `(Sk - 1) * token_stride + Hkv * Dv`. Token and batch
+strides must be multiples of 16 bytes. These strides are runtime values, so
+compact and padded V reuse the same plan and compiled kernel without a copy.
+This applies to every supported V dtype and head dimension, including MLA.
+Captured CUDA graphs retain the captured V address and strides; update its
+contents in place, or recapture to change the view.
+Paged K/V accepts positive, non-overlapping page/head/token
 strides aligned to 16 bytes and unit head-dimension stride. The strides are
 runtime TensorMap inputs, so interleaved K/V slices need no repacking.
 Cumulative offsets, sequence lengths, and variable-window metadata must
@@ -102,6 +112,19 @@ precondition in both validation modes. The default API returns O; an enabled
 LSE plan can also return final FP32 LSE, as described below. Intermediate
 softmax state remains internal.
 
+With LSE enabled, ordinary dense contiguous requests with empty local K/V
+write zero output and negative-infinity LSE. Physical packed K/V storage must
+contain at least one token; equal adjacent offsets represent logical empties.
+
+Packed dense contiguous context uses each request's live KV extent for every
+task's loop domain, including during graph replay. This applies to homogeneous
+FP16, BF16, and E4M3 inputs with FP16/BF16 output and paired QK/V dimensions
+128/128 or 192/128 on supported architectures. Empty rows with LSE enabled retain
+one masked tile so the epilogue writes zero O and negative-infinity LSE.
+Fixed/uniform-packed inputs, single-instance and two-CTA schedules, causal and
+windowed attention, paged KV, mixed-precision inputs, and VC/Sage/MXFP8 recipes
+retain their existing domain policies.
+
 ## Tensor and metadata layouts
 
 Contiguous inputs:
@@ -112,7 +135,8 @@ Contiguous inputs:
   V: `[total_kv, Hkv, Dv]`; O: `[total_q, Hq, Dv]`.
 - Supported contiguous `(Dqk, Dv)` pairs: `(128, 128)`, `(192, 128)`,
   `(192, 192)`, and `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
-  with compact rows; callers do not pad the head dimension.
+  with compact heads/features; callers do not pad the head dimension. V may
+  have aligned token-row/batch padding as described above.
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
   Both start at zero, are nondecreasing, and end at the corresponding packed
   tensor extent.
@@ -156,9 +180,15 @@ for an active page indexes the physical cache.
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
 most `W` preceding keys. `softmax_scale` defaults to `1 / sqrt(Dqk)` and
-`output_scale` defaults to 1; supplied scales must be finite, positive, and
-representable as positive `float32` values. All scale inputs are finite positive host scalars; no device scale tensors
-are allocated or accepted.
+`output_scale` defaults to 1. Each independently accepts a Python number or a
+contiguous CUDA FP32 tensor of shape `()` or `(1,)`. Values must be positive and finite;
+tensor values are a caller obligation and are never read on the host. Planning
+infers types from these defaults; `run()` inherits omitted operands and accepts
+same-type overrides. The contract applies to contiguous, paged, Sage, and VC
+plans. VC's per-channel scale table remains a separate tensor and is composed
+with the global output multiplier on the GPU. See
+[global scale operands](../../README.md#global-scale-operands) for compilation
+and CUDA graph lifetimes.
 
 For packed contiguous attention, planning fixes model semantics. Every run supplies `qo_indptr` and `kv_indptr`; their
 values and packed tensor totals may change between runs while preserving the
@@ -377,8 +407,8 @@ runtime tensors alive until every graph using that plan is destroyed.
   dtype; the mixed combinations are `torch.bfloat16` Q/K with
   `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
-- VC-Attention (QK16 with bf16 Q/K or QK8 with E4M3 Q/K, both with E4M3 V
-  tile residuals and restored tile means) runs only through the dense
+- VC-Attention (QK16 with bf16 Q/K or QK8 with E4M3 or, on SM100, INT8 Q/K,
+  both with E4M3 V tile residuals and restored tile means) runs only through the dense
   contiguous `BatchPrefillTSWrapper` and `batch_prefill` at `head_dim=128`; see
   [VC-Attention](../../README.md#vc-attention).
 - Sage attention covers only the contiguous dense fixed-length
@@ -387,7 +417,7 @@ runtime tensors alive until every graph using that plan is destroyed.
   tensors and the decode kernel's coverage are in
   [Sage attention](../../README.md#sage-attention).
 - Re-plan either wrapper after changing a static capacity, head or dtype
-  geometry, mask, window, or default scale; page size and explicit metadata
+  geometry, mask, window, or scale type; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
   change between completed runs while remaining within the static plan and its
   promises.

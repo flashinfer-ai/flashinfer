@@ -61,6 +61,7 @@ from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -73,7 +74,7 @@ from ..helpers.gather import (
 
 from .nvfp4_kv_load import load_nvfp4_kv_stage, publish_nvfp4_v
 from ..helpers.sparse_indices import cache_sparse_source_lengths
-from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row
+from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row, store_shared_u32x4
 from .config import (
     OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
@@ -108,6 +109,7 @@ from ..helpers.math import (
     fma_packed_f32x2,
     mul_packed_f32x2,
     output_dtype,
+    pack_float2_to_bf16,
     p_desc_layout,
     p_desc_leading_byte_offset,
     p_desc_stride_byte_offset,
@@ -126,7 +128,11 @@ from ..helpers.ops import (
     fmax_f32,
     pack_float4_to_fp8_e4m3,
 )
-from ..helpers.mask import MaskType, mask_visible_k_length
+from ..helpers.mask import (
+    MaskType,
+    mask_visible_k_length,
+    rows_have_distinct_kv_prefix,
+)
 from ..helpers.query import (
     copy_q_fp8_to_tmem,
     flat_query_row_state,
@@ -240,7 +246,9 @@ class MlaTsWorkTileInfo:
     Besides the scheduler coordinate, cache the per-tile K-domain values that
     hot resource paths need. Each persistent warp loop computes the K domain
     once and passes the derived indices to the page-offset, TMA, MMA, and
-    softmax bodies.
+    softmax bodies. ``k_visible_end`` is the rank-local key prefix every query
+    row sees; it is carried only when rows see different prefixes
+    (``rows_have_distinct_kv_prefix``) and is ``None`` otherwise.
     """
 
     @cute.jit
@@ -251,6 +259,7 @@ class MlaTsWorkTileInfo:
         k_len=0,
         k_tile_count=0,
         k_index_base=0,
+        k_visible_end=None,
     ):
         """Initialize the staged tile coordinate and cached K-domain metadata."""
         cluster_idx, seq_q_idx, batch_idx, split_kv_idx = tile_idx
@@ -262,6 +271,9 @@ class MlaTsWorkTileInfo:
         self._k_len = Int32(k_len)
         self._k_tile_count = Int32(k_tile_count)
         self._k_index_base = Int32(k_index_base)
+        self._k_visible_end = None
+        if cutlass.const_expr(k_visible_end is not None):
+            self._k_visible_end = Int32(k_visible_end)
 
     @property
     @cute.jit
@@ -298,6 +310,12 @@ class MlaTsWorkTileInfo:
         """Return the first K tile index owned by this work tile."""
         return self._k_index_base
 
+    @property
+    @cute.jit
+    def k_visible_end(self):
+        """Return the rank-local keys ``[0, end)`` every query row sees."""
+        return self._k_visible_end
+
     @cute.jit
     def update_from(self, other) -> None:
         """Replace this tile info with another tile info object."""
@@ -310,6 +328,8 @@ class MlaTsWorkTileInfo:
         self._k_len = Int32(other.k_len)
         self._k_tile_count = Int32(other.k_tile_count)
         self._k_index_base = Int32(other.k_index_base)
+        if cutlass.const_expr(self._k_visible_end is not None):
+            self._k_visible_end = Int32(other.k_visible_end)
 
     def __extract_mlir_values__(self):
         """Extract scalar MLIR values for value-type lowering."""
@@ -321,6 +341,8 @@ class MlaTsWorkTileInfo:
         values += cutlass.extract_mlir_values(self._k_len)
         values += cutlass.extract_mlir_values(self._k_tile_count)
         values += cutlass.extract_mlir_values(self._k_index_base)
+        if self._k_visible_end is not None:
+            values += cutlass.extract_mlir_values(self._k_visible_end)
         return values
 
     def __new_from_mlir_values__(self, values):
@@ -336,6 +358,9 @@ class MlaTsWorkTileInfo:
             cutlass.new_from_mlir_values(self._k_len, [values[5]]),
             cutlass.new_from_mlir_values(self._k_tile_count, [values[6]]),
             cutlass.new_from_mlir_values(self._k_index_base, [values[7]]),
+            None
+            if self._k_visible_end is None
+            else cutlass.new_from_mlir_values(self._k_visible_end, [values[8]]),
         )
 
 
@@ -354,7 +379,8 @@ class MlaWorkQueue(WorkQueue):
     """
 
     tile_sched_params: Any = None
-    cache_seqs: Any = None  # cache_seqs tensor for k_tile_count
+    cache_seqs: Any = None  # global lengths for k_tile_count
+    cp_rank: Any = 0
     split_kv: Any = None  # maximum split slots in the launch/workspace
     block_split_kvs: Any = None  # optional per-batch split caps
     is_var_split_kv: cutlass.Constexpr[bool] = False
@@ -376,6 +402,7 @@ class MlaWorkQueue(WorkQueue):
         self,
         tile_sched_params,
         cache_seqs=None,
+        cp_rank=0,
         split_kv=None,
         block_split_kvs=None,
         is_var_split_kv=False,
@@ -404,6 +431,7 @@ class MlaWorkQueue(WorkQueue):
             self.tile_scheduler_config = None
         self.tile_sched_params = tile_sched_params
         self.cache_seqs = cache_seqs
+        self.cp_rank = cp_rank
         self.split_kv = split_kv
         self.block_split_kvs = block_split_kvs
         self.is_var_split_kv = is_var_split_kv
@@ -423,6 +451,7 @@ class MlaWorkQueue(WorkQueue):
                 Int32(0),
                 Int32(0),
                 Int32(0),
+                Int32(0) if self.caches_visible_k_end else None,
             ),
             docs="Current MLA persistent-scheduler work tile.",
         )
@@ -475,7 +504,18 @@ class MlaWorkQueue(WorkQueue):
 
     @cute.jit
     def wrap_work_tile(self, work_tile):
-        return MlaTsWorkTileInfo(work_tile.tile_idx, work_tile.is_valid_tile)
+        return MlaTsWorkTileInfo(
+            work_tile.tile_idx,
+            work_tile.is_valid_tile,
+            k_visible_end=Int32(0) if self.caches_visible_k_end else None,
+        )
+
+    @property
+    def caches_visible_k_end(self) -> bool:
+        """Return whether work tiles carry the key prefix every row sees."""
+        return self.cfg is not None and rows_have_distinct_kv_prefix(
+            self.cfg.mask_type, self.cu_seqlens_q is not None, self.logical_seq_len_q
+        )
 
     @cute.jit
     def _work_tile_from_clc_tile(self, work_tile):
@@ -507,7 +547,7 @@ class MlaWorkQueue(WorkQueue):
         params = self.tile_sched_params
         _, s_idx, b_idx, split_kv_idx = tile_idx
         safe_b_idx = cute.math.min(b_idx, params.problem_shape_b - Int32(1))
-        if cutlass.const_expr(self.static_seq_len_k is not None):
+        if cutlass.const_expr(self.static_seq_len_k is not None and cfg.cp_world == 1):
             K = Int32(self.static_seq_len_k)
         else:
             K = Int32(self.cache_seqs[safe_b_idx])
@@ -545,10 +585,16 @@ class MlaWorkQueue(WorkQueue):
                 safe_b_idx,
             )
             K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
+        K = local_kv_length(cfg, K, self.cp_rank)
         K = K if query_tile_has_rows else Int32(0)
         k_tile_total = (K + Int32(cfg.mma_qk_tiler[1] - 1)) // Int32(
             cfg.mma_qk_tiler[1]
         )
+        k_visible_end = None
+        if cutlass.const_expr(self.caches_visible_k_end):
+            k_visible_end = self._visible_k_end(
+                s_idx, safe_b_idx, sequence_k_len, q_len
+            )
         if cutlass.const_expr(self.static_split_kv == 1):
             # Single-split fixed profiles process the whole K domain in one CTA.
             # Avoid the runtime split-KV ceil-div/min/max sequence in every
@@ -583,6 +629,32 @@ class MlaWorkQueue(WorkQueue):
             sequence_k_len,
             k_tile_count,
             k_index_base,
+            k_visible_end,
+        )
+
+    @cute.jit
+    def _visible_k_end(self, s_idx, b_idx, sequence_k_len, q_len):
+        """Return the rank-local keys ``[0, end)`` every row of a work tile sees.
+
+        Bottom-right causal prefixes, and their rank-local counts under context
+        parallelism, are nondecreasing in the flat query row, so the tile's
+        first row has the shortest prefix. Computed once per work tile; softmax
+        compares each K tile against it.
+        """
+        cfg = self.cfg
+        _, _, first_q_idx, _, _ = flat_query_row_state(
+            Int32(0),
+            s_idx,
+            cfg.mma_qk_tiler[0],
+            self.logical_num_heads_q,
+            self.logical_seq_len_q,
+            self.cu_seqlens_q,
+            b_idx,
+        )
+        return local_kv_length(
+            cfg,
+            mask_visible_k_length(cfg.mask_type, sequence_k_len, first_q_idx, q_len),
+            self.cp_rank,
         )
 
     @cute.jit
@@ -2433,6 +2505,7 @@ class TmemSResource(HighThroughputMlaResource):
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
+    cp_rank: Any = 0  # runtime context-parallel rank
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2799,6 +2872,42 @@ class TmemSResource(HighThroughputMlaResource):
         return row_sum, row_sum
 
     @cute.jit
+    def _masked_row_prefix_bounds(
+        self, work_tile, local_tidx, needs_row_causal_mask, needs_cp_causal_mask
+    ):
+        """Load a masked tile's rank-local row bound and the request's Q length.
+
+        Called only on masked tiles, so the metadata loads stay off the
+        unmasked ones.
+        """
+        cfg = self.cfg
+        row_kv_bound = Int32(0)
+        logical_seq_len_q = Int32(0)
+        if cutlass.const_expr(needs_row_causal_mask or needs_cp_causal_mask):
+            batch_idx = Int32(work_tile.tile_idx[2])
+            _, logical_seq_len_q = query_batch_bounds(
+                self.cu_seqlens_q, batch_idx, self.logical_seq_len_q
+            )
+        if cutlass.const_expr(needs_cp_causal_mask):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            _, _, logical_q_idx, _, _ = flat_query_row_state(
+                row_in_tile,
+                Int32(work_tile.tile_idx[1]),
+                cfg.mma_qk_tiler[0],
+                self.logical_num_heads_q,
+                self.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch_idx,
+            )
+            global_bound = mask_visible_k_length(
+                cfg.mask_type, Int32(work_tile.k_len), logical_q_idx, logical_seq_len_q
+            )
+            row_kv_bound = local_kv_length(cfg, global_bound, self.cp_rank)
+        return row_kv_bound, logical_seq_len_q
+
+    @cute.jit
     def _load_s_impl(
         self,
         stage_info: StageInfo,
@@ -2822,39 +2931,28 @@ class TmemSResource(HighThroughputMlaResource):
         stage_idx = stage_info.stage_idx
 
         work_tile = stage_info.work_tile
-        K = Int32(work_tile.k_len)
+        K = local_kv_length(cfg, Int32(work_tile.k_len), self.cp_rank)
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
+            cfg.cp_world == 1 and cfg.mask_type == MaskType.CAUSAL.value
         )
-        if cutlass.const_expr(needs_row_causal_mask):
-            batch_idx = Int32(work_tile.tile_idx[2])
-            _, logical_seq_len_q = query_batch_bounds(
-                self.cu_seqlens_q,
-                batch_idx,
-                self.logical_seq_len_q,
+        needs_cp_causal_mask = cutlass.const_expr(
+            cfg.cp_world > 1 and cfg.mask_type == MaskType.CAUSAL.value
+        )
+        # Mask only tiles reaching past the keys every row sees: the request's
+        # K length, or the work tile's cached prefix when rows differ. The
+        # per-row bounds load only in the masked branch below.
+        visible_k_end = K
+        if cutlass.const_expr(
+            rows_have_distinct_kv_prefix(
+                cfg.mask_type, self.cu_seqlens_q is not None, self.logical_seq_len_q
             )
-            first_flat_query_row = Int32(work_tile.tile_idx[1]) * Int32(
-                cfg.mma_qk_tiler[0]
-            )
-            # A row r sees key k iff H * (k - K + SQ) <= r.  Apply the
-            # equivalent boundary test to the first row in this physical tile
-            # so non-power-of-two H never needs a quotient on the softmax path.
-            first_mask_flat_row = Int32(self.logical_num_heads_q) * (
-                tile_offset_k
-                + Int32(cfg.mma_qk_tiler[1])
-                - K
-                + logical_seq_len_q
-                - Int32(1)
-            )
-            group_needs_mask = first_flat_query_row < first_mask_flat_row
-        else:
-            group_needs_mask = kv_tile_needs_right_mask(
-                tile_offset_k,
-                Int32(cfg.mma_qk_tiler[1]),
-                K,
-            )
+        ):
+            visible_k_end = Int32(work_tile.k_visible_end)
+        group_needs_mask = kv_tile_needs_right_mask(
+            tile_offset_k, Int32(cfg.mma_qk_tiler[1]), visible_k_end
+        )
 
         neg_inf = Float32(-Float32.inf)
         row_max_tile = row_max
@@ -2933,6 +3031,9 @@ class TmemSResource(HighThroughputMlaResource):
             ):
                 group_needs_mask = (mask_routes.low | mask_routes.high) != Int32(0)
         if group_needs_mask:
+            row_kv_bound, logical_seq_len_q = self._masked_row_prefix_bounds(
+                work_tile, local_tidx, needs_row_causal_mask, needs_cp_causal_mask
+            )
             if cutlass.const_expr(needs_row_causal_mask):
                 # Clamp padded physical tail rows to the request's last real
                 # row. Their Q/output accesses remain independently
@@ -2957,7 +3058,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(needs_cp_causal_mask):
+                    token_is_visible = token_idx < row_kv_bound
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )
@@ -4127,6 +4230,49 @@ class GmemOResource(HighThroughputMlaResource):
         )
 
     @cute.jit
+    def _store_staged_bf16_slice(self, values, flat_row, column, valid, local_tidx):
+        """TMA-store one warp's normalized 32-row x 128-column BF16 slice.
+
+        Each correction warp owns two 4 KiB boxes (32 rows x 64 BF16, 128-byte
+        swizzle) that it reuses across slices and work tiles. Its elected lane
+        issues and retires the bulk groups; a box is rewritten only after the
+        group that last read it has finished reading SMEM.
+        """
+        lane = local_tidx & Int32(31)
+        warp = local_tidx >> Int32(5)
+        # Consecutive lanes own consecutive flattened rows.
+        first_row = Int32(flat_row) - lane
+        for box in cutlass.range_constexpr(2):
+            slot = (warp * Int32(2) + Int32(box)) * Int32(4096)
+            if prims.elect_sync():
+                prims.cp_async_bulk_wait_group(1, read=True)
+            cute.arch.sync_warp()
+            for chunk in cutlass.range_constexpr(8):
+                base = box * 64 + chunk * 8
+                words = [
+                    pack_float2_to_bf16(values[base + 2 * w], values[base + 2 * w + 1])
+                    for w in range(4)
+                ]
+                offset = (
+                    slot
+                    + lane * Int32(128)
+                    + ((Int32(chunk) ^ (lane & Int32(7))) * Int32(16))
+                )
+                store_shared_u32x4(
+                    self.smem_o, offset, words[0], words[1], words[2], words[3]
+                )
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            if valid:
+                if prims.elect_sync():
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_o_desc,
+                        self.smem_o.subview(slot),
+                        (column + box * 64, first_row),
+                    )
+                    prims.cp_async_bulk_commit_group()
+
+    @cute.jit
     def _store_quantized_slice(
         self,
         values,
@@ -4640,7 +4786,24 @@ class GmemOResource(HighThroughputMlaResource):
                 qk_acc_regs[i] = scaled[0]
                 qk_acc_regs[i + 1] = scaled[1]
 
-        if row_in_tile < physical_tile_rows and query_is_valid:
+        if cutlass.const_expr(cfg.stage_bf16_output):
+            if cutlass.const_expr(self.cu_seqlens_q is not None):
+                staged_row = storage_flat_query_row
+            else:
+                staged_row = (
+                    logical_head_idx
+                    + logical_q_idx * logical_num_heads_q
+                    + batch_idx * logical_num_heads_q * Int32(self.output.shape[2])
+                )
+            self._store_staged_bf16_slice(
+                qk_acc_regs,
+                staged_row,
+                iter_n * tile_d + g_j,
+                row_in_tile < physical_tile_rows and query_is_valid,
+                local_tidx,
+            )
+        direct_store = Int32(0 if cfg.stage_bf16_output else 1)
+        if row_in_tile < physical_tile_rows and query_is_valid and direct_store != 0:
             if cutlass.const_expr(self.partial_output is not None):
                 S_q = (
                     cutlass.Int32(self.partial_output.shape[3])

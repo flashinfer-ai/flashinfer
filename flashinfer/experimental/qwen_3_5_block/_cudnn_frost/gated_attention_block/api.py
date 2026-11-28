@@ -1449,7 +1449,9 @@ class QsaSpec:
         tiles and declines a 640-column band, typed.  At decode row counts (``T = B x S_q <= 128``) the slab GEMM takes the
         small-M route's 128-row swap-AB tile (N 13952 = 109 x 128: the route's overflow branch admits the one N off the 256
         grid whose 128-row tiles divide it), so a band declaration over the pools compiles without the opt-in flag and is
-        capture-safe like the four-band one; past 128 rows the band slab keeps the graph route.
+        capture-safe like the four-band one; past 128 rows the band slab takes the GEMM engine's own baseline tile for its
+        shape (the kernel the graph route ran there) on the same JIT-only route, so the prefill / extend / chunked forms are
+        capture-safe and flag-free too (the pick follows the part's SM count: a recorded plan replays within one SM class).
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
         The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
         ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
@@ -3682,13 +3684,14 @@ class _Projection(_Stage):
 
     def resolves_a_jit_tile(self) -> bool:
         """Whether ``tile_config="auto"`` names a JIT tile for this stage's own ``(M, N, K)`` -- asked of the driver's ONE resolver
-        (``kernels.proj_gemm._auto_tile_name``: the small-M route at ``M <= SMALL_M_MAX``, else the forced 256-wide tile where 256
-        divides N) with the operands :meth:`compile` hands ``build_proj_gemm`` (K-major A and B, this stage's dtype / alpha /
-        block_scale).  True is the JIT-only route (no backend plan, no cuDNN handle at execute: what a ``capture_safe`` declaration
-        needs to compile); False is the graph route, where ``capture_safe=True`` would be the driver's typed decline at ``compile()``
-        -- so the block sets the flag only where this reads True.  The indexer band's slab (N 13952, off the 256 grid) reads True
-        at decode row counts through the small-M route's 128-row swap-AB tile and False past 128 rows.  A host query (no device
-        sync): the SM count and the compiler family it reads are device properties."""
+        (``kernels.proj_gemm._auto_tile_name``: the small-M route at ``M <= SMALL_M_MAX``, past it the large-M rule's name on the
+        128 grid off the 256 grid -- the GEMM engine's own baseline pick -- else the forced 256-wide tile where 256 divides N) with
+        the operands :meth:`compile` hands ``build_proj_gemm`` (K-major A and B, this stage's dtype / alpha / block_scale).  True is
+        the JIT-only route (no backend plan, no cuDNN handle at execute: what a ``capture_safe`` declaration needs to compile);
+        False is the graph route, where ``capture_safe=True`` would be the driver's typed decline at ``compile()`` -- so the block
+        sets the flag only where this reads True.  The indexer band's slab (N 13952, off the 256 grid) reads True at every row
+        count: through the small-M route's 128-row swap-AB tile at decode row counts, through the engine's baseline past 128 rows.
+        A host query (no device sync): the SM count and the compiler family it reads are device properties."""
         from .kernels.proj_gemm import _auto_tile_name
 
         return _auto_tile_name(self.m, self.n, self.k, dtype=self.dtype, a_major="k", b_major="k", block_scale=self.block_scale, alpha=self.alpha) is not None
@@ -10537,9 +10540,11 @@ class GatedAttentionBlockFwd(APIBase):
         # route's tile at T = B x S_q <= 128 -- which is how the indexer band's slab (QsaSpec.index_band: n_qkvg = 13312 + 640 = 13952,
         # off the 256 grid) is capture-safe at decode row counts: its 218 64-row tiles overflow a wave and the route takes the 128-row
         # swap-AB tile that divides it exactly (109 CTAs), the same JIT-only route as the four-band slab, no opt-in flag at compile().
-        # A band declaration past 128 rows resolves no tile and keeps the driver's own route -- its steps run eagerly and a capture is
-        # the driver's typed refusal at the first captured execute (the band's prefill / extend forms' documented limit); setting the
-        # flag there would decline the whole block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
+        # Past 128 rows the band slab resolves the GEMM engine's own baseline pick for its shape (the large-M rule: the kernel the graph
+        # route ran there), so the band's prefill / extend / chunked forms take the same JIT-only route and are capture-safe too; a
+        # shape the resolver names NO tile for (an N off both tile grids) keeps the driver's own route -- its steps run eagerly and a
+        # capture is the driver's typed refusal at the first captured execute -- and setting the flag there would decline the whole
+        # block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
         # so this predicate cannot drift from the route -- and read AGAIN at compile() on the compiling device
         # (`_flag_capture_safe_projections`): the SM count the small-M route reads is a device property, so a declaration and its
         # compile on different parts would otherwise carry a stale flag into the driver.

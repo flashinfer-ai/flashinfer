@@ -47,6 +47,10 @@ from .api import (  # noqa: F401
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
     CuteDslConfig,
+    FireflyNvfp4Config,
+    BatchInvariantBf16Config,
+    BatchInvariantFp4Config,
+    BatchInvariantFp8PerTensorConfig,
     FrostLowLatencyConfig,
     PrimsTsConfig,
     CutlassBf16Config,
@@ -125,6 +129,7 @@ from .runners import (  # noqa: F401
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    FireflyNvfp4Runner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
@@ -163,6 +168,7 @@ from .core import (
     RoutingInputMode,
     TrtllmMoERoutingMetadata,
     TrtllmMoERoutingMetadataSlot,
+    TrtllmMoePaddedWeights,
     convert_to_block_layout,
     cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
@@ -172,9 +178,12 @@ from .core import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+    deinterleave_gated_rows,
+    pad_trtllm_moe_weights,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
+    split_fp4_moe_weights_by_locality_domain,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_channel_scale_moe,
@@ -184,6 +193,8 @@ from .core import (
     trtllm_fused_moe_workspace_size,
     trtllm_moe_allocate_routing_metadata,
     trtllm_moe_allocate_routing_metadata_multi_tile,
+    trtllm_fp4_block_scale_moe_routing_tile_n,
+    populate_trtllm_moe_routing_metadata_,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -191,6 +202,7 @@ from .core import (
 )
 
 from .prepare import (
+    interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
@@ -315,6 +327,13 @@ def __getattr__(name: str):
             stacklevel=2,
         )
         return CuteDslRunner
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -359,6 +378,10 @@ __all__ = [
     "CudnnGroupedGemmNvfp4Config",
     "CudnnGroupedGemmNvfp4Runner",
     "CuteDslConfig",
+    "FireflyNvfp4Config",
+    "BatchInvariantBf16Config",
+    "BatchInvariantFp4Config",
+    "BatchInvariantFp8PerTensorConfig",
     "FrostLowLatencyConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -401,6 +424,7 @@ __all__ = [
     "ExecutionConfig",
     "ExpertConfig",
     "CuteDslRunner",
+    "FireflyNvfp4Runner",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
@@ -408,6 +432,8 @@ __all__ = [
     "TrtllmMoERoutingMetadataSlot",
     "trtllm_moe_allocate_routing_metadata",
     "trtllm_moe_allocate_routing_metadata_multi_tile",
+    "trtllm_fp4_block_scale_moe_routing_tile_n",
+    "populate_trtllm_moe_routing_metadata_",
     "trtllm_moe_acquire_da_graph_leases",
     "trtllm_moe_da_diagnostics",
     "trtllm_moe_release_da_resources",
@@ -447,6 +473,7 @@ __all__ = [
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
+    "interleave_cute_dsl_moe_weights",
     "interleave_moe_weights_for_sm90_mixed_gemm",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
@@ -454,6 +481,9 @@ __all__ = [
     "gen_cutlass_fused_moe_sm100_module",
     "gen_cutlass_fused_moe_sm90_module",
     "gen_trtllm_gen_fused_moe_sm100_module",
+    "deinterleave_gated_rows",
+    "pad_trtllm_moe_weights",
+    "TrtllmMoePaddedWeights",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
     "prims_ts_bf16_moe",
@@ -470,6 +500,7 @@ __all__ = [
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
+    "split_fp4_moe_weights_by_locality_domain",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_channel_scale_moe",
@@ -505,6 +536,7 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
+    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

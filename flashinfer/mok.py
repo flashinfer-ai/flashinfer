@@ -91,8 +91,8 @@ def create_mok_bf16_workspace(
     hidden_size,
     topk,
     source_capacity=None,
-    fwd_num_comm_sms=40,
-    bwd_num_comm_sms=40,
+    fwd_num_comm_sms="auto",
+    bwd_num_comm_sms="auto",
     minibatch_size=4096,
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
@@ -112,11 +112,12 @@ def create_mok_bf16_workspace(
     Call outside CUDA Graph capture; retain the workspace for every replay.
 
     ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` are the fixed (forward, backward)
-    communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
-    for both takes the measured row of the device, ``precision`` and EP group
-    size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
-    Rubin (212 SMs) MXFP8 at EP8: 60 / 60, no row elsewhere, so the factory
-    split stays in force there).
+    communication-SM counts of every launch. ``"auto"`` (default, for both)
+    takes the measured row of the device, ``precision`` and EP group size
+    (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 BF16 at EP4-64: 20 / 24,
+    GB300 MXFP8 at EP8/32/64: 44 / 36, Rubin (212 SMs) MXFP8 at EP8: 60 / 60)
+    and the factory split 40 / 40 where there is no row; a pair of integers
+    fixes the split. The split changes time only, never an output bit.
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the

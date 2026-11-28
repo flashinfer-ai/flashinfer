@@ -15,4 +15,5 @@ def stage_routes(ids, scores, ids_out, scores_out, *, workspace) -> None:
         scores_out,
         workspace=workspace,
         use_tvm_ffi=os.environ.get("FLASHINFER_SM107_PREP_TVM_FFI", "1") != "0",
+        zero_masked_scores=False,
     )

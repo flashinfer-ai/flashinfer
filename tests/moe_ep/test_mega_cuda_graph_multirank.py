@@ -72,7 +72,7 @@ def test_blackwell_genphase_dtype_graph(sparse_ep_runtime, kind, early):
 def test_nvfp4_mega_two_rank_graph_replay_lockstep(
     mode, token_back_mode, tuning, in_kernel_fc2_reduce, alpha_source
 ):
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 2:
@@ -237,13 +237,16 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(
         dist.barrier()
 
 
-def _tail_probe(world, sm_count):
+def _tail_probe(world, sm_count, *, ncu=False):
     """Exercise the real communication tail with peer writes from other roles."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.megamoe_config import (
+        MegaMoEDiagnostics,
+    )
 
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
 
     args_type = pkg.TokenCommArgs
 
@@ -263,6 +266,7 @@ def _tail_probe(world, sm_count):
                 cluster_shape_mn=(2, 1),
                 dispatch_warp_start=8,
                 num_other_warps=8,
+                diagnostics=MegaMoEDiagnostics(use_ncu=ncu),
             )
 
         @cute.jit
@@ -351,6 +355,8 @@ def _tail_probe(world, sm_count):
                     warp - 8,
                     lane,
                     num_sms=sm_count,
+                    local_rank=args.local_rank,
+                    sync_num_threads=self.comm.dispatch_group_threads,
                     prologue_grid_sync=True,
                     epilogue_grid_sync=True,
                 )
@@ -373,7 +379,7 @@ def test_tail_reset_multirank_graph(count, ncu, monkeypatch):
     from cutlass.cute.runtime import from_dlpack
     from cuda.bindings import driver as cuda
 
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world not in (2, 4):
@@ -384,7 +390,7 @@ def test_tail_reset_multirank_graph(count, ncu, monkeypatch):
         dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     monkeypatch.setenv("MEGA_USE_NCU", "1" if ncu else "0")
     sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
-    probe = _tail_probe(world, sm_count)
+    probe = _tail_probe(world, sm_count, ncu=ncu)
     single_cta = count <= 4096 and not ncu
     assert probe.comm.use_single_cta_tail_reset(count) == single_cta
     signal_offset = (count + 3) // 4 * 4
@@ -458,7 +464,7 @@ def _sparse_dispatch_probe(world, sm_count, capacity, topk, sparse, local_expert
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
 
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
 
     experts = local_experts * world
     shared_prefix = 2 * (experts + local_experts)
@@ -623,7 +629,7 @@ def test_sparse_dispatch_graph(capacity, topk, local_experts, sparse, monkeypatc
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm
 
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world not in (2, 4):
@@ -802,32 +808,55 @@ def test_sparse_to_dense_graph(sparse_ep_runtime, dtype, early, capacity):
     Dense per-route cells are the numerical control; independent dense Torch
     oracles live in the existing NVFP4/MXFP8 multirank suites.
     """
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
 
     rank, world = sparse_ep_runtime
-    create = (
-        pkg.create_dummy_nvfp4_inputs
-        if dtype == "nvfp4"
-        else pkg.create_dummy_mxfp8_inputs
-    )
-    make_thunk = (
-        pkg.nvfp4_mega_launch_thunk if dtype == "nvfp4" else pkg.mxfp8_mega_launch_thunk
-    )
     torch.manual_seed(6447 + rank)
-    options = dict(apply_routing_weights_before_fc2=early) if dtype == "nvfp4" else {}
-    _, w1, w2, buffer = create(
-        rank,
-        world,
-        16,
-        capacity,
-        capacity,
-        4,
-        512,
-        256,
-        gate_up_clamp=10.0,
-        seed=6447,
-        **options,
-    )
+    if dtype == "nvfp4":
+        make_thunk = pkg.nvfp4_mega_launch_thunk
+        _, w1, w2, buffer = pkg.create_dummy_nvfp4_inputs(
+            rank,
+            world,
+            16,
+            capacity,
+            capacity,
+            4,
+            512,
+            256,
+            gate_up_clamp=10.0,
+            seed=6447,
+            apply_routing_weights_before_fc2=early,
+        )
+    else:
+        from flashinfer.moe_ep import MoEWeightPack
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources
+
+        from .test_moe_ep_mxfp8_cutedsl_mega_multirank import (
+            _make_mxfp8_workspace,
+            _mega_problem,
+            _stage_mxfp8_problem,
+        )
+
+        problem = _mega_problem(
+            rank,
+            world,
+            num_tokens=capacity,
+            max_tokens=capacity,
+            hidden=512,
+            intermediate=256,
+            num_experts=16,
+        )
+        buffer = _make_mxfp8_workspace(problem)
+        _stage_mxfp8_problem(problem, buffer)
+        w1, w2 = preprocess_mega_weights(
+            MoEWeightPack(problem["w13"], problem["w2"]),
+            hidden_size=512,
+            intermediate_size=256,
+        )
+        make_thunk = sources.sm100_block_scaled_mega_launch_thunk
     graph = torch.cuda.CUDAGraph()
     try:
         capture_stream = torch.cuda.Stream()
@@ -835,19 +864,27 @@ def test_sparse_to_dense_graph(sparse_ep_runtime, dtype, early, capacity):
         with torch.cuda.stream(capture_stream):
             thunk = make_thunk(w1, w2, buffer)
             thunk()
-        ids = buffer.topk_idx.clone()
-        scores = buffer.topk_weights.clone()
+        route_ids = buffer.topk_idx[:capacity]
+        route_scores = buffer.topk_weights[:capacity]
+        ids = route_ids.clone()
+        scores = route_scores.clone()
         torch.cuda.synchronize()
         dist.barrier()
-        mega = buffer._frontend._mega
-        kernel = mega.kernel
-        assert kernel.token_comm.use_single_cta_tail_reset(kernel.shared_zero_i32_count)
-        region = kernel._shared_region_by_name["combine_quant"]
-        start = kernel._shared_offsets["combine_quant"]
-        combine = mega.shared_workspace.narrow(0, start, region.nbytes).view(
-            torch.bfloat16
-        )
-        combine = combine.reshape(capacity, 4, 512)
+        if dtype == "nvfp4":
+            mega = buffer._frontend._mega
+            kernel = mega.kernel
+            assert kernel.token_comm.use_single_cta_tail_reset(
+                kernel.shared_zero_i32_count
+            )
+            region = kernel._shared_region_by_name["combine_quant"]
+            start = kernel._shared_offsets["combine_quant"]
+            combine = (
+                mega.shared_workspace.narrow(0, start, region.nbytes)
+                .view(torch.bfloat16)
+                .reshape(capacity, 4, 512)
+            )
+        else:
+            combine = buffer._pre_reduced_activation.view(torch.bfloat16)[:capacity]
         dense_terms = combine.float().clone()
         finite = torch.isfinite(dense_terms).all().to(torch.int32)
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
@@ -865,8 +902,8 @@ def test_sparse_to_dense_graph(sparse_ep_runtime, dtype, early, capacity):
                 valid = base % 3 != 0
             if state == "asymmetric":
                 valid[(0, 1, 129, capacity)[rank] :] = False
-            buffer.topk_idx.copy_(ids).masked_fill_(~valid, -1)
-            buffer.topk_weights.copy_(scores).masked_fill_(~valid, float("nan"))
+            route_ids.copy_(ids).masked_fill_(~valid, -1)
+            route_scores.copy_(scores).masked_fill_(~valid, float("nan"))
             expected = torch.zeros((capacity, 512), device="cuda", dtype=torch.float32)
             for k in range(4):
                 term = torch.where(valid[:, k, None], dense_terms[:, k], 0)
@@ -881,7 +918,7 @@ def test_sparse_to_dense_graph(sparse_ep_runtime, dtype, early, capacity):
                 if replay in (0, 64):
                     torch.cuda.synchronize()
                     dist.barrier()
-                    actual = buffer.output_activation.float()
+                    actual = buffer.output_activation[:capacity].float()
                     error = (actual - expected).norm() / expected.norm().clamp_min(
                         1e-12
                     )

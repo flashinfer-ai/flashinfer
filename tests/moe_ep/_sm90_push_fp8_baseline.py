@@ -24,7 +24,7 @@ def get_runner():
     """Return one cached grouped-GEMM runner for the current process."""
     global _runner
     if _runner is None:
-        from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import (
+        from flashinfer.moe_ep.shims.sm90.push_style_megamoe.gemm import (
             create_sm90_push_fp8_moe_gemm_runner,
         )
 

@@ -1,6 +1,6 @@
 """The Cake Ulysses all-to-all package: its portfolio through the public communicator, and the package route.
 
-The backend assertions import the package only through :func:`tests.test_helpers.cake_package.cake_package`
+The backend assertions import the package only through :func:`tests.cake.test_helpers.cake_package.cake_package`
 (flashinfer-ai/flashinfer#6553); the multi-GPU portfolio runs through the public communicator so the public
 contract (caller-owned outputs, NCCL-equal results) is what is checked.
 """
@@ -24,7 +24,7 @@ from tests.comm.cake_ulysses_a2a_fixture import (
     shapes,
 )
 from tests.comm.test_ulysses_a2a import multi_process_parallel
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_ulysses")
 cake_build = cake_package("cake_ulysses", "cake_build")
@@ -42,6 +42,7 @@ def _correctness_worker(world_size, rank, port, nvlink_kernel):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for shape in shapes(world_size):
@@ -95,6 +96,7 @@ def _registered_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for index, shape in enumerate(shapes(world_size)):
@@ -203,6 +205,7 @@ def _unaligned_rank_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for shape in shapes(world_size):
@@ -260,13 +263,14 @@ def test_registered_outputs_with_one_unaligned_rank(world_size):
 # programs) let a stream whose destination has not entered the launch yet
 # store its first 16-byte units into a zone at the tail of the destination's
 # signal allocation; the destination copies them into ``out`` before its
-# launch ends. No other program writes the zone. CTA c serves the same
-# destination in both programs and both advance the same per-CTA epoch, so
-# the two share one communicator's zone. The checks read this rank's u32
-# signal words: EPOCHS + c (the epoch of CTA c's last launch), ZR + c (the
-# epoch of the last launch whose incoming stream c used the zone) and the
-# zone's units, unit ((c * 2 + epoch % 2) * ZONE_SLOTS + slot) * 480 + lane
-# from word ZONE_DATA.
+# launch ends: the scatter program its first trip's first two units of each
+# lane (slots 0 and 1), the gather program the first unit (slot 0). No other
+# program writes the zone. CTA c serves the same destination in both programs
+# and both advance the same per-CTA epoch, so the two share one communicator's
+# zone. The checks read this rank's u32 signal words: EPOCHS + c (the epoch of
+# CTA c's last launch), ZR + c (the epoch of the last launch whose incoming
+# stream c used the zone) and the zone's units, unit ((c * 2 + epoch % 2) *
+# ZONE_SLOTS + slot) * 480 + lane from word ZONE_DATA.
 
 # (dtype, world size, collective) of every direct program that uses the zone
 _ZONE_PROGRAMS = frozenset({("bf16", 8, "scatter"), ("bf16", 8, "gather")})
@@ -360,8 +364,9 @@ void entry_poll(torch::Tensor words, torch::Tensor dest, torch::Tensor status,
 }
 """
 # (B, S_local, H, D) at world 8: one 16-byte unit a row for H = 8, D = 8, so
-# the stream sizes sit on the zone slot (480 units) and chunk (7680 units)
-# boundaries, up to every CTA of a destination holding a stripe (21 / 22);
+# the stream sizes sit on the zone slot (480 units), the scatter's two slots
+# (960 units) and chunk (7680 units) boundaries, up to every CTA of a
+# destination holding a stripe (21 / 22);
 # rows with B > 1 put batch boundaries inside a zone slot (the scatter's
 # output places each batch apart); the last two rows are not whole 16-byte
 # units and take the elements path
@@ -373,6 +378,9 @@ _ZONE_ROWS = [
     (1, 479, 8, 8),
     (1, 480, 8, 8),
     (1, 481, 8, 8),
+    (1, 959, 8, 8),
+    (1, 960, 8, 8),
+    (1, 961, 8, 8),
     (1, 7679, 8, 8),
     (1, 7680, 8, 8),
     (1, 7681, 8, 8),
@@ -545,7 +553,16 @@ def _raise_if_any(errors, what):
 
 
 def _zone_audit(
-    before, after, *, rank, launches, units, adopted, poisoned, direct_sources=()
+    before,
+    after,
+    *,
+    rank,
+    launches,
+    units,
+    adopted,
+    poisoned,
+    direct_sources=(),
+    op="gather",
 ):
     """Epoch and zone audit of this rank over ``launches`` direct launches.
 
@@ -554,10 +571,11 @@ def _zone_audit(
     stream from one of ``direct_sources`` (an unaligned rank, or a late rank
     whose destinations had all entered: it sends straight into ``out`` after
     the barrier that follows its read of the entry token). With ``poisoned``
-    (one launch, the zone poisoned before it), exactly the streams whose ZR
-    word changed wrote their parity's slot 0, the units of their first trip,
-    and nothing else of the zone changed. Returns the errors and the number of
-    streams that used the zone.
+    (one launch of ``op``, the zone poisoned before it), exactly the streams
+    whose ZR word changed wrote their parity's slots, the units of their first
+    trip (slot 0 the first unit of each lane, and under the scatter slot 1 the
+    second), and nothing else of the zone changed. Returns the errors and the
+    number of streams that used the zone.
     """
     epochs0, tags0, _ = before
     epochs1, tags1, written = after
@@ -580,12 +598,12 @@ def _zone_audit(
         for c in range(_GRID):
             expected = torch.zeros(2, _ZONE_SLOTS, _ZONE_LANES, dtype=torch.bool)
             if c in changed:
-                count = min(
-                    max(units - _zone_stream(c)[1] * _CHUNK_UNITS, 0), _ZONE_LANES
-                )
-                if count == 0:
+                stripe = max(units - _zone_stream(c)[1] * _CHUNK_UNITS, 0)
+                if stripe == 0:
                     errors.append(f"stream {c} used the zone without a stripe")
-                expected[epochs1[c] % 2, 0, :count] = True
+                for slot in range(_ZONE_SLOTS if op == "scatter" else 1):
+                    count = min(max(stripe - slot * _ZONE_LANES, 0), _ZONE_LANES)
+                    expected[epochs1[c] % 2, slot, :count] = True
             if not torch.equal(written[c], expected):
                 errors.append(
                     f"zone of CTA {c}: {int(written[c].sum())} units written, "
@@ -720,6 +738,7 @@ def _zone_trial(case, probe, op, late, step, units, unaligned=()):
         poisoned=True,
         direct_sources=tuple(unaligned)
         + ((late,) if late is not None and late != rank else ()),
+        op=op,
     )
     errors += found
     counts = [None] * communicator.world_size
@@ -741,6 +760,7 @@ def _zone_worker(world_size, rank, port, op, other_dtypes):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         partner = _PARTNER[op]
@@ -823,6 +843,7 @@ def _zone_graph_worker(world_size, rank, port, op):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         partner = _PARTNER[op]
@@ -971,6 +992,7 @@ def _zone_unaligned_worker(world_size, rank, port, op):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         unaligned, step = 1, 2000
@@ -1151,6 +1173,7 @@ def _zone_sharing_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         step = 3000

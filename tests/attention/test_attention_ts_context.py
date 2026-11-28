@@ -51,12 +51,18 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
     FmhaConfig,
 )
+from flashinfer.quantization import mxfp8_quantize_bshd
 from flashinfer.utils import is_sm100a_supported
 
 
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="PrimTS context attention requires SM100 or SM103",
+)
+_REQUIRES_CONTEXT_STATS_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="PrimTS context statistics require SM100, SM103, or SM107",
 )
 
 _HEAD_DIM = 128
@@ -919,6 +925,8 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v",
         "qo_indptr",
         "kv_indptr",
+        "q_scales",
+        "k_scales",
         "variable_window_token_starts",
         "variable_window_token_ends",
         "variable_window_cta_starts",
@@ -946,6 +954,94 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
     assert context_module._ContextPlanState.__dataclass_params__.frozen is True
+
+
+def _row_strided_value(value: torch.Tensor, padding: int) -> torch.Tensor:
+    """Put V in aligned, offset storage with poisoned row/batch padding."""
+
+    row_stride = value.shape[-2] * value.shape[-1] + padding
+    strides = (row_stride, value.shape[-1], 1)
+    if value.ndim == 4:
+        strides = (value.shape[1] * row_stride + padding, *strides)
+    offset = 16 // value.element_size()
+    size = (
+        offset + sum((n - 1) * s for n, s in zip(value.shape, strides, strict=True)) + 1
+    )
+    storage = torch.full((size,), 32.0, device=value.device, dtype=value.dtype)
+    result = storage.as_strided(value.shape, strides, offset)
+    result.copy_(value)
+    return result
+
+
+@_REQUIRES_CONTEXT_STATS_GPU
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+def test_attention_ts_context_strided_v_reuse_and_graph(packed):
+    """Compact/padded V reuse one kernel and replay reloads the captured view."""
+
+    qk_dtype = v_dtype = torch.bfloat16
+    head_dim, head_dim_vo, heads = 192, 128, 6
+    case = _make_context_case(
+        q_lengths=(33, 17) if packed else (33, 33),
+        k_lengths=(257, 129) if packed else (257, 257),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        qkv_dtype=qk_dtype,
+        packed_query=packed,
+        mask_type="causal",
+        head_dim=head_dim,
+        out_dtype=torch.bfloat16,
+        seed=20261105,
+    )
+    case = replace(case, v=case.v[..., :head_dim_vo].to(v_dtype).contiguous())
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=case.q.device,
+        batch_size=2,
+        max_q_len=max(case.q_lengths),
+        max_kv_len=max(case.k_lengths),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
+        q_dtype=qk_dtype,
+        k_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        out_dtype=case.out_dtype,
+        packed_query=packed,
+        mask_type=case.mask_type,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+    )
+    compact_out = _run_wrapper(wrapper, case)
+    expected = _context_reference(case)
+    atol, rtol = 0.01, 0.02
+    torch.testing.assert_close(compact_out.float(), expected, atol=atol, rtol=rtol)
+    state = wrapper._plan_state
+    cache_before = context_module._get_compiled_context.cache_info()
+    for padding in (64, 192):
+        padded_case = replace(case, v=_row_strided_value(case.v, padding))
+        actual = _run_wrapper(wrapper, padded_case)
+        torch.testing.assert_close(actual, compact_out, atol=0, rtol=0)
+        assert wrapper._plan_state is state
+    assert context_module._get_compiled_context.cache_info() == cache_before
+    # The one-shot adapter has its own geometry validation and must accept V.
+    torch.testing.assert_close(
+        _run_one_shot(padded_case).float(), expected, atol=atol, rtol=rtol
+    )
+    graph = _capture_context_graph(
+        wrapper,
+        padded_case.q,
+        padded_case.k,
+        padded_case.v,
+        actual,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
+    padded_case.v.copy_((padded_case.v.float() + 0.25).to(v_dtype))
+    expected = _context_reference(padded_case)
+    actual.zero_()
+    graph.replay()
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
 
 
 def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
@@ -1288,8 +1384,10 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed_query=False, mask_type="dense", vc=None),
-        scale_softmax_log2=torch.empty(1),
+        geometry=SimpleNamespace(
+            packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
+        ),
+        softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
         variable_window_padded_starts=None,
@@ -1331,7 +1429,7 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
-        scale_softmax_log2=torch.empty(1),
+        softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),
@@ -3645,6 +3743,155 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
     _assert_context_correct(output, case.reference)
 
 
+def _mxfp8_plan_options(*, batch_size: int, seq_len: int, num_heads: int, **overrides):
+    """Plan keywords of an MXFP8 Q/K plan: E8M0 Q/K dtype, E4M3 V, bf16 output."""
+    options = dict(
+        device="cuda:0",
+        batch_size=batch_size,
+        max_q_len=seq_len,
+        max_kv_len=seq_len,
+        num_qo_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=_HEAD_DIM,
+        q_dtype=torch.float8_e8m0fnu,
+        k_dtype=torch.float8_e8m0fnu,
+        out_dtype=torch.bfloat16,
+    )
+    options.update(overrides)
+    return options
+
+
+# Every run keyword the MXFP8 tests below pass, checked against the live signature.
+_MXFP8_RUN_KEYWORDS = ("q_scales", "k_scales", "output_scale", "softmax_scale")
+
+
+def _plan_mxfp8(*, batch_size: int, seq_len: int, num_heads: int, **overrides):
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        **_mxfp8_plan_options(
+            batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, **overrides
+        )
+    )
+    return wrapper
+
+
+def test_attention_ts_context_mxfp8_tests_match_wrapper_signatures():
+    """The MXFP8 helpers pass only keywords the wrapper declares, on any host."""
+    plan_parameters = inspect.signature(BatchPrefillTSWrapper.plan).parameters
+    run_parameters = inspect.signature(BatchPrefillTSWrapper.run).parameters
+    options = _mxfp8_plan_options(
+        batch_size=1, seq_len=128, num_heads=2, mask_type="causal", window_left=64
+    )
+    assert set(options) <= set(plan_parameters)
+    assert set(_MXFP8_RUN_KEYWORDS) <= set(run_parameters)
+
+
+def _dequantize_mxfp8(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Undo ``mxfp8_quantize_bshd``: ``[B, S, H, D]`` fp32 from the data and atoms."""
+    batch_size, seq_len, num_heads, head_dim = data.shape
+    tiles = scales.shape[2]
+    # Atom byte 16 * (r % 32) + 4 * (r // 32) + block holds row r of the tile.
+    per_row = (
+        scales.view(batch_size, num_heads, tiles, 32, 4, head_dim // 32)
+        .permute(0, 1, 2, 4, 3, 5)
+        .reshape(batch_size, num_heads, tiles * 128, head_dim // 32)[:, :, :seq_len]
+    )
+    factor = torch.exp2(per_row.float() - 127.0).permute(0, 2, 1, 3)
+    return data.float() * factor.repeat_interleave(32, dim=-1)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len", "num_heads", "mask_type"),
+    [
+        (1, 128, 2, "dense"),
+        (1, 128, 2, "causal"),
+        (1, 1024, 4, "dense"),
+        (1, 1024, 4, "causal"),
+        (2, 4176, 4, "dense"),
+    ],
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_accuracy(
+    batch_size, seq_len, num_heads, mask_type
+):
+    """The kernel on MXFP8 Q/K equals fp32 attention on the dequantized operands."""
+    torch.manual_seed(0)
+    shape = (batch_size, seq_len, num_heads, _HEAD_DIM)
+    q, k, v = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    q8, q_scales = mxfp8_quantize_bshd(q)
+    k8, k_scales = mxfp8_quantize_bshd(k)
+    v_scale = v.abs().amax().float() / 448.0
+    v8 = (v.float() / v_scale).to(_FP8)
+    sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
+    wrapper = _plan_mxfp8(
+        batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, mask_type=mask_type
+    )
+    out = wrapper.run(
+        q8,
+        k8,
+        v8,
+        q_scales=q_scales,
+        k_scales=k_scales,
+        output_scale=v_scale.item(),
+        softmax_scale=sm_scale,
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        _dequantize_mxfp8(q8, q_scales).transpose(1, 2),
+        _dequantize_mxfp8(k8, k_scales).transpose(1, 2),
+        (v8.float() * v_scale).transpose(1, 2),
+        scale=sm_scale,
+        is_causal=mask_type == "causal",
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), expected, rtol=5e-2, atol=5e-2)
+    # E4M3 P and V bound the error; Gaussian data sits at 2.2e-2 to 2.7e-2.
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 3e-2
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_plan_contract():
+    """MXFP8 Q/K takes E4M3 V, and runs need both scale tensors."""
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2, v_dtype=torch.bfloat16)
+    wrapper = _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2)
+    q8 = torch.zeros((1, 128, 2, _HEAD_DIM), device="cuda", dtype=_FP8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8)
+    plain = BatchPrefillTSWrapper()
+    plain.plan(
+        device="cuda:0",
+        batch_size=1,
+        max_q_len=128,
+        max_kv_len=128,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        head_dim=_HEAD_DIM,
+        q_dtype=_FP8,
+        k_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+    )
+    scales = torch.zeros((1, 2, 1, 128, 4), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales, k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(ValueError, match="aligned"):
+        wrapper.run(q8, q8, q8, q_scales=scales.flatten()[1:513], k_scales=scales)
+    # The linear [tokens, 4] scales of mxfp8_quantize have the byte count of the
+    # atoms but not their order.
+    with pytest.raises(ValueError, match="scale atoms"):
+        wrapper.run(q8, q8, q8, q_scales=scales.reshape(256, 4), k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(
+            batch_size=1, seq_len=128, num_heads=2, mask_type="causal", window_left=64
+        )
+
+
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize(
     "k_lengths",
@@ -4875,7 +5122,55 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
-# Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+@pytest.mark.parametrize("heads", [6, 96])
+@_REQUIRES_CONTEXT_STATS_GPU
+def test_attention_ts_context_mla_chunk_merge(heads):
+    """Merge a dense cached prefix with a causal suffix, for TP16 and DP heads."""
+    dtype = torch.bfloat16
+    torch.manual_seed(314)
+    q = torch.randn(1, 129, heads, 192, device="cuda").to(dtype)
+    k = torch.randn(1, 385, heads, 192, device="cuda").to(dtype)
+    v = torch.randn(1, 385, heads, 128, device="cuda").to(dtype)
+    pieces = []
+    for start, end, mask in ((0, 128, "dense"), (128, 385, "causal")):
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=q.device,
+            batch_size=1,
+            max_q_len=129,
+            max_kv_len=end - start,
+            num_qo_heads=heads,
+            num_kv_heads=heads,
+            head_dim=192,
+            head_dim_vo=128,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            out_dtype=torch.bfloat16,
+            mask_type=mask,
+            lse_mode="base2",
+        )
+        stats = torch.empty(q.shape[:-1], device="cuda")
+        out = wrapper.run(
+            q,
+            k[0, start:end].unsqueeze(0),
+            v[0, start:end].unsqueeze(0),
+            lse=stats,
+        )
+        pieces.append((out.float(), stats))
+    (o0, s0), (o1, s1) = pieces
+    maximum = torch.maximum(s0, s1)
+    w0 = (s0 - maximum).exp2()
+    w1 = (s1 - maximum).exp2()
+    merged = (o0 * w0[..., None] + o1 * w1[..., None]) / (w0 + w1)[..., None]
+    scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), k.float()) / math.sqrt(192)
+    mask = torch.arange(385, device="cuda")[None, :] > (
+        256 + torch.arange(129, device="cuda")[:, None]
+    )
+    scores.masked_fill_(mask[None, :, None, :], -torch.inf)
+    expected = torch.einsum("bqhk,bkhd->bqhd", scores.softmax(-1), v.float())
+    torch.testing.assert_close(merged, expected, atol=0.01, rtol=0.02)
+    relative_rms = (merged - expected).square().mean() / expected.square().mean()
+    assert relative_rms.sqrt() < 0.01
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -5617,3 +5912,145 @@ def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("paged", (False, True))
+def test_context_global_scales_graph_replay(paged):
+    """A mixed signature keeps a 0-D calibration scale live under capture."""
+    common = dict(
+        q_lengths=(64,),
+        k_lengths=(128,),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        mask_type="dense",
+        seed=17,
+    )
+    if paged:
+        case = _make_paged_context_case(
+            **common,
+            head_dim=128,
+            qk_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            out_dtype=torch.bfloat16,
+        )
+        reference = case.reference
+        scale = torch.tensor(reference.output_scale, device="cuda")
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(
+            wrapper, replace(case, reference=replace(reference, output_scale=scale))
+        )
+        args = (
+            reference.q,
+            case.k_cache,
+            case.v_cache,
+            metadata.qo_indptr,
+            metadata.block_tables,
+            metadata.seq_lens_kv,
+        )
+        name = "output_scale"
+    else:
+        reference = _make_context_case(
+            **common,
+            qkv_dtype=_FP8,
+            packed_query=False,
+            out_dtype=torch.bfloat16,
+        )
+        scale = torch.tensor(reference.softmax_scale, device="cuda")
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, replace(reference, softmax_scale=scale))
+        args = (reference.q, reference.k, reference.v)
+        name = "softmax_scale"
+
+    def check(expected):
+        torch.testing.assert_close(
+            out.float(), _context_reference(expected), atol=2e-2, rtol=5e-2
+        )
+
+    out = wrapper.run(*args)
+    check(reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    changed = getattr(reference, name) * 1.5
+    scale.fill_(changed)
+    graph.replay()
+    check(replace(reference, **{name: changed}))
+    override = torch.tensor([changed * 0.5], device="cuda")
+    wrapper.run(*args, out=out, validate=False, **{name: override})
+    check(replace(reference, **{name: changed * 0.5}))
+    wrapper.run(*args, out=out, validate=False)
+    check(replace(reference, **{name: changed}))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("qk_dtype", [torch.bfloat16, _FP8], ids=["bf16", "e4m3"])
+def test_attention_ts_context_e4m3_v_keeps_small_probabilities(qk_dtype):
+    """A sink row keeps the mass of 16383 keys at P ~ 2^-12 each, which a P
+    scale of 1 would round to zero in E4M3 while the fp32 row sum keeps it.
+    BF16 and E4M3 Q/K take different QK MMA paths to the same E4M3 V."""
+    case = _make_context_case(
+        q_lengths=(16384,),
+        k_lengths=(16384,),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=qk_dtype,
+        packed_query=False,
+        mask_type="dense",
+        out_dtype=torch.bfloat16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026110301,
+    )
+    q = torch.zeros_like(case.q, dtype=torch.float32)
+    q[..., 0] = 1.0
+    k = torch.randn_like(case.k, dtype=torch.float32) * 0.05
+    k[..., 0] = 0.0
+    k[:, 0, :, 0] = 12.0 * math.log(2.0) / case.softmax_scale
+    v = 1.0 + 0.1 * torch.randn_like(case.v, dtype=torch.float32)
+    v[:, 0] = -1.0
+    case = replace(case, q=q.to(qk_dtype), k=k.to(qk_dtype), v=v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("qk_dtype", [torch.bfloat16, _FP8], ids=["bf16", "e4m3"])
+def test_attention_ts_context_e4m3_v_rescales_after_row_max_rise(qk_dtype):
+    """A later KV tile raises the row max while small weights retain visible mass."""
+    case = _make_context_case(
+        q_lengths=(16384,),
+        k_lengths=(16384,),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=qk_dtype,
+        packed_query=False,
+        mask_type="dense",
+        out_dtype=torch.bfloat16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026112401,
+    )
+    q = torch.zeros_like(case.q, dtype=torch.float32)
+    q[..., 0] = 1.0
+    k = torch.zeros_like(case.k, dtype=torch.float32)
+    # The rise is below the old lazy threshold of eight log2 units. Keep the
+    # first maximum high enough that scale-one E4M3 drops the background mass.
+    later_key = 8192
+    k[:, 0, :, 0] = 12.0 * math.log(2.0) / case.softmax_scale
+    k[:, later_key, :, 0] = 16.0 * math.log(2.0) / case.softmax_scale
+    v = torch.ones_like(case.v)
+    v[:, 0] = -1.0
+    v[:, later_key] = -1.0
+    case = replace(case, q=q.to(qk_dtype), k=k.to(qk_dtype), v=v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(wrapper, case)
+    # Identical queries and a dense mask share one independent FP32 reference;
+    # still run and check all 16K query rows to retain the long-Q launch shape.
+    reference_case = replace(case, q=case.q[:, :1], q_lengths=(1,))
+    expected = _context_reference(reference_case).expand_as(actual)
+    _assert_context_correct(actual, case, expected=expected)

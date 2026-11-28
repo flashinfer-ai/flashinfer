@@ -285,7 +285,7 @@ to the shim version.
 On an AArch64 Docker host, the experiment can be built with:
 
 ```bash
-scripts/build_jit_cache_provider_wheelhouse.sh
+scripts/infra/build_jit_cache_provider_wheelhouse.sh
 ```
 
 The wrapper defaults to target `12.1a`, local version `cu130`, one NVCC thread,
@@ -308,7 +308,7 @@ label. This chooses the `nightly/cu134` PyTorch index and CUDA 13.4 builder:
 ```bash
 FLASHINFER_LOCAL_VERSION=cu134 \
 FLASHINFER_JIT_CACHE_PROVIDER_ARCH=12.1a \
-scripts/build_jit_cache_provider_wheelhouse.sh
+scripts/infra/build_jit_cache_provider_wheelhouse.sh
 ```
 
 `--print-config` resolves and prints this configuration without starting Docker.
@@ -326,7 +326,7 @@ JIT-disabled GPU gate with:
 
 ```bash
 FLASHINFER_DISABLE_JIT=1 \
-python scripts/smoke_test_jit_cache_provider.py --provider sm121a
+python scripts/infra/smoke_test_jit_cache_provider.py --provider sm121a
 ```
 
 The initial DGX Spark build produced a 250,767,917-byte provider wheel containing

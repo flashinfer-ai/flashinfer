@@ -750,6 +750,90 @@ def is_prims_ts_fp8_per_tensor_supported(
     return True, ""
 
 
+def deepseek_fp8_scale_block_size(hidden_size: int, hidden_states_scale: Any) -> int:
+    """Side of the square DeepSeek FP8 scale block implied by the activation scale.
+
+    ``hidden_states_scale`` is ``[hidden_size / block, num_tokens]``. Returns
+    ``128`` when the shape does not imply a block; the support check rejects
+    such calls with a reason.
+    """
+    if hidden_states_scale is None or hidden_states_scale.ndim != 2:
+        return 128
+    rows = int(hidden_states_scale.shape[0])
+    if rows == 0 or hidden_size % rows != 0:
+        return 128
+    block = hidden_size // rows
+    return block if block in (32, 128) else 128
+
+
+def _deepseek_fp8_scale_block(
+    runner: Any, moe_inputs: Any, kwargs: dict[str, Any]
+) -> tuple[bool, str, int]:
+    """Infer the DeepSeek FP8 scale block from the scale shapes.
+
+    Returns ``(ok, reason, block)``. The block is read from
+    ``hidden_states_scale`` (``[hidden_size / block, num_tokens]``) and the
+    weight scales must use the same block:
+
+    * ``gemm1_weights_scale[..., 2I / block, H / block]``
+    * ``gemm2_weights_scale[..., H / block, I / block]``
+    """
+    hidden_size = int(runner.hidden_size)
+    intermediate_size = int(runner.intermediate_size)
+    act_scale = moe_inputs.hidden_states_scale
+    if act_scale.ndim != 2 or act_scale.shape[0] == 0:
+        return False, "DeepSeek FP8 hidden_states_scale must be 2-D", 0
+    block, rem = divmod(hidden_size, int(act_scale.shape[0]))
+    if rem != 0 or block not in (32, 128):
+        return (
+            False,
+            "DeepSeek FP8 hidden_states_scale must be [hidden_size / 128, "
+            "num_tokens] or [hidden_size / 32, num_tokens], got "
+            f"{tuple(act_scale.shape)} for hidden_size={hidden_size}",
+            0,
+        )
+    if hidden_size % block != 0 or intermediate_size % block != 0:
+        return (
+            False,
+            f"hidden_size and intermediate_size must be multiples of {block}",
+            0,
+        )
+    if _enum_eq(
+        kwargs.get("weight_layout", runner.weight_layout), WeightLayout.BlockMajorK
+    ) and (hidden_size % 128 != 0 or intermediate_size % 128 != 0):
+        return (
+            False,
+            "BlockMajorK stores weights in 128-element K blocks, so "
+            f"hidden_size={hidden_size} and intermediate_size={intermediate_size} "
+            "must be multiples of 128 or use the MajorK layout",
+            0,
+        )
+    fc1_rows = 2 * intermediate_size
+    expected = (
+        ("gemm1_weights_scale", (fc1_rows // block, hidden_size // block)),
+        ("gemm2_weights_scale", (hidden_size // block, intermediate_size // block)),
+    )
+    num_local_experts = int(runner.num_local_experts)
+    for name, shape in expected:
+        scale = kwargs[name]
+        if scale.ndim != 3 or int(scale.shape[0]) != num_local_experts:
+            return (
+                False,
+                f"DeepSeek FP8 {name} must be [num_local_experts={num_local_experts}, "
+                f"rows / {block}, K / {block}], got {tuple(scale.shape)}",
+                0,
+            )
+        actual = tuple(scale.shape[-2:])
+        if actual != shape:
+            return (
+                False,
+                f"DeepSeek FP8 {name} trailing dims {actual} do not match the "
+                f"{block}x{block} scale block {shape}",
+                0,
+            )
+    return True, "", block
+
+
 def is_prims_ts_fp8_block_scale_supported(
     runner: Any,
     moe_inputs: Any,
@@ -812,9 +896,7 @@ def is_prims_ts_fp8_block_scale_supported(
         kwargs.get("gemm1_bias") is not None or kwargs.get("gemm2_bias") is not None
     ):
         return False, "DeepSeek FP8 Prims-TS bias is not supported"
-    if runner.intermediate_size % 128 != 0 or runner.hidden_size % 128 != 0:
-        return False, "hidden_size and intermediate_size must be multiples of 128"
-
+    deepseek_fp8_block_size = 128
     if is_deepseek:
         if moe_inputs.hidden_states_scale.dtype != torch.float32:
             return False, "DeepSeek FP8 hidden_states_scale must be float32"
@@ -827,8 +909,15 @@ def is_prims_ts_fp8_block_scale_supported(
             return False, "DeepSeek FP8 gemm1_weights_scale must be float32"
         if kwargs["gemm2_weights_scale"].dtype != torch.float32:
             return False, "DeepSeek FP8 gemm2_weights_scale must be float32"
+        ok, reason, deepseek_fp8_block_size = _deepseek_fp8_scale_block(
+            runner, moe_inputs, kwargs
+        )
+        if not ok:
+            return False, reason
         mapper_name = "map_trtllm_deepseek_fp8_moe_tactic"
     else:
+        if runner.intermediate_size % 128 != 0 or runner.hidden_size % 128 != 0:
+            return False, "hidden_size and intermediate_size must be multiples of 128"
         if (
             kwargs.get("gemm1_weights_scale") is None
             or kwargs.get("gemm2_weights_scale") is None
@@ -856,6 +945,7 @@ def is_prims_ts_fp8_block_scale_supported(
                     num_local_experts=getattr(runner, "num_local_experts", None),
                     weight_layout=_weight_layout_arg(runner, kwargs),
                     enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                    deepseek_fp8_block_size=deepseek_fp8_block_size,
                 )
             else:
                 pair = mapper(

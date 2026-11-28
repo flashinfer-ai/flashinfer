@@ -116,7 +116,7 @@ def test_staged_routing_ffi_signatures_take_optional_weights(name, expected_para
     )
     assert source_path.exists(), f"JIT MoE source does not exist: {source_path}"
     source = source_path.read_text()
-    begin = source.index(f"Array<Tensor> {name}(")
+    begin = source.index(f" {name}(")
     signature = source[source.index("(", begin) + 1 : source.index(")", begin)]
     params = [param.strip() for param in signature.split(",")]
     names = [param.split()[-1] for param in params]
@@ -504,6 +504,7 @@ def _partition_geometry_runner(
         has_output_block_scaling = False
         preferred_cluster_shape = (1, 1, 1)
         umma_cta_count = 1
+        use_deepseek_fp8 = 0
 
         def __init__(self, tile_m):
             self.tile_m = tile_m
@@ -571,6 +572,7 @@ def test_unpartitioned_geometry_filters_incomplete_wider_cga(monkeypatch):
         is_swap_ab = True
         tile_m = 128
         umma_cta_count = 2
+        use_deepseek_fp8 = 0
 
         def __init__(self, cluster_dim_x):
             self.preferred_cluster_shape = (cluster_dim_x, 1, 1)
@@ -658,8 +660,8 @@ def test_tp_n_tp_k_without_finalize_reduces_partials():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enable_pdl", (False, True))
-def test_partitioned_finalize_forwards_enable_pdl(enable_pdl):
+@pytest.mark.parametrize(("enable_pdl", "zero_rows"), ((False, True), (True, False)))
+def test_partitioned_finalize_forwards_enable_pdl_and_zero_rows(enable_pdl, zero_rows):
     class Module:
         def trtllm_moe_run_finalize(self, *args):
             self.args = args
@@ -687,10 +689,12 @@ def test_partitioned_finalize_forwards_enable_pdl(enable_pdl):
             num_experts=8,
             do_finalize=True,
             enable_pdl=enable_pdl,
+            zero_rows_without_local_expert=zero_rows,
         )
         == []
     )
     assert module.args[9] is enable_pdl
+    assert module.args[12] is zero_rows
 
 
 def _materialize_bf16_partition_execution(strategy: str):
@@ -1623,7 +1627,7 @@ def test_gemm_launches_use_local_expert_count():
         "build_fp8_block_scale_launch_io": 2,
         "build_fp8_per_tensor_launch_io": 2,
         "build_mxfp4_bf16_launch_io": 2,
-        "build_mxfp4_mxfp8_launch_io": 4,
+        "build_mxfp4_mxfp8_launch_io": 3,
         "build_nvfp4_launch_io": 2,
     }
     direct_values = [
