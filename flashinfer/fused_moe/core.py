@@ -1701,7 +1701,8 @@ def cutlass_fused_moe(
         stale) and are not written to ``output``, and the finalize runs a persistent grid sized
         by the SM count instead of one block per row. Use it when a CUDA graph is captured over a
         fixed-size buffer whose live prefix changes from step to step. ``None`` treats every row
-        as live. Not supported in ``min_latency_mode``. The count requires the unfused finalize:
+        as live. CUTLASS backend only: ``backend="cake"`` does not take it, and it is not
+        supported in ``min_latency_mode``. The count requires the unfused finalize:
         ``use_fused_finalize`` resolves to False (an explicit True raises), and a pre-allocated
         workspace must be sized with ``use_fused_finalize=False``.
 
@@ -1826,6 +1827,18 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    # The device token count is a CUTLASS-backend contract: the Cake routes read every row.
+    if num_active_tokens is not None:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' does not take num_active_tokens: the Cake routes "
+                "route and write every row of the input"
+            )
+        if min_latency_mode:
+            raise ValueError("num_active_tokens is not supported in min_latency_mode")
+        check_shape_dtype_device(
+            num_active_tokens, (1,), torch.int32, input.device, "num_active_tokens"
+        )
     # A device token count or an fp32 output needs the unfused finalize: the fused GEMM2
     # epilogue zero-fills every row of ``output`` and stores the activation dtype. The flag is
     # part of the runner key and the autotune cache key, so it is resolved here, once.
@@ -1965,13 +1978,6 @@ def cutlass_fused_moe(
     else:
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
-        )
-
-    if num_active_tokens is not None:
-        if min_latency_mode:
-            raise ValueError("num_active_tokens is not supported in min_latency_mode")
-        check_shape_dtype_device(
-            num_active_tokens, (1,), torch.int32, input.device, "num_active_tokens"
         )
 
     with torch.cuda.device(input.device):
