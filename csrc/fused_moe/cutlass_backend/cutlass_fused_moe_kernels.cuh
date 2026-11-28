@@ -427,13 +427,6 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
   int const token = blockIdx.x * BLOCK_SIZE + threadIdx.x;
 
-  // Tokens at or beyond the device count carry no routing; their ids may be stale.
-  int64_t const num_live_tokens =
-      num_active_tokens_ptr == nullptr
-          ? num_tokens
-          : min(num_tokens, static_cast<int64_t>(__ldg(num_active_tokens_ptr)));
-  bool is_valid_token = token < num_live_tokens;
-
   // This is the masked expert id for this token
   int local_token_selected_experts[EXPERTS_PER_TOKEN];
   // This is the final permuted rank of this token (ranked by selected expert)
@@ -443,6 +436,14 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
+
+  // Tokens at or beyond the device count carry no routing; their ids may be stale. The count is
+  // written by an earlier kernel, so it is read after the PDL wait like every other input.
+  int64_t const num_live_tokens =
+      num_active_tokens_ptr == nullptr
+          ? num_tokens
+          : min(num_tokens, static_cast<int64_t>(*num_active_tokens_ptr));
+  bool is_valid_token = token < num_live_tokens;
 
 // build expert map
 // we need to populate expert ids for all threads, even if there are
@@ -689,11 +690,12 @@ __global__ void blockExpertPrefixSumKernel(
   cudaGridDependencySynchronize();
 #endif
 
-  // Tokens at or beyond the device count carry no routing; their ids may be stale.
+  // Tokens at or beyond the device count carry no routing; their ids may be stale. The count is
+  // written by an earlier kernel, so it is read after the PDL wait like every other input.
   int64_t const num_live_tokens =
       num_active_tokens_ptr == nullptr
           ? num_tokens
-          : min(num_tokens, static_cast<int64_t>(__ldg(num_active_tokens_ptr)));
+          : min(num_tokens, static_cast<int64_t>(*num_active_tokens_ptr));
   int expanded_token_id = -1;
   if (token_id < num_live_tokens) {
     for (int i = 0; i < num_experts_per_token; i++) {
@@ -2034,12 +2036,6 @@ __global__ void finalizeMoeRoutingKernel(
   assert(padded_cols % 4 == 0);
   assert(unpadded_cols % 4 == 0);
   assert(unpadded_cols <= padded_cols);
-  // Rows at or beyond the device token count hold no token: they are neither read nor written, so
-  // the launcher sizes the grid by the SM count instead of the host-side buffer rows.
-  int64_t const num_live_rows =
-      num_active_tokens_ptr == nullptr
-          ? num_rows
-          : min(num_rows, static_cast<int64_t>(__ldg(num_active_tokens_ptr)));
 
   // Load 128-bits per thread, according to the smallest data type we read/write
   constexpr int64_t FINALIZE_ELEM_PER_THREAD =
@@ -2060,6 +2056,13 @@ __global__ void finalizeMoeRoutingKernel(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif
+
+  // Rows at or beyond the device token count hold no token: they are neither read nor written, so
+  // the launcher sizes the grid by the SM count instead of the host-side buffer rows. The count is
+  // written by an earlier kernel, so it is read after the PDL wait like every other input.
+  int64_t const num_live_rows = num_active_tokens_ptr == nullptr
+                                    ? num_rows
+                                    : min(num_rows, static_cast<int64_t>(*num_active_tokens_ptr));
 
   for (int64_t original_row = blockIdx.x; original_row < num_live_rows; original_row += gridDim.x) {
     auto* reduced_row_ptr_v =
