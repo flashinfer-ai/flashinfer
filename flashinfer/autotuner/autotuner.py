@@ -1686,15 +1686,17 @@ class AutoTunerStatistics:
 
     Attributes:
         cache_misses (int): Number of cache misses requiring fallback
-        cache_miss_config_collection (Dict[str, Set[OptimizationProfile]]): Collection of configs that caused cache misses
+        cache_miss_config_collection (Dict[str, Set[Tuple[Tuple[int, ...], ...]]]): Per op,
+            the input shapes of the inference-time cache misses, mapped to their
+            nearest tuning profile (the bucketed shapes the cache is keyed by)
         failed_profiling_count (Dict[str, int]): Number of failed profiling attempts per operation
         tuned_op_total_configs (Dict[str, int]): Total configurations tried per operation
         tuned_op_successful_configs (Dict[str, int]): Successful configurations per operation
     """
 
     cache_misses: int = 0
-    cache_miss_config_collection: dict[str, set[OptimizationProfile]] = field(
-        default_factory=dict[str, set[OptimizationProfile]]
+    cache_miss_config_collection: dict[str, set[tuple[tuple[int, ...], ...]]] = field(
+        default_factory=dict[str, set[tuple[tuple[int, ...], ...]]]
     )
     failed_profiling_count: dict[str, set[ProfilingCacheKey]] = field(
         default_factory=dict[str, set[ProfilingCacheKey]]
@@ -2178,6 +2180,7 @@ class AutoTuner:
         self._logged_cache_miss_oor: set[tuple[str, tuple[tuple[int, ...], ...]]] = (
             set()
         )
+        self._logged_cache_miss_no_op_data: set[str] = set()
         # Per-op memo of _has_tune_data's in-memory scan, valid for one value of
         # _dirty_seq (every winner publication bumps it; clear_cache resets it
         # and empties this memo).
@@ -2527,6 +2530,18 @@ class AutoTuner:
         if part is None:
             part = self._winner_partitions[key] = _WinnerSourceDict()
         return part
+
+    def _ops_with_tune_data(self) -> list[str]:
+        """Sorted names of the ops that have tuned data: winners tuned or loaded
+        in this process, and entries of a loaded config file."""
+        ops = {k.custom_op for k in self._winner_cache()}
+        if not self._isolate_legacy_configs and self._file_configs:
+            for key in self._file_configs:
+                # Keys are ``str((custom_op, runner_class_name, profile))``.
+                parts = key.split("'", 2)
+                if len(parts) == 3 and key.startswith("('"):
+                    ops.add(parts[1])
+        return sorted(ops)
 
     def _winner_cache_identity(self) -> tuple | None:
         store = self._active_managed_store
@@ -3371,6 +3386,19 @@ class AutoTuner:
                             ),
                         )
 
+                    # Count the miss, so that a caller can check after warm-up
+                    # (or at shutdown) which ops ran on their fallback tactic.
+                    try:
+                        miss_profile = self._find_nearest_profile(
+                            input_shapes, tuning_config
+                        )
+                    except Exception:
+                        miss_profile = tuple(tuple(s) for s in input_shapes)
+                    self.stats.cache_misses += 1
+                    self.stats.cache_miss_config_collection.setdefault(
+                        custom_op, set()
+                    ).add(miss_profile)
+
                     # If the user has loaded an autotune cache (via
                     # ``autotune(cache=...)``) or warmed up profiling
                     # results *for this specific custom_op* in the
@@ -3423,6 +3451,27 @@ class AutoTuner:
                                 f"max_num_tokens during the next tuning "
                                 f"pass to avoid this perf cliff."
                             )
+                    else:
+                        if custom_op not in self._logged_cache_miss_no_op_data:
+                            tuned_ops = self._ops_with_tune_data()
+                            if tuned_ops:
+                                self._logged_cache_miss_no_op_data.add(custom_op)
+                                shown = ", ".join(tuned_ops[:5])
+                                more = ", ..." if len(tuned_ops) > 5 else ""
+                                logger.warning(
+                                    f"[AutoTuner]: No tuned config for "
+                                    f"{custom_op} (first seen with "
+                                    f"input_shapes={input_shapes}) although tuned "
+                                    f"data exists for other ops ({shown}{more}); "
+                                    f"falling back to "
+                                    f"runner={runners[0].__class__.__name__} "
+                                    f"tactic=-1.  If a tuning cache was loaded, it "
+                                    f"may have been made by a different FlashInfer "
+                                    f"version (other op names or keys), or this op "
+                                    f"was not part of the tuning pass.  Other "
+                                    f"shapes of this op are not reported; see "
+                                    f"AutoTuner.stats.cache_miss_config_collection."
+                                )
                 return runner, tactic
 
             assert len(runners) > 0, "At least one runner is required"
@@ -5766,6 +5815,7 @@ class AutoTuner:
             self._observed_cache_generations.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
+            self._logged_cache_miss_no_op_data.clear()
             self._tune_data_memo.clear()
             self._dirty = False
             self._dirty_seq = 0

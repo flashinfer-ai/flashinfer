@@ -3348,6 +3348,14 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
                 return (cap,)
             return (cap, str(inputs[4].dtype))
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: Any) -> bool:
+            if isinstance(tactic, bool) or not isinstance(tactic, int):
+                return False
+            if tactic == -1:
+                return True
+            no_profile = OptimizationProfile(shapes=[], tensor_initializers=[])
+            return tactic in self.get_valid_tactics(inputs, no_profile)
+
         def forward(
             self,
             inputs: List[torch.Tensor],
