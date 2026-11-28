@@ -12058,6 +12058,25 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
 
+    if is_sm12x_supported(a.device):
+        m_g, n_g, k_g = scale_granularity_mnk
+        if m_g not in (1, 128) or (n_g, k_g) != (128, 128):
+            raise ValueError(
+                "SM12x CUTLASS requires scale_granularity_mnk=(1, 128, 128) "
+                f"or (128, 128, 128), got {scale_granularity_mnk}"
+            )
+        m, n = a.shape[0], b.shape[0]
+        if m % m_g:
+            raise ValueError(
+                f"M must be a multiple of {m_g} for scale granularity "
+                f"{scale_granularity_mnk} on SM12x CUTLASS, got M={m}"
+            )
+        if n % n_g:
+            raise ValueError(
+                f"N must be a multiple of {n_g} for scale granularity "
+                f"{scale_granularity_mnk} on SM12x CUTLASS, got N={n}"
+            )
+
     return True
 
 
@@ -12354,6 +12373,7 @@ def gemm_fp8_nt_groupwise(
     Notes
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
+    On SM120/SM121 CUTLASS (``backend="cutlass"``), ``n`` must be a multiple of 128, and ``m`` must also be a multiple of 128 when ``scale_granularity_mnk=(128, 128, 128)``.
     """
     if batch_invariant:
         from .batch_invariant.tuning import gemm_fp8_nt_groupwise_batch_invariant_auto
@@ -12728,6 +12748,10 @@ def gemm_fp8_nt_blockscaled(
     -------
     torch.Tensor
         Output tensor of shape ``(M, N)`` with dtype ``out_dtype``.
+
+    Notes
+    -----
+    On SM120/SM121 CUTLASS, both ``M`` and ``N`` must be multiples of ``128``.
     """
     return gemm_fp8_nt_groupwise(
         a,

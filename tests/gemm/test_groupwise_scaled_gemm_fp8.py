@@ -174,8 +174,8 @@ def test_fp8_groupwise_gemm(
 
 @pytest.mark.parametrize("n", [192, 200])
 def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
-    # The SM12x kernel rejects n % 128 != 0; the error must reach the caller
-    # instead of returning with `out` unwritten.
+    # The SM12x CUTLASS requirement rejects unaligned N before launch;
+    # skip_check=True reaches the kernel wrapper, which must propagate its error.
     if not torch.cuda.is_available():
         pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
     if not is_sm12x_supported(torch.device("cuda")):
@@ -186,7 +186,7 @@ def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
     a_scale = torch.ones((k // 128, m), device="cuda")
     b_scale = torch.ones((k // 128, math.ceil(n / 128)), device="cuda")
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="sm120"):
+    with pytest.raises(ValueError, match="N must be a multiple of 128"):
         gemm_fp8_nt_groupwise(
             a,
             b,
@@ -197,7 +197,89 @@ def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
             out_dtype=torch.bfloat16,
             backend="cutlass",
         )
+    with pytest.raises(RuntimeError, match="sm120"):
+        gemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            "MN",
+            out=out,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+            skip_check=True,
+        )
         torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "m,n,match",
+    [
+        (32, 128, "M must be a multiple of 128"),
+        (160, 128, "M must be a multiple of 128"),
+        (128, 64, "N must be a multiple of 128"),
+        (128, 192, "N must be a multiple of 128"),
+    ],
+)
+def test_fp8_blockscale_gemm_sm12x_unsupported_shape_raises(m, n, match):
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_blockscaled requires CUDA")
+    device = torch.device("cuda")
+    if not is_sm12x_supported(device):
+        pytest.skip("SM12x only")
+
+    a = torch.empty((m, 256), dtype=torch.float8_e4m3fn, device=device)
+    b = torch.empty((n, 256), dtype=torch.float8_e4m3fn, device=device)
+    a_scale = torch.ones((math.ceil(m / 128), 2), device=device)
+    b_scale = torch.ones((math.ceil(n / 128), 2), device=device)
+    with pytest.raises(ValueError, match=match):
+        gemm_fp8_nt_blockscaled(a, b, a_scale, b_scale, scale_major_mode="K")
+
+
+@pytest.mark.parametrize(
+    "sm12x,m,n,granularity,error",
+    [
+        (True, 32, 128, (1, 128, 128), None),
+        (True, 128, 128, (128, 128, 128), None),
+        (True, 32, 128, (128, 128, 128), "M must be a multiple of 128"),
+        (True, 128, 192, (1, 128, 128), "N must be a multiple of 128"),
+        (True, 128, 192, (128, 128, 128), "N must be a multiple of 128"),
+        (True, 128, 128, (64, 128, 128), "SM12x CUTLASS requires scale_granularity"),
+        (True, 128, 128, (1, 64, 128), "SM12x CUTLASS requires scale_granularity"),
+        (False, 32, 192, (128, 128, 128), None),
+    ],
+)
+def test_fp8_sm12x_cutlass_alignment_requirement(
+    monkeypatch, sm12x, m, n, granularity, error
+):
+    from flashinfer.gemm import gemm_base
+
+    monkeypatch.setattr(gemm_base, "is_sm12x_supported", lambda device: sm12x)
+    m_g, n_g, k_g = granularity
+    a = torch.empty((m, 256), dtype=torch.float8_e4m3fn)
+    b = torch.empty((n, 256), dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((math.ceil(m / m_g), 256 // k_g), dtype=torch.float32)
+    b_scale = torch.empty((math.ceil(n / n_g), 256 // k_g), dtype=torch.float32)
+    args = (a, b, a_scale, b_scale, "K")
+    kwargs = {"scale_granularity_mnk": granularity}
+    if error is None:
+        assert gemm_base._cutlass_gemm_fp8_nt_groupwise_requirement(*args, **kwargs)
+    else:
+        with pytest.raises(ValueError, match=error):
+            gemm_base._cutlass_gemm_fp8_nt_groupwise_requirement(*args, **kwargs)
+
+
+def test_fp8_sm12x_cutile_allows_unaligned_n():
+    """SM12x CUTLASS alignment rules do not block cuTile partial-N execution."""
+    from flashinfer.gemm import gemm_base
+
+    a = torch.empty((32, 256), dtype=torch.float8_e4m3fn)
+    b = torch.empty((64, 256), dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty((32, 2), dtype=torch.float32)
+    b_scale = torch.empty((1, 2), dtype=torch.float32)
+    assert gemm_base._cutile_gemm_fp8_nt_groupwise_requirement(
+        a, b, a_scale, b_scale, "K", scale_granularity_mnk=(1, 128, 128)
+    )
 
 
 @pytest.mark.parametrize(
