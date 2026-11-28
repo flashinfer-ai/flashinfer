@@ -2374,6 +2374,35 @@ def test_merge_rejects_invalid_metadata(fake) -> None:
     assert not fake
 
 
+# The largest capacity of a [2, 2, cap, row] receive slot whose last word lies
+# at or below 2**31 - 1 int32 words: 33 * (4 * cap) for legacy rows, 64 *
+# (4 * cap) int32 words for tagged rows.
+_LEGACY_CAP_MAX = ((1 << 31) - 1) // (33 * 4)
+_TAGGED_CAP_MAX = ((1 << 31) - 1) // (64 * 4)
+
+
+@pytest.mark.parametrize("tagged", (False, True))
+def test_merge_rejects_rows_past_int32_offsets(fake, tagged: bool) -> None:
+    """The merge programs address the receive rows through int32 element
+    offsets: a slot whose last word lies past 2**31 - 1 int32 words is
+    rejected before any launch, and the largest one within it launches."""
+    e = msa_ops.msa_icp_merge_candidates
+    cap = _TAGGED_CAP_MAX if tagged else _LEGACY_CAP_MAX
+    row, dtype = (32, torch.int64) if tagged else (33, torch.int32)
+    a = merge_args(2, tagged=tagged, t=5, cap=8)
+    over = {"recv_slot": _t((2, 2, cap + 1, row), dtype)}
+    within = {"recv_slot": _t((2, 2, cap, row), dtype)}
+    if tagged:
+        over["expected_generations"] = _t((2, cap + 1), torch.int32)
+        within["expected_generations"] = _t((2, cap), torch.int32)
+    _expect_rejected(fake, e, _with(a, **over), "2\\*\\*31 - 1 int32 words")
+    # a strided view: the offsets follow its strides, not its element count
+    wide = _t((2, 2, 8, 1 << 27), dtype)[..., :row]
+    _expect_rejected(fake, e, _with(a, recv_slot=wide), "2\\*\\*31 - 1 int32 words")
+    _call(e, _with(a, **within))
+    assert len(fake) == 1
+
+
 @pytest.mark.parametrize("world", (2, 4))
 @pytest.mark.parametrize("mode", ("legacy", "tagged", "prefill"))
 def test_merge_binds_the_rows(fake, world: int, mode: str) -> None:
@@ -2481,6 +2510,16 @@ def test_comm_layout_rejects_invalid_geometry() -> None:
     for args in ((3, 1, 8), (1, 4, 8), (2, 0, 8), (2, 2, 0)):
         with pytest.raises(ValueError):
             msa_ops.msa_icp_comm_layout(*args)
+
+
+def test_comm_layout_rejects_storage_past_int32_offsets() -> None:
+    """The storage of 3 * W * hpr * capacity rows of 33 + 64 int32 words each
+    must lie within 2**31 - 1 int32 words: the merges address it through int32
+    element offsets."""
+    cap = ((1 << 31) - 1) // (3 * 2 * 2 * 97)
+    assert msa_ops.msa_icp_comm_layout(2, 2, cap)["storage_words"] <= (1 << 31) - 1
+    with pytest.raises(ValueError, match="2\\*\\*31 - 1 int32 words"):
+        msa_ops.msa_icp_comm_layout(2, 2, cap + 1)
 
 
 @pytest.mark.parametrize("page", (128, 256))

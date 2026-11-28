@@ -162,6 +162,18 @@ def _peer_rows(
             )
 
 
+def _int32_offsets(name: str, t: torch.Tensor, words_per_element: int) -> None:
+    """The kernels address ``t`` through int32 element offsets from its data
+    pointer: its last element, counted in int32 words, must end at or below
+    ``2**31 - 1``."""
+    *outer, row = t.shape
+    last = sum((n - 1) * s for n, s in zip(outer, t.stride()[:-1], strict=True))
+    if (last + row) * words_per_element > _INT32_MAX:
+        raise ValueError(
+            f"{name} must lie within 2**31 - 1 int32 words of its first element"
+        )
+
+
 def _heads(h: int) -> None:
     if h != NUM_INDEX_HEADS:
         raise ValueError(
@@ -431,8 +443,12 @@ def comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict[str
     tagged_offset_bytes = legacy_words * 4
     if tagged_offset_bytes % 8:
         raise ValueError("the tagged rows would not be 8-byte aligned")
+    storage_words = legacy_words + rows * 2 * TAGGED_WORDS
+    # The merges address a slot's rows through int32 element offsets.
+    if storage_words > _INT32_MAX:
+        raise ValueError("the receive storage must hold at most 2**31 - 1 int32 words")
     return {
-        "storage_words": legacy_words + rows * 2 * TAGGED_WORDS,
+        "storage_words": storage_words,
         "legacy_offset_bytes": 0,
         "tagged_offset_bytes": tagged_offset_bytes,
         "legacy_shape": (
@@ -1603,6 +1619,8 @@ def merge_candidates(
                 + (" (tagged rows)" if tagged else " (legacy rows)")
             )
         _heads(world * hpr)
+    # A tagged row's int64 words are two int32 words each.
+    _int32_offsets("recv_slot", recv_slot, 2 if tagged else 1)
     if (
         output.dtype != torch.int32
         or output.ndim != 3
