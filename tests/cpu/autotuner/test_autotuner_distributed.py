@@ -760,14 +760,20 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from flashinfer.autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload
 from flashinfer.utils import last_positive_power_of_2
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
 single_runner = case.startswith("final_single_runner_")
 different_valid_tactics = case == "final_single_runner_different_valid_tactics"
-complete = single_runner or case == "final_cached_disagreement"
+retire_and_retune = case == "final_rejected_no_borrow_and_retune"
+failed_unlink = case == "final_cached_disagreement_managed_failed_unlink"
+cached_disagreement = case.startswith("final_cached_disagreement")
+managed = case.startswith("final_cached_disagreement_managed") or retire_and_retune
+complete = single_runner or cached_disagreement or retire_and_retune
 agreed = case in ("final_incomplete_agreement", "final_single_runner_agreement")
+allow_rejected_bucket = False
 root = Path(os.environ["CASE_ROOT"])
 
 class RunnerA(TunableRunner):
@@ -782,6 +788,8 @@ class RunnerB(RunnerA):
     def validate_tactic_for_profile(self, inputs, tactic, profile):
         return True
     def validate_tactic(self, inputs, tactic):
+        if retire_and_retune:
+            return allow_rejected_bucket or inputs[0].shape[0] == 4 or rank == 0
         return agreed or different_valid_tactics or rank == 0
 
 profiled = []
@@ -808,7 +816,7 @@ try:
     runners = [winner] if single_runner else [RunnerA(), winner]
     inputs = [torch.zeros(8, 8)]
     config = TuningConfig()
-    expected_profiled = runners
+    expected_profiled = [runners[0], *runners] if managed else runners
     if different_valid_tactics:
         # Agree on each bucket's winner before selecting with rank-local inputs.
         inputs = [torch.zeros(4 if rank == 0 else 8, 8)]
@@ -823,16 +831,74 @@ try:
             ),
         )
         expected_profiled = [winner] * 4
+    if retire_and_retune:
+        config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0,),
+                    dim_idx=(0,),
+                    gen_tuning_buckets=(4, 8),
+                    map_to_tuning_buckets=last_positive_power_of_2,
+                ),
+            ),
+        )
+        expected_profiled = [runners[0], *runners] * 2
     expected = (winner, 0) if agreed else (runners[0], -1)
     selections = []
-    with autotune(True):
-        for repeat in (False, True):
+    def context():
+        return autotune_v2(cache_root=root / "cache") if managed else autotune(True)
+    with context():
+        if failed_unlink:
+            key = tuner._get_cache_key("test::final_selection", winner, ((8, 8),), config)
+            stale_entry = tuner._active_managed_store._entry_path(key.file_key)
+            unlink = Path.unlink
+            def fail_for_stale_entry(path, *args, **kwargs):
+                if path == stale_entry:
+                    raise PermissionError("injected cache unlink failure")
+                return unlink(path, *args, **kwargs)
+            Path.unlink = fail_for_stale_entry
+        repeats = (False,) if failed_unlink else (False, True)
+        for repeat in repeats:
             profiled.clear()
             selections.append(tuner.choose_one("test::final_selection", runners, config, inputs))
-            assert profiled == ([] if repeat and complete else expected_profiled)
-    assert selections == [expected, expected], (
+            if retire_and_retune:
+                # Bucket 4 hits after the first pass; only bucket 8 is retried.
+                expected_calls = expected_profiled if not repeat else [runners[0], *runners]
+            else:
+                expected_calls = [] if repeat and complete and agreed else expected_profiled
+            assert profiled == expected_calls
+    assert selections == [expected] * len(repeats), (
         rank, case, [(type(runner).__name__, tactic) for runner, tactic in selections]
     )
+    if complete:
+        set_autotune_process_group(None)
+        if managed:
+            dist.barrier()
+            if failed_unlink:
+                assert stale_entry.is_file()
+                assert tuner.choose_one("test::final_selection", runners, config, inputs) == expected
+            autotune_v2_reload()
+        serving = tuner.choose_one("test::final_selection", runners, config, inputs)
+        assert serving == expected, (rank, case, type(serving[0]).__name__, serving[1])
+        if retire_and_retune:
+            small_serving = tuner.choose_one(
+                "test::final_selection", runners, config, [torch.zeros(4, 8)]
+            )
+            assert small_serving == (winner, 0)
+            allow_rejected_bucket = True
+            set_autotune_process_group(dist.group.WORLD)
+            with context():
+                profiled.clear()
+                assert tuner.choose_one(
+                    "test::final_selection", runners, config, inputs
+                ) == (winner, 0)
+                assert profiled == [runners[0], *runners]
+            set_autotune_process_group(None)
+            dist.barrier()
+            autotune_v2_reload()
+            assert tuner.choose_one(
+                "test::final_selection", runners, config, inputs
+            ) == (winner, 0)
     print("cache agreement OK", rank, case, flush=True)
 finally:
     set_autotune_process_group(None)
@@ -861,6 +927,9 @@ finally:
         "final_incomplete_disagreement",
         "final_incomplete_agreement",
         "final_cached_disagreement",
+        "final_cached_disagreement_managed",
+        "final_cached_disagreement_managed_failed_unlink",
+        "final_rejected_no_borrow_and_retune",
         "final_single_runner_disagreement",
         "final_single_runner_agreement",
         "final_single_runner_different_valid_tactics",
