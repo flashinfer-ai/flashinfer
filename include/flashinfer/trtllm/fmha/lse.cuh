@@ -28,15 +28,19 @@ namespace flashinfer {
 // lse[token_idx, head_idx] lives at
 //     lse + token_idx * lse_stride_tokens + head_idx * lse_stride_heads.
 // Each thread handles one (token, head) pair indexed by elem_idx in [0, num_tokens*num_heads_q).
-__global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restrict__ lse,
-                                       int num_heads_q, int64_t lse_stride_tokens, float lse_scale,
+// md is written by the previous kernel, which can still be running under PDL when this kernel
+// starts. So it is read after the grid-dependency wait with a coherent load (__ldcg): a read-only
+// __restrict__ pointer may be compiled to a non-coherent load (ld.global.nc), which is not ordered
+// after the wait.
+__global__ void ComputeLSEFromMDKernel(float2* md, float* __restrict__ lse, int num_heads_q,
+                                       int64_t lse_stride_tokens, float lse_scale,
                                        int64_t lse_stride_heads, int n) {
   int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (elem_idx >= n) return;
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
 #endif
-  float2 md_elem = md[elem_idx];
+  float2 md_elem = __ldcg(&md[elem_idx]);
   float m = md_elem.x;
   float d = md_elem.y;
   int token_idx = elem_idx / num_heads_q;
@@ -44,8 +48,8 @@ __global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restric
   int64_t out_idx = static_cast<int64_t>(token_idx) * lse_stride_tokens +
                     static_cast<int64_t>(head_idx) * lse_stride_heads;
   lse[out_idx] = lse_scale * (math::log2e * m + math::ptx_log2(d));
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
