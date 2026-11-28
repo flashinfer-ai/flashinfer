@@ -18,20 +18,9 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
     first, s13 = fixture(2 * n, h // 32, finite_scales=True)
     second, s2 = fixture(h, n // 32, finite_scales=True)
     if raw:
-
-        def cpu_planes(batch):
-            offsets = batch.exception_offsets.cpu().tolist()
-            fixed = tuple(t.cpu() for t in batch.fixed)
-            exceptions = batch.exceptions.cpu()
-            return moe.CsfScalePlanes(
-                fixed,
-                tuple(
-                    exceptions[start:end]
-                    for start, end in zip(offsets[:-1], offsets[1:], strict=True)
-                ),
-            )
-
-        first, second = cpu_planes(first), cpu_planes(second)
+        # Unprepared planes from the public encoder; prepare_weights re-buckets them.
+        first = moe.encode_mxfp4_csf_scales(s13)
+        second = moe.encode_mxfp4_csf_scales(s2)
     w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
     w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
     one = torch.ones(e, device=device)

@@ -53,6 +53,7 @@ from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
     CsfScalePlanes,
+    encode_mxfp4_csf_scales,
     Nvfp4CsfWeights,
     Mxfp4CsfWeights,
     IQ2XSWeights,
@@ -321,6 +322,7 @@ __all__ = [
     "PackedWeights",
     "Mxfp4CsfWeights",
     "CsfScalePlanes",
+    "encode_mxfp4_csf_scales",
     "Nvfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
