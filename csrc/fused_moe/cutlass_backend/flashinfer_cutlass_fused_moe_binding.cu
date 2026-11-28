@@ -145,6 +145,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                                               half, IsMXFPX, Sm90Wfp4Afp8Mode>>();
         }
 #ifdef ENABLE_BF16
+      // fp32 output is a finalize-side conversion: the GEMMs run the bf16 runner and the unfused
+      // finalize converts on store (fp32_final_output_, set by the constructor).
+      case float32_code:
       case bfloat16_code:
         if constexpr (NeedQuant) {
           return std::make_unique<
@@ -318,18 +321,32 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << ", Output: " << DLDataTypeToString(mOutputDtype);
     }
 
-    // fp32 output is a finalize-side conversion for bf16/fp16 activations: the GEMMs keep their
-    // native output type and finalize fusion is turned off because that epilogue writes it.
+    // fp32 output is a finalize-side conversion. The GEMMs keep the runner's native output type
+    // (the activation dtype for bf16/fp16 activations, bf16 for MXFP8-scaled e4m3 activations),
+    // the unfused finalize accumulates in fp32 and stores fp32 without the final rounding, and
+    // finalize fusion is off because that epilogue writes the native type. Biases are read in the
+    // native type. Supported: bf16/fp16 activations without a quantized-activation mode, and
+    // e4m3 activations with MXFP8 activation scaling.
     bool const fp32_output = mOutputDtype == dl_float32;
+    mGemmOutputDtype = mOutputDtype;
     if (fp32_output) {
-      TVM_FFI_ICHECK(mActivationDtype == dl_bfloat16 || mActivationDtype == dl_float16)
-          << "float32 output requires bfloat16 or float16 activations";
-      TVM_FFI_ICHECK(!mUseDeepSeekFP8BlockScaling && !mUseW4GroupScaling && !mUseMxfp8ActScaling)
-          << "float32 output is not supported with quantized activations";
+      bool const half_activations =
+          mActivationDtype == dl_bfloat16 || mActivationDtype == dl_float16;
+      bool const plain_weights = mWeightDtype == dl_bfloat16 || mWeightDtype == dl_float16 ||
+                                 mWeightDtype == dl_float8_e4m3fn;
+      bool const plain_runner = half_activations && plain_weights && !mUseDeepSeekFP8BlockScaling &&
+                                !mUseW4GroupScaling && !mUseMxfp8ActScaling;
+      TVM_FFI_ICHECK(plain_runner || isWMxfp8AMxfp8Quant())
+          << "float32 output is supported for bfloat16/float16 activations without a quantized-"
+             "activation mode and for float8_e4m3fn activations with MXFP8 activation scaling; got "
+             "activation "
+          << DLDataTypeToString(mActivationDtype) << ", weight "
+          << DLDataTypeToString(mWeightDtype);
+      mGemmOutputDtype = isWMxfp8AMxfp8Quant() ? dl_bfloat16 : mActivationDtype;
       mKernelRunner->fp32_final_output_ = true;
       mUseFusedFinalize = false;
     }
-    mBiasDtype = fp32_output ? mActivationDtype : mOutputDtype;
+    mBiasDtype = mGemmOutputDtype;
 
     // Must be set before enumerating tactics below: it gates whether GEMM2 finalize-fusion
     // tactics are produced (mayHaveFinalizeFused) and the corresponding workspace sizing.
@@ -797,7 +814,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
-                      DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
+                      DtypeUtils::dataType(mGemmOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config, enable_alltoall,
@@ -805,7 +822,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
-                      DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
+                      DtypeUtils::dataType(mGemmOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config,
@@ -960,6 +977,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   DLDataType mActivationDtype;
   DLDataType mWeightDtype;
   DLDataType mOutputDtype;
+  // What the GEMMs produce: mOutputDtype, except bf16/fp16 for fp32 output (finalize converts).
+  DLDataType mGemmOutputDtype;
   DLDataType mBiasDtype;
   // number of elements packed into the inner dimension of a matrix
   // e.g. 16 nvfp4 elements are packed into a single int64 element
