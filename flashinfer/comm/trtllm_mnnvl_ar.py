@@ -560,6 +560,12 @@ def trtllm_mnnvl_allreduce(
     return output
 
 
+def _check_rmsnorm_tensor_contiguous(name: str, tensor: torch.Tensor) -> None:
+    # The non-quantized CUDA kernel indexes packed rows without tensor strides.
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous for MNNVL fused allreduce RMSNorm")
+
+
 def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -577,6 +583,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_allreduce on the shard_input.
     After this, it performs residual addition and RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
     Note: multicast buffer is the same as the unicast buffer for the current rank.
+
+    All tensor arguments must be contiguous. The kernel does not support strided
+    views (including padded rows). Make input views contiguous explicitly and
+    use contiguous output buffers; this function does not copy into strided outputs.
 
     Args:
         input: Input tensor [num_tokens, hidden_dim]
@@ -613,6 +623,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         raise ValueError(
             f"The gamma tensor must have the same number of elements as the hidden dimension, got {gamma.numel()} elements but expected {input.shape[1]} elements."
         )
+    _check_rmsnorm_tensor_contiguous("input", input)
+    _check_rmsnorm_tensor_contiguous("residual_in", residual_in)
+    _check_rmsnorm_tensor_contiguous("gamma", gamma)
+
     if output is None:
         output = torch.empty_like(input)
     elif len(output.shape) != 2:
@@ -625,6 +639,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         raise ValueError(
             f"The residual output tensor must be 2D, got {len(residual_out.shape)}D. The shape is {residual_out.shape}."
         )
+
+    _check_rmsnorm_tensor_contiguous("output", output)
+    _check_rmsnorm_tensor_contiguous("residual_out", residual_out)
 
     workspace._require_handles_attached()
 
@@ -1220,7 +1237,8 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
 
     Deprecated: use :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm` instead.
     This legacy function is kept for backward compatibility and may be removed
-    in a future release.
+    in a future release. The input, residual, gamma and output tensors must be
+    contiguous (padded rows and other strided views are not supported).
 
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
     After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
@@ -1272,6 +1290,12 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         raise ValueError(
             f"The prenorm output tensor must be 2D, got {len(prenorm_output.shape)}D. The shape is {prenorm_output.shape}."
         )
+
+    _check_rmsnorm_tensor_contiguous("shard_input", shard_input)
+    _check_rmsnorm_tensor_contiguous("residual", residual)
+    _check_rmsnorm_tensor_contiguous("gamma", gamma)
+    _check_rmsnorm_tensor_contiguous("normed_output", normed_output)
+    _check_rmsnorm_tensor_contiguous("prenorm_output", prenorm_output)
 
     module = get_trtllm_mnnvl_comm_module()
 
