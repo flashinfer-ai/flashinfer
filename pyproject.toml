@@ -134,6 +134,7 @@ exclude = [
 "flashinfer" = [
   "_build_meta.py",
   "mla_kv_pack_fp8_workloads.json",
+  "allreduce_fusion_ws2_specialized_workloads.json",
   "top_p_renorm_probs_specialized_workloads.json",
   "mm_mxfp8_specialized_sm107_workloads.json",
 ]

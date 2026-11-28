@@ -197,6 +197,58 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+``create_allreduce_fusion_workspace(backend="specialized", ...)`` builds a
+:class:`SpecializedAllReduceFusionWorkspace`: the state of FlashInfer's
+specialized all-reduce fusion kernels plus a fallback workspace of the stock
+backend that ``backend="auto"`` would otherwise pick.  :func:`allreduce_fusion`
+runs a specialized kernel for a call inside its envelope and the fallback
+backend, with the same arguments, for every other call;
+``workspace.fallback_backend`` names the fallback, and per-call options that
+depend on the backend (such as ``use_oneshot``) follow it.  ``backend="auto"``
+builds this workspace first whenever the ranks agree that a specialized kernel
+covers the workspace, and the stock pick otherwise; ``"trtllm"`` and
+``"mnnvl"`` never run a specialized kernel.  Today it holds one kernel:
+``kARResidualRMSNorm`` with ``fp32_acc=True`` on two ranks of one node, hidden
+size 6144, bfloat16, compute capability 10.3, for the allowlisted
+``weight_bias`` values and token counts.  The checkpoint lifecycle above covers
+both the workspace's own buffers and its fallback's.
+
+Creation is collective.  A workspace configuration outside the kernels' envelope
+(world size, hidden size, dtype, ``max_token_num``) runs none of the
+specialized backend's collectives: ``backend="auto"`` builds the stock pick as
+before, with that backend's own collectives, and an explicit
+``backend="specialized"`` raises ``ValueError`` before building
+anything.  Inside it, the ranks vote (compute capability, one node, free memory,
+the JIT build, the kill switch) and, after allocating, vote again on their
+local setup; one rank's veto or failure is the outcome on every rank.  When the
+vote rejects the kernel, ``backend="auto"`` returns the stock workspace it
+built, while an explicit ``backend="specialized"`` destroys it and raises
+``ValueError`` on every rank.
+
+A call the kernel serves is collective like any all-reduce: a failure local to
+one rank after the call is dispatched, such as running out of memory while
+allocating an omitted ``residual_out`` or ``norm_out`` or an aligned copy of a
+misaligned view, raises on that rank and leaves its peer waiting in the
+kernel.  Pass ``residual_out`` and ``norm_out``, and keep every tensor 16-byte
+aligned, so that the call allocates nothing.
+
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` is read in two places; set it
+identically on every rank.  At creation it is read in the ranks' vote, so only
+inside the envelope above: ``backend="auto"`` then returns the stock workspace,
+and an explicit ``backend="specialized"`` returns a fallback-only
+:class:`SpecializedAllReduceFusionWorkspace` (no kernel state, no extra memory)
+instead of raising.  Outside the envelope an explicit ``backend="specialized"``
+raises ``ValueError`` whether or not the variable is set.  At call time it sends
+every eager call, and every call captured into a CUDA graph from then on, to
+the fallback.  A graph captured before the variable was set still replays the
+launches it captured: recapture such graphs after setting it.
+
+.. autoclass:: SpecializedAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 MNNVL CuTe DSL backend
 ~~~~~~~~~~~~~~~~~~~~~~
 

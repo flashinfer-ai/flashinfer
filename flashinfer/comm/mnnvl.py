@@ -691,7 +691,7 @@ def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> Tuple[Any, bool]
 
 
 def _create_and_import_handles(
-    comm: CommBackend, prop: Any, size: int
+    comm: CommBackend, prop: Any, size: int, local_error: Optional[str] = None
 ) -> Tuple[Optional[List[Any]], List[Optional[str]]]:
     """Make one attempt to back ``size`` bytes on every rank and import every
     peer's allocation.
@@ -699,20 +699,24 @@ def _create_and_import_handles(
     Collective over ``comm``. Returns the per-rank allocation handles (this
     rank's own at its index) and each rank's error, which is ``None`` on
     success. When any rank fails, the handles are ``None`` and everything this
-    rank created or imported is released, so the caller can retry.
+    rank created or imported is released, so the caller can retry. A
+    ``local_error`` (this rank could not prepare the attempt) skips the
+    allocation and is gathered as this rank's error, so every rank still makes
+    the same collective calls.
     """
     rank, size_of_group = comm.Get_rank(), comm.Get_size()
-    handle_type = prop.requestedHandleTypes
+    handle_type = prop.requestedHandleTypes if prop is not None else None
     local_handle = None
     exported = None
-    error = None
-    try:
-        local_handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
-        exported = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(local_handle, handle_type, 0)
-        )
-    except RuntimeError as exc:
-        error = f"creating or exporting the allocation failed: {exc}"
+    error = local_error
+    if error is None:
+        try:
+            local_handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
+            exported = checkCudaErrors(
+                cuda.cuMemExportToShareableHandle(local_handle, handle_type, 0)
+            )
+        except RuntimeError as exc:
+            error = f"creating or exporting the allocation failed: {exc}"
     errors = list(comm.allgather(error))
     if any(errors):
         if exported is not None and handle_type == _POSIX_FD_HANDLE:
@@ -766,6 +770,23 @@ def _format_rank_errors(errors: Sequence[Optional[str]]) -> str:
     )
 
 
+def _make_prop_or_error(
+    make_prop: Callable[[Any], Tuple[Any, int]], handle_type: Any
+) -> Tuple[Any, int, Optional[str]]:
+    """``make_prop(handle_type)``, with a failure returned as this rank's error
+    for :func:`_create_and_import_handles` instead of raised before the
+    exchange its peers enter."""
+    try:
+        prop, size = make_prop(handle_type)
+        return prop, size, None
+    except Exception as exc:  # noqa: BLE001 - gathered with the allocation errors
+        return (
+            None,
+            0,
+            f"querying the allocation properties failed: {type(exc).__name__}: {exc}",
+        )
+
+
 def allocate_mnnvl_handles(
     comm: CommBackend,
     dev_id: int,
@@ -779,12 +800,14 @@ def allocate_mnnvl_handles(
     type used: the one :func:`choose_mnnvl_handle_type` picks or, when FABRIC
     handles fail on a single host (e.g. without an IMEX channel), POSIX file
     descriptors. Each call decides on its own, so every allocation over a host
-    without usable FABRIC handles tries them first.
+    without usable FABRIC handles tries them first. A ``make_prop`` failure on
+    one rank is gathered like an allocation failure, so every rank retries or
+    raises alike.
     """
     global _fabric_fallback_warned
     handle_type, single_host = choose_mnnvl_handle_type(comm, dev_id)
-    prop, size = make_prop(handle_type)
-    handles, errors = _create_and_import_handles(comm, prop, size)
+    prop, size, local_error = _make_prop_or_error(make_prop, handle_type)
+    handles, errors = _create_and_import_handles(comm, prop, size, local_error)
     if handles is not None:
         return handles, handle_type
     failure = _format_rank_errors(errors)
@@ -798,8 +821,8 @@ def allocate_mnnvl_handles(
             _IMEX_HINT,
         )
         handle_type = _POSIX_FD_HANDLE
-        prop, size = make_prop(handle_type)
-        handles, errors = _create_and_import_handles(comm, prop, size)
+        prop, size, local_error = _make_prop_or_error(make_prop, handle_type)
+        handles, errors = _create_and_import_handles(comm, prop, size, local_error)
         if handles is not None:
             return handles, handle_type
         failure = _format_rank_errors(errors)

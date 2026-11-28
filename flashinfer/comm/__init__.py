@@ -124,6 +124,9 @@ from .trtllm_mnnvl_ar import (
     MNNVLAllReduceFusionWorkspace as MNNVLAllReduceFusionWorkspace,
 )
 from .allreduce import TRTLLMAllReduceFusionWorkspace as TRTLLMAllReduceFusionWorkspace
+from .allreduce import (
+    SpecializedAllReduceFusionWorkspace as SpecializedAllReduceFusionWorkspace,
+)
 from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,

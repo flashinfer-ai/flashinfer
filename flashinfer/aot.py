@@ -1100,6 +1100,9 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
     if add_comm:
+        from .jit.allreduce_fusion_ws2_specialized import (
+            gen_allreduce_fusion_ws2_specialized_module,
+        )
         from .jit.comm import (
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
@@ -1136,6 +1139,10 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+        # Specialized two-rank AR + residual + RMSNorm (allreduce_fusion on compute
+        # capability 10.3): one module, built for the exact sm_103a target only.
+        if has_sm103a_exact:
+            jit_specs.append(gen_allreduce_fusion_ws2_specialized_module())
         if has_sm100 or has_sm103 or has_sm110:
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts

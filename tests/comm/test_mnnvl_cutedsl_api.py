@@ -68,7 +68,7 @@ _TWO_SHOT_CONFIG = MNNVLCuteDSLConfig(
 )
 
 
-@pytest.mark.parametrize("backend", ("auto", "trtllm", "mnnvl"))
+@pytest.mark.parametrize("backend", ("auto", "trtllm", "mnnvl", "specialized"))
 @pytest.mark.parametrize(
     "option",
     (
