@@ -12,6 +12,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
@@ -60,6 +62,85 @@ warp_or = partial(cute.arch.warp_redux_sync, kind="or")  # skip predicate reduct
 # Debug helpers
 debug_blasst = False
 gmem_add = partial(cute.arch.atomic_add, sem="relaxed", scope="gpu")  # count skips
+
+
+# Keep two compressed pages-in-flight groups; the conversion warpgroup writes
+# the FP8 operand directly into the existing MMA pipeline's swizzled stage.
+_PACKED_STAGES = 2
+
+
+@dsl_user_op
+def _mixed_fill16(data, sf, dst, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            data.ir_value(loc=loc, ip=ip),
+            sf.ir_value(loc=loc, ip=ip),
+            dst.toint().ir_value(loc=loc, ip=ip),
+        ],
+        """
+    {
+      .reg .b64 data;
+      .reg .b16 v<4>;
+      .reg .b32 o<4>;
+      mov.b64 data, $0;
+      mov.b64 {v0,v1,v2,v3}, data;
+      mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 o0,v0,$1;
+      mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 o1,v1,$1;
+      mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 o2,v2,$1;
+      mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 o3,v3,$1;
+      st.shared.v4.b32 [$2], {o0,o1,o2,o3};
+    }
+    """,
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mixed_complete(addr, count, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip), Int32(count).ir_value(loc=loc, ip=ip)],
+        "mbarrier.complete_tx.relaxed.cta.shared::cta.b64 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mixed_l2(src, nbytes, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [src.toint().ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mixed_bulk_copy(dst, src, nbytes, bar, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst.toint().ir_value(loc=loc, ip=ip),
+            src.toint().ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            bar.toint().ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class GroupedQueryAttentionDecodePaged:
@@ -158,6 +239,8 @@ class GroupedQueryAttentionDecodePaged:
         threshold_scale_factor: Optional[Float32],
         stream: cuda.CUstream,
         enable_pdl: bool = True,
+        packed_v: Optional[cute.Tensor] = None,
+        packed_sf: Optional[cute.Tensor] = None,
     ):
         """
         Parameters
@@ -315,6 +398,11 @@ class GroupedQueryAttentionDecodePaged:
         # K, V
         smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
         remaining_bits = smem_capacity_bits - smem_alloc_bits - alignment_bits
+        if cutlass.const_expr(packed_v is not None):
+            remaining_bits -= (1024 - 128) * 8
+            remaining_bits -= (
+                _PACKED_STAGES * (mma_tile_k * blk_tile_d * 9 // 16 + 8) + 256
+            ) * 8
         kv_stages = remaining_bits // mk_stage_bits
         kv_stages -= 1 if kv_stages * pipe_stage_bits > alignment_bits else 0
 
@@ -481,6 +569,8 @@ class GroupedQueryAttentionDecodePaged:
             smem_layout_v_tma,
             tma_atom_v,
             tma_tensor_v,
+            packed_v,
+            packed_sf,
             # Q
             smem_layout_q,
             tma_atom_q,
@@ -501,7 +591,14 @@ class GroupedQueryAttentionDecodePaged:
             log2_threshold_scale_factor,
         ).launch(
             grid=grid,
-            block=[self.threads_per_cta, 1, 1],
+            block=[
+                self.threads_per_cta
+                + (
+                    warpgroup_threads if cutlass.const_expr(packed_v is not None) else 0
+                ),
+                1,
+                1,
+            ],
             cluster=[cluster_x, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
@@ -547,6 +644,8 @@ class GroupedQueryAttentionDecodePaged:
         smem_layout_v_tma: cute.ComposedLayout,
         tma_atom_v: cute.CopyAtom,
         mV: cute.Tensor,
+        packed_v: Optional[cute.Tensor],
+        packed_sf: Optional[cute.Tensor],
         # Q
         smem_layout_q: cute.ComposedLayout,
         tma_atom_q: cute.CopyAtom,
@@ -745,6 +844,30 @@ class GroupedQueryAttentionDecodePaged:
         # dual softmax and blasst are mutually exclusive
         sSP_producer_nbar = nbar(14, softmax_threads)
         sM_mutex_nbar = nbar(14, softmax_threads * softmax_warpgroups)
+        if cutlass.const_expr(packed_v is not None):
+            assert packed_sf is not None
+            assert self.headdim == 128 and page_size == 64
+            assert (
+                softmax_warpgroups == 1 and not enable_blasst and not use_reg_reconfig
+            )
+            mixed_slots = _PACKED_STAGES
+            mixed_desc = smem.allocate_tensor(
+                Int32, cute.make_layout((pages_k + 2, mixed_slots))
+            )
+            mixed_desc_ptr, mixed_desc_layout = mixed_desc.iterator, mixed_desc.layout
+            raw_page = page_size * self.headdim * 9 // 16
+            raw_buf = smem.allocate_tensor(
+                cutlass.Uint8,
+                cute.make_layout((raw_page * pages_k, mixed_slots)),
+                byte_alignment=128,
+            )
+            raw_ptr = raw_buf.iterator
+            raw_bar = smem.allocate_array(Int64, mixed_slots)
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    for ri in cutlass.range_constexpr(mixed_slots):
+                        cute.arch.mbarrier_init(raw_bar + ri, 1)
+                    cute.arch.mbarrier_init_fence()
 
         # named barrier stage helper
         def with_phase(nbar_, phase):
@@ -752,6 +875,15 @@ class GroupedQueryAttentionDecodePaged:
 
         # Alias thread cooperatives
         thr_cg = lambda t: CooperativeGroup(Agent.Thread, t)
+        if cutlass.const_expr(packed_v is not None):
+            cmd_bars = smem.allocate_array(Int64, 2 * mixed_slots)
+            cmd_send, cmd_recv = pipeline.PipelineAsync.create(
+                num_stages=mixed_slots,
+                producer_group=thr_cg(warp_threads),
+                consumer_group=thr_cg(warpgroup_threads),
+                barrier_storage=cmd_bars,
+                defer_sync=True,
+            ).make_participants()
         elect_one_cooperative = thr_cg(1)
         warpgroup_cooperative = thr_cg(warpgroup_threads)
         mma_group = elect_one_cooperative
@@ -856,11 +988,20 @@ class GroupedQueryAttentionDecodePaged:
 
         # Q, K, V
         tAsK = smem.allocate_tensor(
-            k_dtype, smem_layout_k_mma.outer, stensor_align, smem_layout_k_mma.inner
+            k_dtype,
+            smem_layout_k_mma.outer,
+            1024 if cutlass.const_expr(packed_v is not None) else stensor_align,
+            smem_layout_k_mma.inner,
         )  # (MMA, #MMA_M, #MMA_K, kv_stages)
         tAsV = cute.make_tensor(
             tAsK.iterator, smem_layout_v_mma.outer
         )  # (MMA, #MMA_M, #MMA_K, kv_stages)
+        if cutlass.const_expr(packed_v is not None):
+            helper_v = cute.make_tensor(
+                cute.recast_ptr(tAsV.iterator, dtype=cutlass.Uint8, swizzle_=None),
+                smem_layout_v_tma,
+            )
+            helper_v_ptr, helper_v_layout = helper_v.iterator, helper_v.layout
         tBsQ = smem.allocate_tensor(
             q_dtype, smem_layout_q.outer, stensor_align, smem_layout_q.inner
         )  # (MMA, #MMA_N, #MMA_K, q_stages)
@@ -1131,6 +1272,23 @@ class GroupedQueryAttentionDecodePaged:
                 rPT = sPT[None, pt_index].load().reshape((pages_m, tiles_sm))
                 pt_index = pt_index_next
 
+                if cutlass.const_expr(packed_v is not None):
+                    # The K producer knows which contiguous HND head page V will need.
+                    for sm in cutlass.range_constexpr(tiles_sm):
+                        for pm in cutlass.range_constexpr(pages_m):
+                            pg32 = rPT[pm, sm]
+                            if pg32 >= 0 and pg32 < packed_v.shape[0]:
+                                pg = cutlass.Int64(pg32)
+                                vv = packed_v.iterator + packed_v.layout(
+                                    (pg, coord_hk, 0, 0)
+                                )
+                                ss = packed_sf.iterator + packed_sf.layout(
+                                    (pg, coord_hk, 0, 0)
+                                )
+                                with cute.arch.elect_one():
+                                    _mixed_l2(vv, page_size * self.headdim // 2)
+                                    _mixed_l2(ss, page_size * self.headdim // 16)
+
                 # Load K
                 tma_order_v_nbar.arrive_and_wait()
                 kv_token = kv_producer.try_acquire()
@@ -1240,14 +1398,80 @@ class GroupedQueryAttentionDecodePaged:
                             else:
                                 kv_token = kv_producer.try_acquire()
 
-                            for pk in cutlass.range_constexpr(pages_k):
-                                virtual_page_idx = rPT[pk, sk]
-                                cute.copy(
-                                    tma_atom_v,
-                                    gV_tma[None, dm, virtual_page_idx],
-                                    sV_tma[None, pk, kv_handle.index],
-                                    tma_bar_ptr=kv_handle.barrier,
+                            if cutlass.const_expr(packed_v is None):
+                                for pk in cutlass.range_constexpr(pages_k):
+                                    virtual_page_idx = rPT[pk, sk]
+                                    cute.copy(
+                                        tma_atom_v,
+                                        gV_tma[None, dm, virtual_page_idx],
+                                        sV_tma[None, pk, kv_handle.index],
+                                        tma_bar_ptr=kv_handle.barrier,
+                                    )
+                            else:
+                                stage_num, stage_bar = (
+                                    kv_handle.index,
+                                    kv_handle.barrier,
                                 )
+                                cmd = cmd_send.acquire_and_advance()
+                                ci = cmd.index
+                                bar_addr = Int32(stage_bar.toint())
+                                desc = cute.make_tensor(
+                                    mixed_desc_ptr, mixed_desc_layout
+                                )
+                                with cute.arch.elect_one():
+                                    cute.arch.mbarrier_arrive_and_expect_tx(
+                                        raw_bar + ci, pages_k * raw_page
+                                    )
+                                for pk in cutlass.range_constexpr(pages_k):
+                                    page_id = rPT[pk, sk]
+                                    pg = cutlass.Int64(
+                                        page_id
+                                        if page_id >= 0 and page_id < packed_v.shape[0]
+                                        else 0
+                                    )
+                                    vv = packed_v.iterator + packed_v.layout(
+                                        (pg, coord_hk, 0, 0)
+                                    )
+                                    ss = packed_sf.iterator + packed_sf.layout(
+                                        (pg, coord_hk, 0, 0)
+                                    )
+                                    dest = raw_ptr + (ci * pages_k + pk) * raw_page
+                                    with cute.arch.elect_one():
+                                        _mixed_bulk_copy(
+                                            dest,
+                                            vv,
+                                            page_size * self.headdim // 2,
+                                            raw_bar + ci,
+                                        )
+                                        _mixed_bulk_copy(
+                                            dest + page_size * self.headdim // 2,
+                                            ss,
+                                            page_size * self.headdim // 16,
+                                            raw_bar + ci,
+                                        )
+                                        # A physical page can be partially written. The
+                                        # converter must zero its tail before FP8 PV MMA.
+                                        logical_page = (
+                                            (s * kv_splits + kv_split_idx) * pages_s
+                                            + sk * pages_k
+                                            + pk
+                                        )
+                                        desc[pk, ci] = (
+                                            cutlass.min(
+                                                page_size,
+                                                cutlass.max(
+                                                    0, seqlen - logical_page * page_size
+                                                ),
+                                            )
+                                            if page_id >= 0
+                                            and page_id < packed_v.shape[0]
+                                            else 0
+                                        )
+                                with cute.arch.elect_one():
+                                    desc[pages_k, ci] = stage_num
+                                    desc[pages_k + 1, ci] = bar_addr
+                                cute.arch.sync_warp()
+                                cmd.commit()
                 pt_index = 0 if pt_index == (pt_stages - 1) else pt_index + 1
 
             # Slice and partition O
@@ -1274,6 +1498,71 @@ class GroupedQueryAttentionDecodePaged:
             # Store O to gmem
             sO_final_nbar.arrive_and_wait()
             cute.copy(tma_atom_o, sO_tma, gO_tma)
+
+        elif warp_idx >= self.threads_per_cta // warp_threads:
+            if cutlass.const_expr(packed_v is not None):
+                desc = cute.make_tensor(mixed_desc_ptr, mixed_desc_layout)
+                turns = page_size * mma_tile_m // (16 * warpgroup_threads)
+                cmd_number = 0
+                for _ in cutlass.range(iters_s * tiles_sk):
+                    for dm in cutlass.range_constexpr(tiles_dm):
+                        cmd = cmd_recv.wait_and_advance()
+                        ci = cmd.index
+                        cute.arch.mbarrier_wait(
+                            raw_bar + ci, (cmd_number // mixed_slots) % 2
+                        )
+                        cmd_number += 1
+                        stage_idx = desc[pages_k, ci]
+                        bar_addr = desc[pages_k + 1, ci]
+                        for pk in cutlass.range_constexpr(pages_k):
+                            live_tokens = desc[pk, ci]
+                            data = cute.make_rmem_tensor(
+                                cute.make_layout(turns), cutlass.Uint64
+                            )
+                            scales = cute.make_rmem_tensor(
+                                cute.make_layout(turns), cutlass.Uint32
+                            )
+                            for turn in cutlass.range_constexpr(turns):
+                                linear = turn * warpgroup_threads + warpgroup_tidx
+                                token = linear // (mma_tile_m // 16)
+                                x = linear % (mma_tile_m // 16)
+                                group = dm * (mma_tile_m // 16) + x
+                                st = token // 4 * 4 + group // (self.headdim // 64)
+                                sg = (group % (self.headdim // 64)) * 4 + token % 4
+                                pbase = raw_ptr + (ci * pages_k + pk) * raw_page
+                                src = pbase + token * (self.headdim // 2) + group * 8
+                                sf = cute.make_tensor(
+                                    pbase
+                                    + page_size * self.headdim // 2
+                                    + st * (self.headdim // 16)
+                                    + sg,
+                                    cute.make_layout(1),
+                                )[0]
+                                data[turn] = cute.make_tensor(
+                                    cute.recast_ptr(src, dtype=cutlass.Uint64),
+                                    cute.make_layout(1),
+                                )[0]
+                                scales[turn] = cutlass.Uint32(
+                                    cutlass.Uint8(sf)
+                                    if token < live_tokens
+                                    else cutlass.Uint8(0)
+                                ) * cutlass.Uint32(0x01010101)
+                            for turn in cutlass.range_constexpr(turns):
+                                linear = turn * warpgroup_threads + warpgroup_tidx
+                                token = linear // (mma_tile_m // 16)
+                                x = linear % (mma_tile_m // 16)
+                                dst = helper_v_ptr + helper_v_layout(
+                                    ((16 * x, token), pk, stage_idx)
+                                )
+                                _mixed_fill16(data[turn], scales[turn], dst)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            _mixed_complete(
+                                bar_addr,
+                                pages_k * page_size * mma_tile_m // warpgroup_warps,
+                            )
+                        cmd.release()
 
         ##############################
         # MMA KQ (BMM1) Dispatch
@@ -1536,9 +1825,14 @@ class GroupedQueryAttentionDecodePaged:
                                 is_oob_kv = mask_config.is_oob_kv(
                                     idx_q, idx_kv, prediction, seqlen
                                 )
-                                mask = -Float32.inf if is_oob_kv else Float32(0)
                                 masked_p = masked[None, p, sm]
-                                masked_p.store(masked_p.load() + mask)
+                                if cutlass.const_expr(packed_v is not None):
+                                    # Overwrite, not add: masked K can contain NaNs.
+                                    if is_oob_kv:
+                                        masked_p.fill(-Float32.inf)
+                                else:
+                                    mask = -Float32.inf if is_oob_kv else Float32(0)
+                                    masked_p.store(masked_p.load() + mask)
                         scores = masked.load().reshape((blk_tile_n, tiles_sm))
                     else:
                         scores = tSrS_s.load().reshape((blk_tile_n, tiles_sm))
