@@ -228,6 +228,48 @@ def _blackwell_softmax_launches_with_pdl(device_index: int) -> bool:
     return _blackwell_softmax_capability(device_index) in ((10, 3), (10, 7))
 
 
+def _validate_top_k(top_k: Union[torch.Tensor, int, Real]) -> None:
+    """Validate top_k threshold parameter.
+
+    Raises ValueError if top_k is degenerate (zero or negative, excluding sentinel -1).
+    For CUDA tensors, avoids host-device synchronization (.item()) to preserve
+    CUDA graph capture compatibility and eliminate GPU pipeline stalls.
+    """
+    if isinstance(top_k, torch.Tensor):
+        if not top_k.is_cuda:
+            if bool(torch.any(top_k == 0).item()):
+                raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+            if bool(torch.any(top_k < -1).item()):
+                raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+    elif isinstance(top_k, (int, torch.SymInt)):
+        if top_k == 0 or top_k < -1:
+            raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+    elif isinstance(top_k, Real) and not isinstance(top_k, bool):
+        k_val = int(top_k)
+        if k_val == 0 or k_val < -1:
+            raise ValueError(f"top_k must be positive or -1 (to disable), got {top_k}")
+    else:
+        raise TypeError(f"top_k must be an integer or a torch.Tensor, got {type(top_k).__name__}")
+
+
+def _validate_top_p(top_p: Union[torch.Tensor, float, Real]) -> None:
+    """Validate top_p threshold parameter.
+
+    Raises ValueError if top_p is degenerate (<= 0.0).
+    For CUDA tensors, avoids host-device synchronization (.item()) to preserve
+    CUDA graph capture compatibility and eliminate GPU pipeline stalls.
+    """
+    if isinstance(top_p, torch.Tensor):
+        if not top_p.is_cuda:
+            if bool(torch.any(top_p <= 0.0).item()):
+                raise ValueError(f"top_p must be positive, got {top_p}")
+    elif isinstance(top_p, Real) and not isinstance(top_p, bool):
+        if top_p <= 0.0:
+            raise ValueError(f"top_p must be positive, got {top_p}")
+    else:
+        raise TypeError(f"top_p must be a float or a torch.Tensor, got {type(top_p).__name__}")
+
+
 @functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
@@ -387,6 +429,10 @@ def get_sampling_module():
         offset: Optional[Union[int, torch.Tensor]] = None,
         return_valid: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if maybe_top_p_arr is not None:
+            _validate_top_p(maybe_top_p_arr)
+        else:
+            _validate_top_p(top_p_val)
         device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
@@ -453,6 +499,10 @@ def get_sampling_module():
         offset: Optional[Union[int, torch.Tensor]] = None,
         return_valid: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if maybe_top_k_arr is not None:
+            _validate_top_k(maybe_top_k_arr)
+        else:
+            _validate_top_k(top_k_val)
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
@@ -590,6 +640,14 @@ def get_sampling_module():
         offset: Optional[Union[int, torch.Tensor]] = None,
         return_valid: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if maybe_top_k_arr is not None:
+            _validate_top_k(maybe_top_k_arr)
+        else:
+            _validate_top_k(top_k_val)
+        if maybe_top_p_arr is not None:
+            _validate_top_p(maybe_top_p_arr)
+        else:
+            _validate_top_p(top_p_val)
         device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
@@ -660,6 +718,10 @@ def get_sampling_module():
         is_deterministic: bool,
         workspace: torch.Tensor,
     ) -> torch.Tensor:
+        if maybe_top_p_arr is not None:
+            _validate_top_p(maybe_top_p_arr)
+        else:
+            _validate_top_p(top_p_val)
         probs = probs.float()
         maybe_top_p_arr = (
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
@@ -697,6 +759,10 @@ def get_sampling_module():
         row_states_buffer: torch.Tensor,
         is_deterministic: bool = False,
     ) -> torch.Tensor:
+        if maybe_top_k_arr is not None:
+            _validate_top_k(maybe_top_k_arr)
+        else:
+            _validate_top_k(top_k_val)
         # Support FP32, FP16, BF16
         assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {probs.dtype}, expected float32, float16, or bfloat16"
@@ -734,6 +800,10 @@ def get_sampling_module():
         top_k_val: int,
         row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
+        if maybe_top_k_arr is not None:
+            _validate_top_k(maybe_top_k_arr)
+        else:
+            _validate_top_k(top_k_val)
         # Support FP32, FP16, BF16
         assert logits.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {logits.dtype}, expected float32, float16, or bfloat16"
@@ -1784,6 +1854,7 @@ def top_p_sampling_from_probs(
     top_k_sampling_from_probs
     top_p_renorm_probs
     """
+    _validate_top_p(top_p)
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
@@ -1953,6 +2024,7 @@ def top_k_sampling_from_probs(
     top_p_sampling_from_probs
     top_k_renorm_probs
     """
+    _validate_top_k(top_k)
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
@@ -2457,6 +2529,8 @@ def top_k_top_p_sampling_from_logits(
     top_k_mask_logits
     top_p_sampling_from_probs
     """
+    _validate_top_k(top_k)
+    _validate_top_p(top_p)
     if batch_invariant:
         if check_nan:
             if torch.any(torch.isnan(logits)):
@@ -2704,6 +2778,8 @@ def top_k_top_p_sampling_from_probs(
     top_p_renorm_probs
     top_k_mask_logits
     """
+    _validate_top_k(top_k)
+    _validate_top_p(top_p)
     if batch_invariant:
         if check_nan:
             if torch.any(torch.isnan(probs)):
@@ -2852,6 +2928,7 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
+    _validate_top_p(top_p)
     specialized = _top_p_renorm_probs_specialized(probs, top_p, is_deterministic)
     if specialized is not None:
         return specialized
@@ -2948,6 +3025,7 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
+    _validate_top_k(top_k)
     row_states_buffer = _get_row_states_buffer(
         "top_k_renorm_probs_row_states", probs.device
     )
@@ -3018,6 +3096,7 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
+    _validate_top_k(top_k)
     row_states_buffer = _get_row_states_buffer(
         "top_k_mask_logits_row_states", logits.device
     )

@@ -4817,3 +4817,71 @@ def test_per_request_param_indexed_by_row(api, vocab_size, remap, expanded):
         else:
             # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
             assert counts[row_idx].item() == lanes, (remap, lane, counts)
+
+
+def test_sampling_top_k_top_p_degenerate_validation():
+    """Verify that degenerate non-positive top_k and top_p thresholds raise ValueError on CPU/scalar,
+    while CUDA tensor thresholds avoid host-device synchronization to ensure CUDA graph capture safety."""
+    torch.manual_seed(42)
+    batch_size = 4
+    vocab_size = 100
+    probs = torch.rand(batch_size, vocab_size, device="cuda:0")
+    probs /= probs.sum(dim=-1, keepdim=True)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+    zero_tensor_int = torch.zeros(batch_size, dtype=torch.int32, device="cpu")
+    zero_tensor_float = torch.zeros(batch_size, dtype=torch.float32, device="cpu")
+    neg_tensor_int = torch.full((batch_size,), -2, dtype=torch.int32, device="cpu")
+    neg_tensor_float = torch.full((batch_size,), -0.5, dtype=torch.float32, device="cpu")
+
+    # top_k_sampling_from_probs
+    for bad_k in (0, -2, zero_tensor_int, neg_tensor_int):
+        with pytest.raises(ValueError, match="top_k must be positive or -1"):
+            flashinfer.sampling.top_k_sampling_from_probs(probs, bad_k)
+
+    # top_p_sampling_from_probs
+    for bad_p in (0.0, -0.5, zero_tensor_float, neg_tensor_float):
+        with pytest.raises(ValueError, match="top_p must be positive"):
+            flashinfer.sampling.top_p_sampling_from_probs(probs, bad_p)
+
+    # top_k_top_p_sampling_from_probs
+    with pytest.raises(ValueError, match="top_k must be positive or -1"):
+        flashinfer.sampling.top_k_top_p_sampling_from_probs(probs, 0, 0.9)
+    with pytest.raises(ValueError, match="top_p must be positive"):
+        flashinfer.sampling.top_k_top_p_sampling_from_probs(probs, 10, 0.0)
+
+    # top_k_top_p_sampling_from_logits
+    with pytest.raises(ValueError, match="top_k must be positive or -1"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, 0, 0.9)
+    with pytest.raises(ValueError, match="top_p must be positive"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, 10, 0.0)
+
+    # top_k_renorm_probs
+    for bad_k in (0, -2, zero_tensor_int, neg_tensor_int):
+        with pytest.raises(ValueError, match="top_k must be positive or -1"):
+            flashinfer.sampling.top_k_renorm_probs(probs, bad_k)
+
+    # top_p_renorm_probs
+    for bad_p in (0.0, -0.5, zero_tensor_float, neg_tensor_float):
+        with pytest.raises(ValueError, match="top_p must be positive"):
+            flashinfer.sampling.top_p_renorm_probs(probs, bad_p)
+
+    # top_k_mask_logits
+    for bad_k in (0, -2, zero_tensor_int, neg_tensor_int):
+        with pytest.raises(ValueError, match="top_k must be positive or -1"):
+            flashinfer.sampling.top_k_mask_logits(logits, bad_k)
+
+    # Valid sentinel k=-1 must not raise validation error
+    flashinfer.sampling._validate_top_k(-1)
+    flashinfer.sampling._validate_top_k(torch.tensor([-1], device="cuda:0"))
+
+    # CUDA tensor validation must be non-blocking and graph capture safe
+    cuda_k = torch.tensor([10, 20], dtype=torch.int32, device="cuda:0")
+    cuda_p = torch.tensor([0.8, 0.9], dtype=torch.float32, device="cuda:0")
+    g = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g):
+        flashinfer.sampling._validate_top_k(cuda_k)
+        flashinfer.sampling._validate_top_p(cuda_p)
+
