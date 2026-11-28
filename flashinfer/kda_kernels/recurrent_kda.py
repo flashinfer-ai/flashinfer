@@ -62,7 +62,12 @@ from ..jit.flash_kda_decode import (
     get_flash_kda_decode_module,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .packed_kda_decode_cute import launch_unpacked_kda_decode_cute
+from ..gdn_kernels.cute_dsl_cache_naming import (
+    make_kernel_name,
+    persist_cute_dsl_compile,
+)
 from ..utils import get_compute_capability
 
 FlashKDADecodeDeviceArch = Literal["sm100a", "sm103a"]
@@ -966,6 +971,9 @@ def _grouped_kda_host(
     )
 
 
+_CUTE_DSL_MODULE = "recurrent_kda"
+_SOURCE_FILES = (os.path.realpath(__file__),)
+
 _grouped_compiled_cache: dict[tuple, Callable[..., None]] = {}
 
 
@@ -997,45 +1005,75 @@ def _get_grouped_compiled(
                 t, assumed_align=16, enable_tvm_ffi=True
             ).mark_layout_dynamic(leading_dim=ld)
 
-        fn = cute.compile(
-            _grouped_kda_host,
-            dyn(q, 3),
-            dyn(k, 3),
-            dyn(v, 3),
-            dyn(g, 3),
-            dyn(beta, 2),
-            dyn(A_log, 0),
-            dyn(dt_bias, 0),
-            dyn(cu_seqlens, 0),
-            dyn(ssm_state_indices, 1),
-            dyn(num_accepted_tokens, 0),
-            dyn(initial_state, 3),
-            dyn(initial_state_source, 3),
-            from_dlpack(
-                initial_state_indices, assumed_align=4, enable_tvm_ffi=True
-            ).mark_layout_dynamic(),
-            dyn(output, 3),
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1.0,
-            1.0,
-            make_fake_stream(),
-            D,
-            T,
-            KS,
-            H,
-            HV,
-            gm,
-            hdb,
-            bl,
-            ul2,
-            us,
-            VSPLIT,
-            options="--enable-tvm-ffi",
+        def compile_fn():
+            return cute.compile(
+                _grouped_kda_host,
+                dyn(q, 3),
+                dyn(k, 3),
+                dyn(v, 3),
+                dyn(g, 3),
+                dyn(beta, 2),
+                dyn(A_log, 0),
+                dyn(dt_bias, 0),
+                dyn(cu_seqlens, 0),
+                dyn(ssm_state_indices, 1),
+                dyn(num_accepted_tokens, 0),
+                dyn(initial_state, 3),
+                dyn(initial_state_source, 3),
+                from_dlpack(
+                    initial_state_indices, assumed_align=4, enable_tvm_ffi=True
+                ).mark_layout_dynamic(),
+                dyn(output, 3),
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1.0,
+                1.0,
+                make_fake_stream(),
+                D,
+                T,
+                KS,
+                H,
+                HV,
+                gm,
+                hdb,
+                bl,
+                ul2,
+                us,
+                VSPLIT,
+                options="--enable-tvm-ffi",
+            )
+
+        fn = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            make_kernel_name(
+                "grouped",
+                *key,
+                *(
+                    t.dtype
+                    for t in (
+                        q,
+                        k,
+                        v,
+                        g,
+                        beta,
+                        A_log,
+                        dt_bias,
+                        cu_seqlens,
+                        ssm_state_indices,
+                        num_accepted_tokens,
+                        initial_state,
+                        initial_state_source,
+                        initial_state_indices,
+                        output,
+                    )
+                ),
+            ),
+            compile_fn,
+            extra_key_files=_SOURCE_FILES,
         )
         _grouped_compiled_cache[key] = fn
     return fn
@@ -1202,6 +1240,7 @@ def _make_compile_inputs(HEAD_DIM, USE_CU_SEQLENS, state_dtype=cute.BFloat16):
 
 
 @functools.cache
+@persist_cute_dsl_compile(_CUTE_DSL_MODULE, _SOURCE_FILES)
 def _get_compiled_kernel(
     HEAD_DIM,
     USE_QK_L2NORM,
