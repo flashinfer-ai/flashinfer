@@ -326,6 +326,8 @@ void Run(TensorView a_Q, TensorView a_Q_scales_alias, TensorView a_KV, TensorVie
   check_same_device(a_cu_seq_len_k_end, a_Q, "cu_seq_len_k_end", "Q");
   TVM_FFI_CHECK((a_seq_len <= 3072LL), ValueError)
       << KERNEL_NAME << ": requires (seq_len <= 3072)";
+  TVM_FFI_CHECK((a_num_q_blocks >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (num_q_blocks >= 1)";
   TVM_FFI_CHECK((a_num_q_blocks <= 768LL), ValueError)
       << KERNEL_NAME << ": requires (num_q_blocks <= 768)";
   TVM_FFI_CHECK((CheckedMul(CheckedMul(CDiv(CheckedAdd(static_cast<int64_t>(static_cast<int64_t>(a_seq_len)), 3LL), 4LL), 4LL), static_cast<int64_t>(static_cast<int64_t>(a_stride_logits))) <= 4294967296LL), ValueError)

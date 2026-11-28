@@ -42,49 +42,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 3
-#define NUM_KV_PIPE_STAGES 5
-#define NUM_TMEM_PIPE_STAGES 3
-#define SMEM_NEGINF_SCRATCH_OFF 221200
-#define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
-#define SMEM_NEGINF_SCRATCH_STRIDE 4096
-#define SMEM_LOCAL_WORK_OFF 220672
-#define SMEM_LOCAL_WORK_STAGE_BYTES 128
-#define SMEM_LOCAL_WORK_STRIDE 128
-#define SMEM_LOCAL_COST_OFF 220800
-#define SMEM_LOCAL_COST_STAGE_BYTES 128
-#define SMEM_LOCAL_COST_STRIDE 128
-#define SMEM_LOCAL_BASE_OFF 220928
-#define SMEM_LOCAL_BASE_STAGE_BYTES 128
-#define SMEM_LOCAL_BASE_STRIDE 128
-#define SMEM_LOCAL_SPLITS_OFF 221056
-#define SMEM_LOCAL_SPLITS_STAGE_BYTES 128
-#define SMEM_LOCAL_SPLITS_STRIDE 128
-#define SMEM_LOCAL_HEADER_OFF 221184
-#define SMEM_LOCAL_HEADER_STAGE_BYTES 12
-#define SMEM_LOCAL_HEADER_STRIDE 12
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_WEIGHTS_OFF 219136
-#define SMEM_SMEM_WEIGHTS_STAGE_BYTES 512
-#define SMEM_SMEM_WEIGHTS_STRIDE 512
-#define SMEM_SMEM_KV_OFF 50176
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 33792
-#define SMEM_SMEM_KV_SCALES_OFF 82944
-#define SMEM_SMEM_KV_SCALES_STAGE_BYTES 1024
-#define SMEM_SMEM_KV_SCALES_STRIDE 33792
-#define SMEM_CANDIDATE_QUEUE_VALUES_OFF 153088
-#define SMEM_CANDIDATE_QUEUE_VALUES_STAGE_BYTES 8192
-#define SMEM_CANDIDATE_QUEUE_VALUES_STRIDE 8192
-#define SMEM_CANDIDATE_QUEUE_INDICES_OFF 161280
-#define SMEM_CANDIDATE_QUEUE_INDICES_STAGE_BYTES 8192
-#define SMEM_CANDIDATE_QUEUE_INDICES_STRIDE 8192
-#define SMEM_TOTAL 225408
 #define CANDIDATE_MODE 0
 #define FULL_Q_BLOCKS 0
 #ifndef SM_COUNT
@@ -214,7 +171,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -250,7 +207,7 @@ kernel_cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c(const __grid_constant__ CUte
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* neginf_scratch = reinterpret_cast<float*>(smem_raw + 221200);
     const int neginf_scratch_addr = smem + 221200;
     unsigned int* local_work = reinterpret_cast<unsigned int*>(smem_raw + 220672);
@@ -275,14 +232,15 @@ kernel_cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c(const __grid_constant__ CUte
     const int candidate_queue_values_addr = smem + 153088;
     int* candidate_queue_indices = reinterpret_cast<int*>(smem_raw + 161280);
     const int candidate_queue_indices_addr = smem + 161280;
+
+    // Kernel setup ops
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q_scales_alias))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV_scales))) : "memory"); }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (22 barriers at smem_raw[0..176))
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -335,14 +293,14 @@ kernel_cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c(const __grid_constant__ CUte
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (tid < 32) {
         unsigned int qidx = tid;
-        unsigned int start = 4294967295;
+        unsigned int start = 4294967295ll;
         unsigned int end = 0;
         #pragma unroll
         for (int qi = 0; qi < 4; qi++) {
@@ -371,13 +329,13 @@ kernel_cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c(const __grid_constant__ CUte
                 ScheduleMeta[(unsigned int)((3 * SM_COUNT + 1) / 2 * 2) + 2 * qidx + 1] = splits;
             }
         }
-        uint64_t scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
+        uint64_t scanned = ((unsigned long long)splits << 32ull) + (unsigned long long)cost;
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32); if (lane >= 1) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32); if (lane >= 2) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32); if (lane >= 4) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32); if (lane >= 8) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32); if (lane >= 16) { scanned += peer; } }
-        local_work[qidx] = (unsigned int)(scanned >> 32);
+        local_work[qidx] = (unsigned int)(scanned >> 32ull);
         local_cost[qidx] = (unsigned int)scanned;
     }
     __syncthreads();

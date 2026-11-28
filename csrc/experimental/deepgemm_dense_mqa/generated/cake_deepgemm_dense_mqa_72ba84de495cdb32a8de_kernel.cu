@@ -42,54 +42,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 396
-#define TMEM_TMEM_ACC_OFFSET 0
-#define TMEM_TMEM_SF_Q_OFFSET 384
-#define TMEM_TMEM_SF_KV_OFFSET 388
-#define NUM_Q_PIPE_STAGES 3
-#define NUM_KV_PIPE_STAGES 10
-#define NUM_TMEM_PIPE_STAGES 3
-#define SMEM_NEGINF_SCRATCH_OFF 202368
-#define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
-#define SMEM_NEGINF_SCRATCH_STRIDE 4096
-#define SMEM_LOCAL_WORK_OFF 201728
-#define SMEM_LOCAL_WORK_STAGE_BYTES 128
-#define SMEM_LOCAL_WORK_STRIDE 128
-#define SMEM_LOCAL_COST_OFF 201856
-#define SMEM_LOCAL_COST_STAGE_BYTES 128
-#define SMEM_LOCAL_COST_STRIDE 128
-#define SMEM_LOCAL_BASE_OFF 201984
-#define SMEM_LOCAL_BASE_STAGE_BYTES 128
-#define SMEM_LOCAL_BASE_STRIDE 128
-#define SMEM_LOCAL_SPLITS_OFF 202112
-#define SMEM_LOCAL_SPLITS_STAGE_BYTES 128
-#define SMEM_LOCAL_SPLITS_STRIDE 128
-#define SMEM_SCAN_WARP_SUMS_OFF 202240
-#define SMEM_SCAN_WARP_SUMS_STAGE_BYTES 96
-#define SMEM_SCAN_WARP_SUMS_STRIDE 96
-#define SMEM_SCAN_CARRY_OFF 202336
-#define SMEM_SCAN_CARRY_STAGE_BYTES 8
-#define SMEM_SCAN_CARRY_STRIDE 8
-#define SMEM_LOCAL_HEADER_OFF 202344
-#define SMEM_LOCAL_HEADER_STAGE_BYTES 12
-#define SMEM_LOCAL_HEADER_STRIDE 12
-#define SMEM_SMEM_Q_FP4_OFF 0
-#define SMEM_SMEM_Q_FP4_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_FP4_STRIDE 8192
-#define SMEM_SMEM_KV_FP4_OFF 24576
-#define SMEM_SMEM_KV_FP4_STAGE_BYTES 16384
-#define SMEM_SMEM_KV_FP4_STRIDE 16384
-#define SMEM_SMEM_SF_Q_OFF 188416
-#define SMEM_SMEM_SF_Q_STAGE_BYTES 512
-#define SMEM_SMEM_SF_Q_STRIDE 512
-#define SMEM_SMEM_SF_KV_OFF 189952
-#define SMEM_SMEM_SF_KV_STAGE_BYTES 1024
-#define SMEM_SMEM_SF_KV_STRIDE 1024
-#define SMEM_SMEM_WEIGHTS_OFF 200192
-#define SMEM_SMEM_WEIGHTS_STAGE_BYTES 512
-#define SMEM_SMEM_WEIGHTS_STRIDE 512
-#define SMEM_TOTAL 206848
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -289,7 +241,7 @@ __device__ __forceinline__ void tcgen05_commit_leader(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -325,7 +277,7 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* neginf_scratch = reinterpret_cast<float*>(smem_raw + 202368);
     const int neginf_scratch_addr = smem + 202368;
     unsigned int* local_work = reinterpret_cast<unsigned int*>(smem_raw + 201728);
@@ -352,6 +304,8 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
     const int smem_sf_kv_addr = smem + 189952;
     uint8_t* smem_weights = reinterpret_cast<uint8_t*>(smem_raw + 200192);
     const int smem_weights_addr = smem + 200192;
+
+    // Kernel setup ops
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_Q))) : "memory"); }
@@ -364,7 +318,7 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
         unsigned int splits = 0;
         unsigned int cost = 0;
         if (qidx < (unsigned int)num_q_blocks) {
-            unsigned int start = 4294967295;
+            unsigned int start = 4294967295ll;
             unsigned int end = 0;
             #pragma unroll
             for (int qi = 0; qi < 4; qi++) {
@@ -391,13 +345,13 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
                 ScheduleMeta[scan_span_offset_pre + 2 * qidx + 1] = splits_0;
             }
         }
-        uint64_t scanned = ((unsigned long long)splits << 32) + (unsigned long long)cost;
+        uint64_t scanned = ((unsigned long long)splits << 32ull) + (unsigned long long)cost;
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 1, 32); if (lane >= 1) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 2, 32); if (lane >= 2) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 4, 32); if (lane >= 4) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 8, 32); if (lane >= 8) { scanned += peer; } }
         { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, scanned, 16, 32); if (lane >= 16) { scanned += peer; } }
-        local_work[qidx] = (unsigned int)(scanned >> 32);
+        local_work[qidx] = (unsigned int)(scanned >> 32ull);
         local_cost[qidx] = (unsigned int)scanned;
     }
     if (tid == 352) {
@@ -440,8 +394,7 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
         }
     }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 32 barriers)
-    // Mbarriers at smem_raw[206464..206720)
+    // Mbarrier init (32 barriers at smem_raw[206464..206720))
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -505,12 +458,12 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
+    const unsigned int tmem_tmem_sf_q = taddr + 384;
+    const unsigned int tmem_tmem_sf_kv = taddr + 388;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
-    const int tmem_tmem_sf_q = taddr + 384;
-    const int tmem_tmem_sf_kv = taddr + 388;
     unsigned int scan_span_offset = (3 * SM_COUNT + 1) / 2 * 2;
     if (tid == 0) {
         unsigned int scan_blocks = (unsigned int)num_q_blocks;
@@ -991,9 +944,9 @@ kernel_cake_deepgemm_dense_mqa_72ba84de495cdb32a8de(const __grid_constant__ CUte
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x80004020 << 32);
 
                                 tcgen05_mma_mxf4_bs((tmem_tmem_acc + (mma_tmem_stage * 128)), a_desc + 0, b_desc + 0,
-                                    0x8a00480U, tmem_tmem_sf_kv + 0, tmem_tmem_sf_q + 0, 0);
+                                    0x8a00480U, tmem_tmem_sf_kv + 0 + 0, tmem_tmem_sf_q + 0, 0);
                                 tcgen05_mma_mxf4_bs((tmem_tmem_acc + (mma_tmem_stage * 128)), a_desc + 2, b_desc + 2,
-                                    0x48a004a0U, tmem_tmem_sf_kv + 0, tmem_tmem_sf_q + 0, 1);
+                                    0x48a004a0U, tmem_tmem_sf_kv + 0 + 0, tmem_tmem_sf_q + 0, 1);
                             }
                             tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
                             mma_tmem_stage += 1;
