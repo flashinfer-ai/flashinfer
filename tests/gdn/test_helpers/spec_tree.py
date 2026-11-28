@@ -41,6 +41,28 @@ def chain_parents(steps):
     return list(range(-1, steps - 1))
 
 
+def make_tree(kind, steps, seed=0):
+    """A ``steps``-node draft tree of the given shape (root parent is -1).
+
+    ``binary`` is a complete binary tree in level order, ``star`` hangs every
+    node off the root, and ``random`` draws each parent uniformly from the
+    earlier nodes with a fixed seed.
+    """
+    if kind == "chain":
+        return chain_parents(steps)
+    if kind == "binary":
+        return [-1] + [(node - 1) // 2 for node in range(1, steps)]
+    if kind == "star":
+        return [-1] + [0] * (steps - 1)
+    if kind == "random":
+        generator = torch.Generator().manual_seed(seed * 1000 + steps)
+        return [-1] + [
+            int(torch.randint(0, node, (1,), generator=generator))
+            for node in range(1, steps)
+        ]
+    raise ValueError(f"unknown tree kind {kind!r}")
+
+
 def ancestors(parents, node):
     """Proper ancestors of ``node``, root first."""
     path, cur = [], int(parents[node])

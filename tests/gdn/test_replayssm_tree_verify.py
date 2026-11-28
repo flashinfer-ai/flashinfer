@@ -20,7 +20,13 @@ import torch
 from flashinfer.gdn_decode import gated_delta_rule_mtp
 from flashinfer.utils import get_compute_capability
 
-from tests.gdn.test_helpers.spec_tree import CHAIN_8 as CHAIN, TREES, ancestors
+from tests.gdn.test_helpers.spec_tree import (
+    CHAIN_8 as CHAIN,
+    TREES,
+    ancestors,
+    chain_parents,
+    make_tree,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -166,6 +172,50 @@ def test_tree_differs_from_chain_where_the_tree_forks():
     assert _rel(forked[:, 0], chain[:, 0].double()) < 5e-3
     # Every later node has a different ancestor set, so it must not.
     assert _rel(forked[:, 1:], chain[:, 1:].double()) > 1e-2
+
+
+# Windows beyond the 8-token tile, every HV/H from 1 to 5 (odd ratios pair value
+# heads only within one key head), a single request (one value head per CTA) and
+# a batch (two per CTA).
+_KEY_HEADS = 2
+_WIDE_SHAPES = [
+    pytest.param(steps, ratio, batch, id=f"T{steps}-r{ratio}-B{batch}")
+    for steps in (12, 16)
+    for ratio in (1, 2, 3, 4, 5)
+    for batch in (1, 4)
+]
+
+
+@pytest.mark.parametrize("steps,ratio,batch", _WIDE_SHAPES)
+@pytest.mark.parametrize("kind", ["binary", "random"])
+def test_wide_tree_parents_match_the_ancestor_replay_oracle(steps, ratio, batch, kind):
+    args, cache = _inputs(batch, steps, _KEY_HEADS, _KEY_HEADS * ratio)
+    parents = make_tree(kind, steps)
+    err = _rel(_run(args, cache, parents), _oracle(args, parents))
+    assert err < 5e-3, f"{kind}: relative error {err:.3e}"
+
+
+@pytest.mark.parametrize(
+    "steps,ratio,batch",
+    [(16, ratio, batch) for ratio in (1, 3, 5) for batch in (1, 4)],
+    ids=lambda v: str(v),
+)
+def test_wide_chain_parents_reproduce_the_chain_path(steps, ratio, batch):
+    args, cache = _inputs(batch, steps, _KEY_HEADS, _KEY_HEADS * ratio)
+    chain = _run(args, cache).clone()
+    masked = _run(args, cache, chain_parents(steps))
+    ref = _oracle(args, chain_parents(steps))
+    assert _rel(chain, ref) < 5e-3
+    assert _rel(masked, ref) < 5e-3
+    assert _rel(masked, chain.double()) < 5e-3
+
+
+def test_wide_root_parent_zero_equals_root_parent_minus_one():
+    args, cache = _inputs(1, 12, _KEY_HEADS, _KEY_HEADS * 3)
+    parents = make_tree("random", 12)
+    canonical = _run(args, cache, parents).clone()
+    parents[0] = 0
+    assert torch.equal(_run(args, cache, parents), canonical)
 
 
 def _run_child_with_validation(parents):
