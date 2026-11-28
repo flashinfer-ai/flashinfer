@@ -710,7 +710,7 @@ kernel_cake_gdn_cp_af618767e71e6ea8ff40(const __grid_constant__ CUtensorMap K, f
         unsigned int final_words[4];
         float final_values[8];
         int final_row_base = warp * 16;
-        long long t_head_base = ((long long)t_block * (long long)num_sab_heads + (long long)sab_head) * 4096;
+        long long t_head_base = ((long long)t_block * (long long)num_sab_heads + (long long)sab_head) * 4096ll;
         #pragma unroll
         for (int final_n = 0; final_n < 4; final_n++) {
             int final_col_base = final_n * 16;
@@ -766,14 +766,14 @@ kernel_cake_gdn_cp_af618767e71e6ea8ff40(const __grid_constant__ CUtensorMap K, f
             if (final_r1 < valid_len && valid_len > final_c0 + 9) {
                 out7 = -1.0f * smem_beta[final_c0 + 9] * final_values[7];
             }
-            t[t_head_base + (long long)final_c0 * 64 + (long long)final_r0] = out0;
-            t[t_head_base + (long long)(final_c0 + 1) * 64 + (long long)final_r0] = out1;
-            t[t_head_base + (long long)final_c0 * 64 + (long long)final_r1] = out2;
-            t[t_head_base + (long long)(final_c0 + 1) * 64 + (long long)final_r1] = out3;
-            t[t_head_base + (long long)(final_c0 + 8) * 64 + (long long)final_r0] = out4;
-            t[t_head_base + (long long)(final_c0 + 9) * 64 + (long long)final_r0] = out5;
-            t[t_head_base + (long long)(final_c0 + 8) * 64 + (long long)final_r1] = out6;
-            t[t_head_base + (long long)(final_c0 + 9) * 64 + (long long)final_r1] = out7;
+            t[t_head_base + (long long)final_c0 * 64ll + (long long)final_r0] = out0;
+            t[t_head_base + (long long)(final_c0 + 1) * 64ll + (long long)final_r0] = out1;
+            t[t_head_base + (long long)final_c0 * 64ll + (long long)final_r1] = out2;
+            t[t_head_base + (long long)(final_c0 + 1) * 64ll + (long long)final_r1] = out3;
+            t[t_head_base + (long long)(final_c0 + 8) * 64ll + (long long)final_r0] = out4;
+            t[t_head_base + (long long)(final_c0 + 9) * 64ll + (long long)final_r0] = out5;
+            t[t_head_base + (long long)(final_c0 + 8) * 64ll + (long long)final_r1] = out6;
+            t[t_head_base + (long long)(final_c0 + 9) * 64ll + (long long)final_r1] = out7;
         }
         mbarrier_arrive(beta_empty_addr);
     }

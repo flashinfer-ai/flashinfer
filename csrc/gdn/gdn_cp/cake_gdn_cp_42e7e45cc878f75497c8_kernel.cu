@@ -358,6 +358,7 @@ kernel_cake_gdn_cp_42e7e45cc878f75497c8(const __grid_constant__ CUtensorMap loca
                             :: "r"(taddr + (unsigned int)tmem_row_base_3 + (unsigned int)(col_block_3 * 32)), "r"(*reinterpret_cast<const uint32_t*>(&values_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&values_1[15])));
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(mma_ready_full_addr);
                     __syncwarp();

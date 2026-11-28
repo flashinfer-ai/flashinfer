@@ -215,7 +215,7 @@ __device__ __forceinline__ void tma_store_4d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -274,7 +274,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -298,8 +298,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
     __nv_bfloat16* smem_k_trans = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int smem_k_trans_addr = smem + 33792;
 
-    // Mbarrier init (29 pipeline groups, 0 ordered-sequence groups, 59 barriers)
-    // Mbarriers at smem_raw[0..472)
+    // Mbarrier init (59 barriers at smem_raw[0..472))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -422,15 +421,13 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_tmem_state = taddr;
-    const int tmem_tmem_q_state = taddr + 128;
-    const int tmem_tmem_state_input = taddr + 192;
-    const int tmem_tmem_cg0_acc = taddr + 256;
-    const int tmem_tmem_cg1_acc = taddr + 384;
-    const int tmem_tmem_shared_input = taddr + 448;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr;
+    const unsigned int tmem_tmem_q_state = taddr + 128;
+    const unsigned int tmem_tmem_state_input = taddr + 192;
+    const unsigned int tmem_tmem_cg0_acc = taddr + 256;
+    const unsigned int tmem_tmem_cg1_acc = taddr + 384;
+    const unsigned int tmem_tmem_shared_input = taddr + 448;
 
     // ---- Role: compute_group_0 ----
     if (warp <= 3) {
@@ -567,7 +564,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                                 float _exp2_0 = approx_exp2(t_col_logs_cg0[t_col_log_item_cg0] - t_row_logs_cg0[t_row_log_group_cg0]);
                                 gamma_cg0 = _exp2_0;
                             }
-                            _unpack_bf16_0[t_item_cg0] = (-gamma_cg0) * _unpack_bf16_0[t_item_cg0];
+                            _unpack_bf16_0[t_item_cg0] = -gamma_cg0 * _unpack_bf16_0[t_item_cg0];
                             int qk_valid_cg0 = 0;
                             float qk_scale_cg0 = 0.0f;
                             qk_valid_cg0 = ((t_row_cg0 >= t_col_cg0) ? 1 : 0);
@@ -745,7 +742,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                 int lane_quad_cg1 = lane & 3;
                 int state_slot_cg1 = ((chunk_in_seq_1 > 0) ? (cp_chunk_1 - 1) * num_sab_heads + sab_head_1 : seq_idx_1 * num_sab_heads + sab_head_1);
                 int state_row_cg1 = warp_cg1 * 32 + lane;
-                long long state_base_cg1 = (long long)state_slot_cg1 * 16384 + (long long)state_row_cg1 * 128;
+                long long state_base_cg1 = (long long)state_slot_cg1 * 16384ll + (long long)state_row_cg1 * 128ll;
                 #pragma unroll
                 for (int state_col_block_cg1 = 0; state_col_block_cg1 < 4; state_col_block_cg1++) {
                     float state_seed_cg1[32];
@@ -811,7 +808,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(state_values_cg1[0]), "=f"(state_values_cg1[1]), "=f"(state_values_cg1[2]), "=f"(state_values_cg1[3]), "=f"(state_values_cg1[4]), "=f"(state_values_cg1[5]), "=f"(state_values_cg1[6]), "=f"(state_values_cg1[7]), "=f"(state_values_cg1[8]), "=f"(state_values_cg1[9]), "=f"(state_values_cg1[10]), "=f"(state_values_cg1[11]), "=f"(state_values_cg1[12]), "=f"(state_values_cg1[13]), "=f"(state_values_cg1[14]), "=f"(state_values_cg1[15]), "=f"(state_values_cg1[16]), "=f"(state_values_cg1[17]), "=f"(state_values_cg1[18]), "=f"(state_values_cg1[19]), "=f"(state_values_cg1[20]), "=f"(state_values_cg1[21]), "=f"(state_values_cg1[22]), "=f"(state_values_cg1[23]), "=f"(state_values_cg1[24]), "=f"(state_values_cg1[25]), "=f"(state_values_cg1[26]), "=f"(state_values_cg1[27]), "=f"(state_values_cg1[28]), "=f"(state_values_cg1[29]), "=f"(state_values_cg1[30]), "=f"(state_values_cg1[31])
-                        : "r"(tmem_tmem_state + (warp_cg1 * 32 << 16)));
+                        : "r"(tmem_tmem_state + 0 + (warp_cg1 * 32 << 16)));
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -931,6 +928,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                         v_frag_hi_cg1[v_word_cg1] = v_bits_cg1[2];
                         v_frag_hi_cg1[v_word_cg1 + 1] = v_bits_cg1[3];
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(cg1_acc_empty_addr);
@@ -1359,7 +1357,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(final_state_values_cg1[0]), "=f"(final_state_values_cg1[1]), "=f"(final_state_values_cg1[2]), "=f"(final_state_values_cg1[3]), "=f"(final_state_values_cg1[4]), "=f"(final_state_values_cg1[5]), "=f"(final_state_values_cg1[6]), "=f"(final_state_values_cg1[7]), "=f"(final_state_values_cg1[8]), "=f"(final_state_values_cg1[9]), "=f"(final_state_values_cg1[10]), "=f"(final_state_values_cg1[11]), "=f"(final_state_values_cg1[12]), "=f"(final_state_values_cg1[13]), "=f"(final_state_values_cg1[14]), "=f"(final_state_values_cg1[15]), "=f"(final_state_values_cg1[16]), "=f"(final_state_values_cg1[17]), "=f"(final_state_values_cg1[18]), "=f"(final_state_values_cg1[19]), "=f"(final_state_values_cg1[20]), "=f"(final_state_values_cg1[21]), "=f"(final_state_values_cg1[22]), "=f"(final_state_values_cg1[23]), "=f"(final_state_values_cg1[24]), "=f"(final_state_values_cg1[25]), "=f"(final_state_values_cg1[26]), "=f"(final_state_values_cg1[27]), "=f"(final_state_values_cg1[28]), "=f"(final_state_values_cg1[29]), "=f"(final_state_values_cg1[30]), "=f"(final_state_values_cg1[31])
-                        : "r"(tmem_tmem_state + (warp_cg1 * 32 << 16)));
+                        : "r"(tmem_tmem_state + 0 + (warp_cg1 * 32 << 16)));
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -1441,8 +1439,13 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     mbarrier_wait(load_k_full_addr + (k_stage_qk) * 8, _phase_load_k_full);
                     mbarrier_wait(cg0_acc_empty_addr + (acc_stage_qk) * 8, _phase_cg0_acc_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_a_lo_0 = make_warp_uniform((((smem_q_addr) >> 4) & 0x7FFF) + (q_stage_qk) * 1024);
                     int _mma_b_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & 0x7FFF) + (k_stage_qk) * 1024);
+#else
+                    int _mma_a_lo_0 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_stage_qk) * 1024);
+                    int _mma_b_lo_0 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_qk) * 1024);
+#endif
                     {
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
@@ -1708,7 +1711,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     mbarrier_wait(cg1_acc_empty_addr, _phase_cg1_acc_empty);
                     mbarrier_wait(state_input_ready_addr, _phase_state_input_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & 0x7FFF) + (k_stage_state) * 1024);
+#else
+                    int _mma_b_lo_1 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1754,7 +1761,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_cg1_acc), "r"(_mma_b_lo_1), "r"(tmem_tmem_state_input), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_2 = make_warp_uniform((((smem_k_addr) >> 4) & 0x7FFF) + (k_stage_state) * 1024);
+#else
+                    int _mma_b_lo_2 = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1799,12 +1810,16 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_cg1_acc), "r"(_mma_b_lo_2), "r"(tmem_tmem_shared_input), "r"(1) : "memory");
+                    :: "r"(tmem_tmem_cg1_acc), "r"(_mma_b_lo_2), "r"(tmem_tmem_shared_input + 0), "r"(1) : "memory");
                     elect_commit(cg1_acc_full_addr);
                     _phase_cg1_acc_empty ^= 1;
                     mbarrier_wait(q_state_acc_empty_addr, _phase_q_state_acc_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_3 = make_warp_uniform((((smem_q_addr) >> 4) & 0x7FFF) + (q_stage_state) * 1024);
+#else
+                    int _mma_b_lo_3 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1850,7 +1865,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_3), "r"(tmem_tmem_state_input), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_4 = make_warp_uniform((((smem_q_addr) >> 4) & 0x7FFF) + (q_stage_state) * 1024);
+#else
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1895,7 +1914,7 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_4), "r"(tmem_tmem_shared_input), "r"(1) : "memory");
+                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_4), "r"(tmem_tmem_shared_input + 0), "r"(1) : "memory");
                     elect_commit(q_state_acc_full_addr);
                     _phase_q_state_acc_empty ^= 1;
                     elect_commit(state_input_empty_addr);
@@ -1904,7 +1923,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     mbarrier_wait(vks_ready_addr, _phase_vks_ready);
                     mbarrier_wait(ainv_ready_addr + (ainv_stage_state) * 8, _phase_ainv_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_5 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x7FFF) + (ainv_stage_state) * 512);
+#else
+                    int _mma_b_lo_5 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x3FFF) + (ainv_stage_state) * 512);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1933,8 +1956,12 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_cg1_acc), "r"(_mma_b_lo_5), "r"(tmem_tmem_shared_input), "r"(0) : "memory");
+                    :: "r"(tmem_tmem_cg1_acc), "r"(_mma_b_lo_5), "r"(tmem_tmem_shared_input + 0), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_6 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x7FFF) + (ainv_stage_state) * 512);
+#else
+                    int _mma_b_lo_6 = make_warp_uniform((((smem_ainv_addr) >> 4) & 0x3FFF) + (ainv_stage_state) * 512);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1971,7 +1998,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     mbarrier_wait(qk_ready_addr + (qk_stage_state) * 8, _phase_qk_ready);
                     mbarrier_wait(nv_ready_addr, _phase_nv_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_7_0 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x7FFF) + (qk_stage_state) * 512);
+#else
+                    int _mma_b_lo_7_0 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x3FFF) + (qk_stage_state) * 512);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2000,8 +2031,12 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_7_0), "r"(tmem_tmem_shared_input), "r"(1) : "memory");
+                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_7_0), "r"(tmem_tmem_shared_input + 0), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_7_1 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x7FFF) + (qk_stage_state) * 512);
+#else
+                    int _mma_b_lo_7_1 = make_warp_uniform((((smem_qk_addr) >> 4) & 0x3FFF) + (qk_stage_state) * 512);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2031,7 +2066,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_7_1), "r"(tmem_tmem_shared_input + 32), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_9 = make_warp_uniform((((smem_qk_residual_addr) >> 4) & 0x7FFF) + (qk_stage_state) * 1024);
+#else
+                    int _mma_b_lo_9 = make_warp_uniform((((smem_qk_residual_addr) >> 4) & 0x3FFF) + (qk_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2060,8 +2099,12 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_9), "r"(tmem_tmem_shared_input), "r"(1) : "memory");
+                    :: "r"(tmem_tmem_q_state), "r"(_mma_b_lo_9), "r"(tmem_tmem_shared_input + 0), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_10 = make_warp_uniform((((smem_qk_residual_addr) >> 4) & 0x7FFF) + (qk_stage_state) * 1024);
+#else
+                    int _mma_b_lo_10 = make_warp_uniform((((smem_qk_residual_addr) >> 4) & 0x3FFF) + (qk_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2096,7 +2139,11 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     mbarrier_wait(kv_acc_empty_addr, _phase_kv_acc_empty);
                     mbarrier_wait(decay_v_ready_addr, _phase_decay_v_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_11 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x7FFF) | 0x2000000) + (k_stage_state) * 1024);
+#else
+                    int _mma_b_lo_11 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2125,8 +2172,12 @@ kernel_cake_gdn_cp_2c852810c51f7fad275f(const __grid_constant__ CUtensorMap Q, c
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_state), "r"(_mma_b_lo_11), "r"(tmem_tmem_shared_input), "r"(1) : "memory");
+                    :: "r"(tmem_tmem_state), "r"(_mma_b_lo_11), "r"(tmem_tmem_shared_input + 0), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                     int _mma_b_lo_12 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x7FFF) | 0x2000000) + (k_stage_state) * 1024);
+#else
+                    int _mma_b_lo_12 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_state) * 1024);
+#endif
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

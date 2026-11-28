@@ -155,7 +155,7 @@ kernel_cake_gdn_cp_d81377210e8e2b8b1f0b(const __grid_constant__ CUtensorMap K, f
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 128);
     const int smem_k_addr = smem + 128;
     __half* smem_inverse = reinterpret_cast<__half*>(smem_raw + 16512);
@@ -163,8 +163,7 @@ kernel_cake_gdn_cp_d81377210e8e2b8b1f0b(const __grid_constant__ CUtensorMap K, f
     float* smem_beta = reinterpret_cast<float*>(smem_raw + 24704);
     const int smem_beta_addr = smem + 24704;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 4 barriers)
-    // Mbarriers at smem_raw[0..32)
+    // Mbarrier init (4 barriers at smem_raw[0..32))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -298,8 +297,8 @@ kernel_cake_gdn_cp_d81377210e8e2b8b1f0b(const __grid_constant__ CUtensorMap K, f
                     : "+f"((gram_acc + acc_base)[0]), "+f"((gram_acc + acc_base)[1]), "+f"((gram_acc + acc_base)[2]), "+f"((gram_acc + acc_base)[3])
                     : "r"((gram_a + mma_d_2 * 4)[0]), "r"((gram_a + mma_d_2 * 4)[1]), "r"((gram_a + mma_d_2 * 4)[2]), "r"((gram_a + mma_d_2 * 4)[3]), "r"((gram_b + b_lo_base_1)[0]), "r"((gram_b + b_lo_base_1)[1]));
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                    : "+f"((gram_acc + acc_base + 4)[0]), "+f"((gram_acc + acc_base + 4)[1]), "+f"((gram_acc + acc_base + 4)[2]), "+f"((gram_acc + acc_base + 4)[3])
-                    : "r"((gram_a + mma_d_2 * 4)[0]), "r"((gram_a + mma_d_2 * 4)[1]), "r"((gram_a + mma_d_2 * 4)[2]), "r"((gram_a + mma_d_2 * 4)[3]), "r"((gram_b + b_lo_base_1 + 8)[0]), "r"((gram_b + b_lo_base_1 + 8)[1]));
+                    : "+f"((gram_acc + (acc_base + 4))[0]), "+f"((gram_acc + (acc_base + 4))[1]), "+f"((gram_acc + (acc_base + 4))[2]), "+f"((gram_acc + (acc_base + 4))[3])
+                    : "r"((gram_a + mma_d_2 * 4)[0]), "r"((gram_a + mma_d_2 * 4)[1]), "r"((gram_a + mma_d_2 * 4)[2]), "r"((gram_a + mma_d_2 * 4)[3]), "r"((gram_b + (b_lo_base_1 + 8))[0]), "r"((gram_b + (b_lo_base_1 + 8))[1]));
             }
         }
         #pragma unroll
@@ -711,7 +710,7 @@ kernel_cake_gdn_cp_d81377210e8e2b8b1f0b(const __grid_constant__ CUtensorMap K, f
         unsigned int final_words[4];
         float final_values[8];
         int final_row_base = warp * 16;
-        long long t_head_base = ((long long)t_block * (long long)num_sab_heads + (long long)sab_head) * 4096;
+        long long t_head_base = ((long long)t_block * (long long)num_sab_heads + (long long)sab_head) * 4096ll;
         #pragma unroll
         for (int final_n = 0; final_n < 4; final_n++) {
             int final_col_base = final_n * 16;
@@ -767,14 +766,14 @@ kernel_cake_gdn_cp_d81377210e8e2b8b1f0b(const __grid_constant__ CUtensorMap K, f
             if (final_r1 < valid_len && valid_len > final_c0 + 9) {
                 out7 = -1.0f * smem_beta[final_c0 + 9] * final_values[7];
             }
-            t[t_head_base + (long long)final_c0 * 64 + (long long)final_r0] = out0;
-            t[t_head_base + (long long)(final_c0 + 1) * 64 + (long long)final_r0] = out1;
-            t[t_head_base + (long long)final_c0 * 64 + (long long)final_r1] = out2;
-            t[t_head_base + (long long)(final_c0 + 1) * 64 + (long long)final_r1] = out3;
-            t[t_head_base + (long long)(final_c0 + 8) * 64 + (long long)final_r0] = out4;
-            t[t_head_base + (long long)(final_c0 + 9) * 64 + (long long)final_r0] = out5;
-            t[t_head_base + (long long)(final_c0 + 8) * 64 + (long long)final_r1] = out6;
-            t[t_head_base + (long long)(final_c0 + 9) * 64 + (long long)final_r1] = out7;
+            t[t_head_base + (long long)final_c0 * 64ll + (long long)final_r0] = out0;
+            t[t_head_base + (long long)(final_c0 + 1) * 64ll + (long long)final_r0] = out1;
+            t[t_head_base + (long long)final_c0 * 64ll + (long long)final_r1] = out2;
+            t[t_head_base + (long long)(final_c0 + 1) * 64ll + (long long)final_r1] = out3;
+            t[t_head_base + (long long)(final_c0 + 8) * 64ll + (long long)final_r0] = out4;
+            t[t_head_base + (long long)(final_c0 + 9) * 64ll + (long long)final_r0] = out5;
+            t[t_head_base + (long long)(final_c0 + 8) * 64ll + (long long)final_r1] = out6;
+            t[t_head_base + (long long)(final_c0 + 9) * 64ll + (long long)final_r1] = out7;
         }
         mbarrier_arrive(beta_empty_addr);
     }

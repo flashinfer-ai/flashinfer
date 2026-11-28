@@ -105,8 +105,8 @@ kernel_cake_gdn_cp_958182c9f509a6b30425(float* __restrict__ local_transfer, floa
     }
     int chunk_head_linear = chunk_start * num_heads + head_idx;
     int state_head_linear = seq_idx * num_heads + head_idx;
-    long long chunk_head_base = (long long)chunk_head_linear * 16384;
-    long long state_head_base = (long long)state_head_linear * 16384;
+    long long chunk_head_base = (long long)chunk_head_linear * 16384ll;
+    long long state_head_base = (long long)state_head_linear * 16384ll;
     __syncthreads();
     float r_acc[7];
     float r_acc_next[7];
@@ -143,9 +143,9 @@ kernel_cake_gdn_cp_958182c9f509a6b30425(float* __restrict__ local_transfer, floa
     for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
         int next_chunk_idx = chunk_idx + 1;
         int current_chunk_head_linear = (chunk_start + chunk_idx) * num_heads + head_idx;
-        long long current_chunk_head_base = (long long)current_chunk_head_linear * 16384;
+        long long current_chunk_head_base = (long long)current_chunk_head_linear * 16384ll;
         int next_chunk_head_linear = (chunk_start + next_chunk_idx) * num_heads + head_idx;
-        long long next_chunk_head_base = (long long)next_chunk_head_linear * 16384;
+        long long next_chunk_head_base = (long long)next_chunk_head_linear * 16384ll;
         int state_read = (chunk_idx & 1) * 896;
         int state_write = state_read ^ 896;
         #pragma unroll
@@ -236,7 +236,7 @@ kernel_cake_gdn_cp_958182c9f509a6b30425(float* __restrict__ local_transfer, floa
     #pragma unroll 1
     for (int gap_idx = gap_start; gap_idx < gap_end; gap_idx++) {
         int gap_head_linear = gap_idx * num_heads + head_idx;
-        long long gap_head_base = (long long)gap_head_linear * 16384;
+        long long gap_head_base = (long long)gap_head_linear * 16384ll;
         #pragma unroll
         for (int row_in_cta_9 = 0; row_in_cta_9 < 7; row_in_cta_9++) {
             int _min_5 = ((row_base + row_in_cta_9) < (127) ? (row_base + row_in_cta_9) : (127));
