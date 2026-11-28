@@ -577,8 +577,9 @@ _CUTILE_SUPPORTED_ACTIVATIONS = (
 )
 
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
-# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
-_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121. SM8x runs
+# ``sm8x_fp8_moe``.
+_CUTLASS_NVFP4_ARCHS = (80, 86, 87, 89, 100, 103, 107, 110, 120, 121)
 
 # Per-tensor FP8 follows the dense CUTLASS architecture list; SM80/86/87, which
 # the CUTLASS module has no FP8 kernel for, run ``sm8x_fp8_moe``.

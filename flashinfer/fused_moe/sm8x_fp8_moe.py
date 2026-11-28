@@ -403,6 +403,102 @@ class Sm8xFrostMxfp8Mxfp4MoE(Sm8xCutlassMxfp8Mxfp4MoE):
     _gemm2_alpha_input = 8
 
 
+class Sm8xCutlassNvfp4MoE(_Sm8xCutlassMoEBase, _CudnnGroupedGemmBlockScaleRunnerBase):
+    """``CutlassNvfp4Runner`` on SM8x: packed E2M1 activations with linear E4M3
+    16-element block scales, packed E2M1 weights with per-expert 128x4-swizzled E4M3
+    scales. ``fc1_dequant`` and ``fc2_dequant`` are the two GEMMs' per-expert alphas;
+    the BF16 activation output is NVFP4-quantized with ``fc2_act_global_scale`` (one
+    value, or one per expert). Inputs: ``[hidden, ids, weights, w1, w2, w1_scale,
+    w2_scale, fc1_dequant, fc2_dequant, fc2_act_global_scale, hidden_states_scale,
+    out]``."""
+
+    backend_key = "cutlass_nvfp4"
+    _supported_archs = (80, 86, 87, 89)
+    _x_dtype = torch.uint8
+    _weight_dtype = torch.int64
+    _k_pack = 2
+    _expected_num_inputs = 11
+    _gemm1_alpha_input = 7
+    _gemm2_alpha_input = 8
+    _fc2_act_global_input = 9
+    _block_size = 16
+    _block_scale_dtype = torch.float8_e4m3fn
+    # GEMM2's K in whole 16-byte E2M1 rows: the CUTLASS grouped GEMMs' 128-bit
+    # operand alignment.
+    _intermediate_alignment = 32
+
+    def _body_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        # CUTLASS: [out, hidden, ids, weights, w1, w2, fc1_act_global, w1_scale,
+        # fc1_dequant, fc2_act_global, w2_scale, fc2_dequant, hidden_states_scale].
+        # GEMM1 reads the pre-quantized activations, so fc1_act_global is unused.
+        return [
+            *inputs[1:6],
+            inputs[7],
+            inputs[10],
+            inputs[8],
+            inputs[11],
+            inputs[9],
+            inputs[12].view(torch.float8_e4m3fn),
+            inputs[0],
+        ]
+
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        # CUTLASS NVFP4 rows are whole 4-column scale tiles (hidden_size % 64), so
+        # the swizzled permuted scales keep the row-major size.
+        num_tokens, hidden_size = _CudnnGroupedGemmRunnerBase._validate_hidden_states(
+            self, hidden_states
+        )
+        if hidden_size % 64:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_size divisible by 64, "
+                f"got {hidden_size}."
+            )
+        return num_tokens, hidden_size
+
+    def _gemm1(self, inputs, layout, workspace, tactic) -> torch.Tensor:
+        assert workspace.permuted_hidden_states_scale is not None
+        return sm8x_grouped_mm_fp4(
+            workspace.permuted_hidden_states,
+            inputs[3].view(torch.uint8),
+            workspace.permuted_hidden_states_scale,
+            inputs[5],
+            layout.m_indptr,
+            inputs[self._gemm1_alpha_input],
+            torch.bfloat16,
+            workspace.gemm1_out,
+            16,
+        )
+
+    def _gemm2(self, inputs, layout, workspace, intermediate, tactic) -> torch.Tensor:
+        from ..quantization.fp4_quantization import fp4_quantize
+
+        global_scale = inputs[self._fc2_act_global_input]
+        if global_scale.ndim == 0:
+            global_scale = global_scale.reshape(1)
+        else:  # one per local expert
+            row_expert = layout.row_expert(intermediate.shape[0])
+            global_scale = global_scale.index_select(0, row_expert)
+        quantized, scale = fp4_quantize(
+            intermediate,
+            global_scale,
+            16,
+            False,
+            True,
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
+        )
+        return sm8x_grouped_mm_fp4(
+            quantized.view(torch.uint8),
+            inputs[4].view(torch.uint8),
+            scale,
+            inputs[6],
+            layout.m_indptr,
+            inputs[self._gemm2_alpha_input],
+            torch.bfloat16,
+            None,
+            16,
+        )
+
+
 def _route_repeated_experts(
     layout: _GroupedGemmLayout, topk_ids: torch.Tensor
 ) -> _GroupedGemmLayout:
