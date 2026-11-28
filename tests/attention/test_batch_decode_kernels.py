@@ -773,6 +773,73 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("num_empty_requests", [3, 31])
+def test_cuda_graph_batch_decode_empty_requests_before_long_request(
+    num_empty_requests,
+):
+    # Requests with no KV pages, followed by one long request. The CUDA-core
+    # planner must count every empty request as one chunk when it picks the KV
+    # chunk size; otherwise the long request's last chunks fall outside the
+    # CUDA-graph grid and are never computed.
+    page_size, num_qo_heads, num_kv_heads, head_dim = 16, 32, 8, 128
+    dtype = torch.float16
+    batch_size = num_empty_requests + 1
+    num_pages = 65536 // page_size
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=dtype)
+    kv_data = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, device="cuda:0", dtype=dtype
+    )
+    # Shift V on the last quarter of the sequence so a dropped tail is visible.
+    kv_data[num_pages * 3 // 4 :, 1] += 1.0
+    kv_indptr = torch.tensor(
+        [0] * batch_size + [num_pages], device="cuda:0", dtype=torch.int32
+    )
+    kv_indices = torch.arange(num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.tensor(
+        [0] * num_empty_requests + [page_size], device="cuda:0", dtype=torch.int32
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=False,
+        paged_kv_indptr_buffer=torch.empty_like(kv_indptr),
+        paged_kv_indices_buffer=torch.empty_like(kv_indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(kv_last_page_len),
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        o = wrapper.run(q, kv_data)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        o = wrapper.run(q, kv_data, out=o)
+    o.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+
+    o_ref = flashinfer.decode.single_decode_with_kv_cache(
+        q[-1],
+        kv_data[:, 0].reshape(-1, num_kv_heads, head_dim),
+        kv_data[:, 1].reshape(-1, num_kv_heads, head_dim),
+    )
+    torch.testing.assert_close(o[-1], o_ref, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
