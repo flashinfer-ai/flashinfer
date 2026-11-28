@@ -382,6 +382,13 @@ struct TllmGenFmhaRunnerParams {
   // [numHeadsKv, batchSize, maxNumPagesPerSeqKv] (shared paged-KV index layout), where the
   // selected sparse pages are packed densely at the front of each row.
   bool mUseBlockSparseAttention;
+  // Config batch size (0 = off): choose the kernel and the CTA grid as if the batch had
+  // mConfigBatchSize requests, then launch that grid over all mBatchSize requests (grid Z =
+  // mBatchSize). For one-token generation, every request then gets exactly the kernel, KV split
+  // and reduction of a launch of mConfigBatchSize requests, so one launch reproduces a loop of
+  // such launches bit for bit. Used only for non-MLA generation kernels with maxSeqLenQ == 1 and
+  // mBatchSize > mConfigBatchSize.
+  int mConfigBatchSize;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

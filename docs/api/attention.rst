@@ -57,6 +57,7 @@ Batch Decoding
 
     cudnn_batch_decode_with_kv_cache
     trtllm_batch_decode_with_kv_cache
+    trtllm_fmha_set_config_batch
     xqa_batch_decode_with_kv_cache
 
 DCP Speculative Decode Workspace
