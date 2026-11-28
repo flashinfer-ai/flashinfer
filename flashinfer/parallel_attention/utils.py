@@ -42,10 +42,10 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
 
     Given a tensor whose sequence dimension is the concatenation of multiple
     sub-sequences, split each sub-sequence into ``world_size`` chunks and return
-    the ``rank``-th chunk concatenated together. The first ``world_size - 1``
-    ranks each get ``ceil(seq_len / world_size)`` tokens per sub-sequence;
-    the last rank gets the remainder. The result is zero-padded so that all
-    ranks have the same total sequence length.
+    the ``rank``-th chunk concatenated together. Each rank gets up to
+    ``ceil(seq_len / world_size)`` tokens per sub-sequence; ranks beyond the
+    end of a short sub-sequence get an empty chunk. The result is zero-padded
+    so that all ranks have the same total sequence length.
 
     Args:
         tensor: Input tensor of shape ``[H, total_seq_len, D]`` (HND) or
@@ -79,16 +79,14 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
     offset = 0
     for seq_len in seq_len_list:
         seq_len = int(seq_len)
-        # First (world_size - 1) ranks get ceil(seq_len / world_size),
-        # last rank gets whatever is left.
         base = (seq_len + world_size - 1) // world_size
-        if rank < world_size - 1:
-            chunk_len = base
-            start = offset + base * rank
-        else:
-            # Last rank gets the remainder
-            start = offset + base * (world_size - 1)
-            chunk_len = seq_len - base * (world_size - 1)
+        # When a sequence is shorter than ``world_size``, ranks beyond its
+        # extent own an empty chunk. Clamp the relative start so even a
+        # zero-length ``narrow`` begins at the end of the sequence rather than
+        # past the packed tensor.
+        relative_start = min(base * rank, seq_len)
+        start = offset + relative_start
+        chunk_len = min(base, seq_len - relative_start)
 
         chunks.append(tensor.narrow(chunk_dim, start, chunk_len))
         offset += seq_len
@@ -169,12 +167,11 @@ def ring_varlen_config(seq_lens_q, seq_lens_kv, ring_group):
     split along the sequence dimension across ring ranks. Each rank holds a
     chunk of every sequence, so ``cu_seqlens`` are stored as a 2-D tensor of
     shape ``[ring_size, num_seqs + 1]`` — one row per rank — because each
-    rank's chunk has different per-sequence lengths (the last rank gets the
-    remainder after padding).
+    rank's chunk can have different per-sequence lengths.
 
-    Sequences are padded to be divisible by ``ring_size`` so that the first
-    ``ring_size - 1`` ranks each get ``ceil(seq_len / ring_size)`` tokens per
-    sequence, and the last rank gets the remainder.
+    Each rank gets up to ``ceil(seq_len / ring_size)`` tokens per sequence,
+    matching ``split_varlen_input``. Ranks beyond a sequence's end have zero
+    length; padding in the local tensor is not included in ``cu_seqlens``.
 
     Args:
         seq_lens_q: Per-sequence query lengths, e.g. ``[1021, 1024, 1027]``.
@@ -238,16 +235,14 @@ def ring_varlen_config(seq_lens_q, seq_lens_kv, ring_group):
     cu_seqlens_kv_all_ranks = []
 
     for i in range(world_size):
-        if i == world_size - 1:
-            seq_len_q_cur_rank = padded_seq_len_q_cur_rank - (
-                padded_seq_lens_q - seq_lens_q
-            )
-            seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank - (
-                padded_seq_lens_kv - seq_lens_kv
-            )
-        else:
-            seq_len_q_cur_rank = padded_seq_len_q_cur_rank
-            seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank
+        seq_len_q_cur_rank = torch.minimum(
+            padded_seq_len_q_cur_rank,
+            (seq_lens_q - i * padded_seq_len_q_cur_rank).clamp(min=0),
+        )
+        seq_len_kv_cur_rank = torch.minimum(
+            padded_seq_len_kv_cur_rank,
+            (seq_lens_kv - i * padded_seq_len_kv_cur_rank).clamp(min=0),
+        )
 
         cu_seqlens_q = (
             torch.cat(
