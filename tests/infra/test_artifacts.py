@@ -1,8 +1,10 @@
 import hashlib
 import logging
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier, local
+from threading import Barrier, Event, local
 
 from flashinfer.artifacts import (
     ArtifactPath,
@@ -12,6 +14,7 @@ from flashinfer.artifacts import (
 )
 
 import pytest
+import requests
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
@@ -81,6 +84,101 @@ def test_get_artifact_reuses_empty_cache(
     monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
 
     assert cubin_loader.get_artifact("empty.h", hashlib.sha256(b"").hexdigest()) == b""
+
+
+def _race_get_artifact(monkeypatch, tmp_path, lock_timeout_seconds, hold_seconds):
+    """Run a writer that holds the download lock for ``hold_seconds`` while a
+    reader misses the cache; return each one's result and the reader's wait."""
+    content = b"#pragma once\n"
+    checksum = hashlib.sha256(content).hexdigest()
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://example.test/"
+    )
+    monkeypatch.setattr(
+        cubin_loader, "DOWNLOAD_LOCK_TIMEOUT_SECONDS", lock_timeout_seconds
+    )
+    monkeypatch.delenv("FLASHINFER_NO_DOWNLOAD", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+
+    real_file_lock = cubin_loader.filelock.FileLock
+    reader_waiting = Event()
+
+    def signalling_lock(path, timeout=-1, **kwargs):
+        if threading.current_thread().name == "reader":
+            reader_waiting.set()
+        return real_file_lock(path, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(cubin_loader.filelock, "FileLock", signalling_lock)
+
+    in_download = Event()
+    finish_download = Event()
+
+    class BlockingSession:
+        def get(self, url, timeout=None):
+            in_download.set()
+            assert finish_download.wait(30)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = content
+            return response
+
+    class NoDownloadSession:
+        def get(self, url, timeout=None):
+            raise AssertionError("waiter must reuse the holder's download")
+
+    results = {}
+    reader_wait = {}
+
+    def fetch(name, session):
+        begin = time.monotonic()
+        results[name] = cubin_loader.get_artifact("header.h", checksum, session)
+        reader_wait[name] = time.monotonic() - begin
+
+    writer = threading.Thread(target=fetch, args=("writer", BlockingSession()))
+    writer.start()
+    assert in_download.wait(10)
+    reader = threading.Thread(
+        target=fetch, args=("reader", NoDownloadSession()), name="reader"
+    )
+    reader.start()
+    assert reader_waiting.wait(10)
+    reader.join(hold_seconds)
+    finish_download.set()
+    writer.join(30)
+    reader.join(30)
+    assert not reader.is_alive()
+    return content, results, reader_wait["reader"]
+
+
+def test_get_artifact_waits_for_slow_concurrent_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that misses the cache while another downloads must get the file.
+
+    Reproduces the flashinferMetaInfo.h failure of
+    test_gen_module_symlink_race_condition: the download holding the lock took
+    longer than the waiters' lock timeout, so they gave up and found no file.
+    """
+    content, results, _ = _race_get_artifact(
+        monkeypatch, tmp_path, lock_timeout_seconds=10.0, hold_seconds=0.5
+    )
+    assert results == {"writer": content, "reader": content}
+
+
+def test_get_artifact_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder stuck past the lock timeout makes the waiter fail, not hang."""
+    content, results, reader_wait = _race_get_artifact(
+        monkeypatch, tmp_path, lock_timeout_seconds=0.2, hold_seconds=5.0
+    )
+    assert results == {"writer": content, "reader": b""}
+    assert reader_wait < 5.0
+
+
+def test_download_lock_timeout_default_is_bounded() -> None:
+    assert 300 <= cubin_loader.DOWNLOAD_LOCK_TIMEOUT_SECONDS < float("inf")
 
 
 def test_sanity_check_urllib_behavior():
