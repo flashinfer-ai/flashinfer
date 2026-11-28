@@ -37,6 +37,8 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...helpers.sparse_indices import cache_sparse_source_lengths
 from ...helpers.nvfp4_kv import (
+    begin_raw_load,
+    gather_fp8_tile,
     publish_nvfp4_kv,
     source_is_fp8,
     load_nvfp4_panel,
@@ -815,6 +817,7 @@ class SmemPageOffsetsResource(MlaResource):
                 cta_idx_q,
                 self.cu_seqlens_q,
                 batch_idx,
+                cp_rank=self.cp_rank,
             )
             local_tile_idx = local_kv_tile_idx(
                 cfg,
@@ -928,22 +931,41 @@ class SmemPageOffsetsResource(MlaResource):
                         destinations += (
                             target._smem_kv.data_ptr(target.kv_stage_offset(slot)),
                         )
-                record_bytes = Int32(cfg.nvfp4_row_bytes)
-                if source_is_fp8(cfg, raw[0] < Int32(0)):
-                    record_bytes = Int32(512)
-                issue_whole_record(
-                    destinations[0],
-                    target._nv_barriers.data_ptr(
-                        stage_info.stage_idx & Int32(1)
-                        if cfg.single_raw_prefetch
-                        else stage_info.stage_idx
-                    ),
-                    raw,
-                    target.tma_desc_c_latent,
-                    target.tma_desc_c_rope,
-                    issuer=issuer,
-                    row_bytes=record_bytes,
+                raw_full = target._nv_barriers.data_ptr(
+                    stage_info.stage_idx & Int32(1)
+                    if cfg.single_raw_prefetch
+                    else stage_info.stage_idx
                 )
+                fp8_tile = source_is_fp8(cfg, raw[0] < Int32(0))
+                if cutlass.const_expr(cfg.tma_fp8_primary_tiles):
+                    if fp8_tile:
+                        # The loaders gather this tile straight into its retained
+                        # stage. Its raw slot carries no bytes but keeps the
+                        # ring's epochs: arrive without a transaction.
+                        begin_raw_load(raw_full, Int32(0))
+                    else:
+                        issue_whole_record(
+                            destinations[0],
+                            raw_full,
+                            raw,
+                            target.tma_desc_c_latent,
+                            target.tma_desc_c_rope,
+                            issuer=issuer,
+                            row_bytes=Int32(cfg.nvfp4_row_bytes),
+                        )
+                else:
+                    record_bytes = Int32(cfg.nvfp4_row_bytes)
+                    if fp8_tile:
+                        record_bytes = Int32(512)
+                    issue_whole_record(
+                        destinations[0],
+                        raw_full,
+                        raw,
+                        target.tma_desc_c_latent,
+                        target.tma_desc_c_rope,
+                        issuer=issuer,
+                        row_bytes=record_bytes,
+                    )
             return
         for fragment in cutlass.range_constexpr((cfg.pages_per_kv_tile + 31) // 32):
             fragment_lane = lane_idx + Int32(fragment * 32)
@@ -957,6 +979,7 @@ class SmemPageOffsetsResource(MlaResource):
                     cta_idx_q,
                     self.cu_seqlens_q,
                     batch_idx,
+                    cp_rank=self.cp_rank,
                 )
                 local_tile_idx = local_kv_tile_idx(
                     cfg,
@@ -996,9 +1019,19 @@ class SmemPageOffsetsResource(MlaResource):
                     3,
                     cutlass.Int32,
                 )
-                prims.cp_async_shared_global(
-                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-                )
+                if cutlass.const_expr(cfg.cp_world > 1):
+                    if seq_len_kv == Int32(0):
+                        # An empty rank need not own any valid physical pages.
+                        # A negative page selects TMA's out-of-bounds zero fill.
+                        self._smem_page_offsets.data_ptr(smem_offset).store(Int32(-1))
+                    else:
+                        prims.cp_async_shared_global(
+                            smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                        )
+                else:
+                    prims.cp_async_shared_global(
+                        smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                    )
 
     @producer_work
     @cute.jit
@@ -1471,6 +1504,30 @@ class SmemKvResource(MlaResource):
             )
 
     @cute.jit
+    def _tma_fp8_tile(self, cached_page_ids, page_id_slot):
+        """Whether this tile's rows are FP8 primary rows gathered straight into its stage."""
+        cfg = self.cfg
+        if cutlass.const_expr(not cfg.tma_fp8_primary_tiles):
+            return cutlass.Boolean(False)
+        return source_is_fp8(
+            cfg, cached_page_ids[page_id_slot * cfg.sparse_cache_words] < Int32(0)
+        )
+
+    @cute.jit
+    def _gather_fp8_tile(self, dst, stage_info, cached_page_ids, page_id_slot, warp):
+        """Gather this warp's rows of an FP8 primary tile into the four retained panels."""
+        cfg = self.cfg
+        gather_fp8_tile(
+            dst,
+            self.tma_desc_v,
+            stage_info.barrier,
+            cached_page_ids,
+            page_id_slot * cfg.sparse_cache_words,
+            warp,
+            rows=cfg.tile_size_kv // cfg.load_num_warps,
+        )
+
+    @cute.jit
     def _raw_record_view(self, cached_page_ids, page_id_slot):
         """Return (raw-full barrier, parity, raw buffer, raw-empty barrier) for a tile."""
         cfg = self.cfg
@@ -1503,20 +1560,23 @@ class SmemKvResource(MlaResource):
         step only converts and stores the register snapshot.
         """
         cfg = self.cfg
-        assert cfg.early_raw_snapshot and cfg.kv_cache_format != "fp8"
+        assert cfg.early_raw_snapshot and (
+            cfg.kv_cache_format != "fp8" or cfg.tma_fp8_primary_tiles
+        )
         raw_full, raw_phase, raw, raw_empty = self._raw_record_view(
             cached_page_ids, page_id_slot
         )
         while not prims.mbarrier_try_wait_parity(raw_full, raw_phase):
             pass
-        snapshot_nvfp4_record(
-            raw,
-            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-            self._nv_packed,
-            self._nv_scales,
-            self._nv_rope,
-            rope_dim=cfg.rope_dim,
-        )
+        if not self._tma_fp8_tile(cached_page_ids, page_id_slot):
+            snapshot_nvfp4_record(
+                raw,
+                cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                self._nv_packed,
+                self._nv_scales,
+                self._nv_rope,
+                rope_dim=cfg.rope_dim,
+            )
         release_raw_record(raw_empty)
 
     @cute.jit
@@ -1576,15 +1636,24 @@ class SmemKvResource(MlaResource):
                 if cutlass.const_expr(cfg.early_raw_snapshot):
                     # snapshot_raw_record already waited, read and released
                     # this tile's raw slot before the KV acquire.
-                    store_nvfp4_record(
-                        destinations[0],
-                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-                        self._nv_packed,
-                        self._nv_scales,
-                        self._nv_rope,
-                        stage_bytes=cfg.kv_smem_tile_bytes,
-                        rope_dim=cfg.rope_dim,
-                    )
+                    if self._tma_fp8_tile(cached_page_ids, page_id_slot):
+                        self._gather_fp8_tile(
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
+                        )
+                    else:
+                        store_nvfp4_record(
+                            destinations[0],
+                            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                            self._nv_packed,
+                            self._nv_scales,
+                            self._nv_rope,
+                            stage_bytes=cfg.kv_smem_tile_bytes,
+                            rope_dim=cfg.rope_dim,
+                        )
                 else:
                     # The metadata warp issues gathers independently, so
                     # all eight original load warps can convert in parallel.
@@ -1596,7 +1665,17 @@ class SmemKvResource(MlaResource):
                         _, _, raw_ptr, raw_empty = self._raw_record_view(
                             cached_page_ids, page_id_slot
                         )
-                    if source_is_fp8(
+                    if self._tma_fp8_tile(cached_page_ids, page_id_slot):
+                        # The raw slot carried no bytes for this tile.
+                        release_raw_record(raw_empty)
+                        self._gather_fp8_tile(
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
+                        )
+                    elif source_is_fp8(
                         cfg,
                         cached_page_ids[page_id_slot * cfg.sparse_cache_words]
                         < Int32(0),
@@ -1757,6 +1836,7 @@ class SmemKvResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         tile_idx = global_kv_tile_idx(
             cfg,
@@ -1847,15 +1927,20 @@ class SmemKvResource(MlaResource):
                     is_v=is_v,
                     active_width=active_width,
                 )
-                publish_nvfp4_kv(
-                    stage_info.barrier,
-                    (
-                        cfg.whole_kv_tile_bytes
-                        if cfg.whole_kv_tile
-                        else cfg.kv_smem_tile_bytes
+                # Gathered FP8 primary tiles complete their bytes through TMA.
+                if not (
+                    qk_stage_idx == 0
+                    and self._tma_fp8_tile(cached_page_ids, page_id_slot)
+                ):
+                    publish_nvfp4_kv(
+                        stage_info.barrier,
+                        (
+                            cfg.whole_kv_tile_bytes
+                            if cfg.whole_kv_tile
+                            else cfg.kv_smem_tile_bytes
+                        )
+                        // cfg.load_num_warps,
                     )
-                    // cfg.load_num_warps,
-                )
                 return
             if cutlass.const_expr(
                 not is_v and active_width == 64 and cfg.rope_dim == 64
@@ -2011,7 +2096,14 @@ class SmemKvResource(MlaResource):
                         tile_idx * Int32(pages_per_tile) + Int32(page_frag),
                         last_valid_page,
                     )
-                    page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
+                    if cutlass.const_expr(cfg.cp_world > 1):
+                        page_id = Int32(-1)
+                        if seq_len_kv > Int32(0):
+                            page_id = Int32(
+                                self.page_offsets[logical_page_idx, batch_idx]
+                            )
+                    else:
+                        page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
                 page_base = Int32(page_frag * first_page_elems)
                 smem_page_offset = page_base
                 if prims.elect_sync():

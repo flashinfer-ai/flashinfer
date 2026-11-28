@@ -23,7 +23,7 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
 from .spec import (
@@ -121,7 +121,7 @@ def register_capacity(family: str, sm_count: int, size: int, clusters: int) -> N
     if cap.get(size) == clusters:
         return  # nothing the ranking depends on changed: the cached rankings stay
     cap[size] = clusters
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # the L2 sizes devices reported at run time, keyed like the capacities
@@ -144,7 +144,7 @@ def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
     if _QUERIED_L2.get((family, sm_count)) == float(l2_bytes):
         return  # unchanged: the cached rankings stay
     _QUERIED_L2[(family, sm_count)] = float(l2_bytes)
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # ----------------------------------------------------------------------------- the estimate
@@ -278,9 +278,12 @@ def estimate_cycles(
     out_bytes: int = 2,
     c: Optional[Dict[str, float]] = None,
     nominal: bool = False,
+    epi_tile_cycles: float = 0.0,
 ) -> float:
     """SM-cycles of the launch for record ``k`` at the shape: waves of CTA tiles over the part's co-resident cluster
-    capacity, each the slower of its MMA and its L2 -> SMEM traffic per k-step plus a floor, bounded below by the shared
+    capacity, each the slower of its MMA and its L2 -> SMEM traffic per k-step plus a floor -- and no shorter than
+    ``epi_tile_cycles``, a caller's per-tile epilogue work (the accumulator stages overlap a tile's epilogue with the next
+    tile's mainloop, so a tile costs the longer of the two; 0 for the dense bodies) -- bounded below by the shared
     L2 fabric and by the operands' HBM bytes, plus the stall of the bytes the scheduler's tile order fetches again
     (`hbm_traffic`) beyond what the body's duration streams unnoticed, the epilogue and (workspace split) the fixup;
     raster, swizzle and 2-CTA adjustments multiply. ``b_major`` does not enter the estimate (the narrow-tile cost is
@@ -368,7 +371,7 @@ def estimate_cycles(
             )
             + p["step_floor"]
         )
-    body = waves * ksteps * step
+    body = waves * max(ksteps * step, epi_tile_cycles)
     active = ctas_m * n_tiles * items * k.cluster_k
     l2_total = (
         active
@@ -508,6 +511,27 @@ def rank(
     scored.sort(key=lambda t: (t[0], t[1]))
     out = tuple((k, float(t)) for t, _, k in scored)
     return out[:topk] if topk else out
+
+
+# the memos built on a ranking (`schedule.default_config`'s pick, `schedule.rank_topk`'s list) are cleared with it, so a
+# device's registered numbers invalidate them the way they invalidate the rankings
+_RANK_DEPENDENT_CACHES: List[Callable[[], None]] = []
+_rank_cache_clear = rank.cache_clear
+
+
+def clear_rank_cache() -> None:
+    """Forget every cached ranking and every memo built on one."""
+    _rank_cache_clear()
+    for clear in _RANK_DEPENDENT_CACHES:
+        clear()
+
+
+def on_rank_cache_clear(clear: Callable[[], None]) -> None:
+    """Register a memo's ``cache_clear`` to run whenever the rankings are forgotten (``rank.cache_clear()`` included)."""
+    _RANK_DEPENDENT_CACHES.append(clear)
+
+
+rank.cache_clear = clear_rank_cache  # type: ignore[method-assign]
 
 
 def best_record(

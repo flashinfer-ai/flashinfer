@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass.cute as cute
 
+from flashinfer import cake_sage_block_sparse_attention_backend as _cake_backend
 from flashinfer.api_logging import flashinfer_api
 
 from .bsa_utils.cache_utils import get_jit_cache
@@ -71,7 +72,8 @@ def bsa_attn_sm100_blk64_fwd(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Forward pass for BSA block-sparse attention using the blk64 CuTe-DSL kernel.
 
-    Supports SM100 and SM103. MHA only (num_kv_heads must equal num_heads);
+    Supports SM100 and SM103. The CuTe-DSL backend is MHA only
+    (num_kv_heads must equal num_heads);
     head_dim must be 128.
 
     Args:
@@ -158,13 +160,9 @@ def bsa_attn_sm100_blk64_fwd(
         )
         fake = False
     if use_cake:
-        from flashinfer.cake_sage_block_sparse_attention_backend import (
-            sm100_sage_fwd_cake_dispatch,
-        )
-
         # Narrowing for the type checker: use_cake implies all three scales.
         assert q_scale is not None and k_scale is not None and v_scale is not None
-        result = sm100_sage_fwd_cake_dispatch(
+        result = _cake_backend.sm100_sage_fwd_cake_dispatch(
             q,
             k,
             v,

@@ -60,21 +60,17 @@ pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
 ```
 
 The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
-kernels need ≥ 4.6.x. **4.6.1** is the perf-validated reference (the TUNING.md
-and benchmark tables were measured on it); **4.7.0** is correctness-validated
-(2026-08-10, jobs 2384640/2384641/2384650: drop harness, fused-quant unit
-tests, and the full deep_gemm/nvfp4/mxfp8 mega multirank + oracle suites all
-green) but its perf has not been measured — pin 4.6.1 when producing numbers
-meant to compare against the reference tables.
+kernels need ≥ 4.6.x. **4.6.1** is the performance reference. The July 22
+microbenchmarks used **4.5.2** with the mainloop workaround.
+**4.7.0** passed the drop harness, fused-quant unit tests, and the DeepGEMM,
+NVFP4 and MXFP8 MegaMoE multi-rank and oracle suites on 2026-08-10.
 
-History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
-every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
-`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
-root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
-activation-quant staging (`DataPreprocess` in
-`kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
-staging path — fixed by the upstream `50117315d` sync recorded in that drop's
-VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
+History: 4.7.0 used to crash every four-rank
+`deep_gemm.fp8_fp4_mega_moe` launch with `CUDA_ERROR_MISALIGNED_ADDRESS`
+(bisected on B200 on 2026-08-05). The problem was in `DataPreprocess` in
+[`inputs_process.py`](../../flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/comm/inputs_process.py),
+which handles fused activation-quant staging. The `50117315d` source drop
+fixed it, so the 4.6.1 pin was lifted. The vLLM e2e sections below keep
 their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
 the vLLM engine env, not for running the moe_ep test suite.
 
@@ -109,7 +105,7 @@ band, that is a real signal, not marginality.
   `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`
   (`Fatal Python error: Aborted` in the nvfp4 warmup's module imports) — or
   (b) in CPython teardown after the pytest summary
-  (`malloc(): unaligned tcache chunk detected`, job 2388315). Not a kernel
+  (`malloc(): unaligned tcache chunk detected`). Not a kernel
   or test bug: everything passes standalone, per-file, and in every subset
   tried (observed since 2026-07-22; B200, dsl 4.6.1). `run_tests.sh unit`
   therefore (1) runs that test in its own pytest process and (2) exits both
@@ -248,7 +244,7 @@ sweep has its own bench script,
 
 The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
 Cake-generated parametric persistent kernel per deployment, JIT-compiled from
-`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`flashinfer/moe_ep/shims/sm120/cake_mxfp4/`) has its own target,
 `bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
 for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
 multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. The target is not part of `all`; PR CI runs only
@@ -278,7 +274,7 @@ graphs" in the kernel package README).
 A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
 makes the call fail on every rank with `CUDA error: unspecified launch failure`
 (device `trap`) instead of hanging; restart the processes (see the wait-deadline
-paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+paragraph in `flashinfer/moe_ep/kernels/cake/mxfp4_megamoe_sm120/README.md`).
 On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
 this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
 the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
@@ -295,7 +291,7 @@ and CUDA-graph replay. Supported geometry: `hidden % 256 == 0`,
 `intermediate % 128 == 0`, `top_k in {1, 2, 4, 6, 8}`, experts divisible by
 the world size; anything else raises `MoEEpConfigError` at init. The expert
 GEMMs ship as generated sources sealed by
-`kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_manifest.json`;
+`kernels/cake/bf16_megamoe_sm90/cake_sm90_bf16_megamoe_manifest.json`;
 the target runs the CPU frozen-sources guard
 (`tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py`) first, and a
 hand-edited generated file fails the JIT loader closed (sha256 mismatch).
@@ -393,7 +389,7 @@ Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
 M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
-[`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+[`shims/sm90/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/shims/sm90/cutedsl_megamoe/TUNING.md).
 
 The native BF16 backend is benchmarked against the same-precision split
 baseline (NCCL-EP + CUTLASS BF16 fused MoE through the same `MoEEpLayer`)
@@ -413,65 +409,30 @@ reference first). See the module docstring for the columns.
 
 ## Benchmarking
 
-Two harnesses live in the companion **`moe_ep_benchmark`** repo (kept next to
-the flashinfer checkout — not part of this tree): a single-node
-**microbenchmark** (`fi_mega` / `model_shapes`) and a **vLLM 0.25.1
-end-to-end** suite (`vllm_e2e/`). Clone it beside your flashinfer checkout:
-
-```bash
-export ROOT=/path/to            # parent dir; hold both checkouts here
-cd "$ROOT"
-git clone https://github.com/mhoqueanik/moe_ep_benchmark.git
-# pin the revision the published numbers were run with (vllm-pr branch,
-# "Add 2026-07-22 cutlass-dsl 4.5.2 validation results" — scripts + result CSVs)
-git -C moe_ep_benchmark checkout c8aefda
-# $ROOT now has both flashinfer-2/flashinfer-moe_ep and moe_ep_benchmark/
-```
-
-All numbers below were measured on **4× GB200 (SM100)** at the tip of this
-tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
-(vLLM 0.25.1's own pin) — the measured and supported baseline. 4.6.1 appears
-below only as a parity *reference*: the mainloop workaround brings 4.5.2 to
-4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
-unsupported (4.5.0 fails at `cute.compile`) — see
-[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+The July 22 microbenchmarks used **4× GB200 (SM100)** with the FlashInfer
+mainloop workaround and **nvidia-cutlass-dsl 4.5.2**, the version pinned by
+vLLM 0.25.1. With the workaround, 4.5.2 matches the 4.6.1 reference
+and is the runtime floor for this setup. Version 4.5.0 fails at
+`cute.compile`. See
+[`../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
-Every table below comes from one sweep — `model_shapes/run_model_shapes.sh` —
-which runs five variants (the table columns) across the MoE geometries of real
-models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
-(7168 / 2048 / 256 / top-8) **is** the default-geometry table.
+The sweep compared five variants across the MoE geometries of real models.
+The default geometry is DeepSeek-V3 (7168 / 2048 / 256 / top-8).
+The July NVFP4 results use the implementation now selected with
+`sm100_nvfp4_nvfp4_bf16_cutedsl_legacy`.
 
-| column          | variant          | backend          | env |
+| column          | variant          | backend          | combine |
 |-----------------|------------------|------------------|-----|
 | `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
-| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
-| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | In-kernel FC2 reduction |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | E2M1 with one BF16 scale per 16 values |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | E4M3 with one E8M0 scale per 32 values |
 
-Inside the flashinfer-EP container (editable install per "Build & test
-environment" above), pin the DSL and run the sweep:
-
-```bash
-# pin the DSL the numbers were measured on ($ROOT set at clone time above)
-python -m pip install "nvidia-cutlass-dsl[cu13]==4.5.2"
-python -c "import cutlass; assert cutlass.__version__=='4.5.2', cutlass.__version__"
-
-cd "$ROOT/moe_ep_benchmark"
-# all six shapes × five variants; e2e_pipelined timing is the sweep default
-SEQ_LENS="8 64 512 1024 2048 4096 8192" GPUS=4 \
-  bash model_shapes/run_model_shapes.sh
-# just the default-geometry table:
-SHAPES=deepseek_v3 SEQ_LENS="8 64 512 1024 2048 4096 8192" \
-  bash model_shapes/run_model_shapes.sh
-# render markdown (speedup-vs-dg columns) from the CSV(s):
-python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
-```
-
-- `MEGA_TIMING=e2e_pipelined` (steady-state, iters back-to-back enqueued) is the
-  default and the methodology of these tables — don't override it.
+- `e2e_pipelined` measures steady-state forward calls enqueued back to back,
+  with activations prepared before timing.
 - First-time `cute.compile` scales with experts/rank (~12 min per kernel config
   at 64 experts/rank; `qwen3_5_397b` at 128/rank is the worst case). Compiles
   cache under `~/.cache/flashinfer`, so resubmits are cheap.
@@ -565,37 +526,12 @@ the cutedsl %64 relaxation (fp4 variants only):
 
 ### 2. End-to-end vLLM benchmark
 
-The backend integrated into vLLM 0.25.1 (integration lands as a separate PR),
-driven from `vllm_e2e/` — see `vllm_e2e/RUNBOOK.md` for the full recipe and
-`vllm_e2e/FINDINGS.md` for the measured numbers. Backend is selected per-run by
-env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated):
+The vLLM 0.25.1 comparison measures native DeepGEMM, DeepGEMM through
+FlashInfer (`fi_dg`), and NVFP4 through FlashInfer (`fi_nvfp4`).
 
-| config   | env |
-|----------|-----|
-| native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_fp4_bf16_deepgemm` |
-| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
-
-```bash
-W=$ROOT/moe_ep_benchmark/vllm_e2e
-# 1) hold a 4-GPU node; run every command through the container helper:
-JOBID=$(sbatch --parsable -A "$SLURM_ACCOUNT" -p batch -N1 \
-    --ntasks-per-node=1 --time=04:00:00 -J fi.vllm_e2e.hold \
-    --output=$W/logs/hold_%j.log --wrap "sleep 14400")
-# 2) one-time venv: vllm==0.25.1 + editable fi branch + patch_0251 (keeps
-#    vllm's own cutlass-dsl 4.5.2 pin):
-JOBID=$JOBID bash $W/in_container.sh 'bash setup_container.sh'
-# 3) throughput A/B (backend env-only):
-JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
-# 4) GSM8K fairness gate (both checkpoints must land in the same band):
-JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
-JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
-```
-
-Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
-- **Prefill, 8k-token chunks**: `WORKLOADS="prefill:8192:1" MAX_BATCHED_TOKENS=8192 bash bench_throughput.sh`.
+Settings for the **headline cells**:
+- **Prefill, 8k-token chunks**: 8192 input tokens, one output token per request,
+  and an 8192-token batch limit.
 - **Decode @ 1024-seq concurrency**: run the decode workload with CUDA-graph
   capture covering the prefill chunk shapes (vLLM
   `max_cudagraph_capture_size` >= the chunk size). With the default small
@@ -655,16 +591,16 @@ route-staging kernel to convert IDs and scores and zero masked scores.
 Unsupported layouts or `FLASHINFER_MEGA_FUSED_STAGE=0` use Torch staging.
 As on the other Blackwell paths, callers supply valid routing values.
 This configuration supports default/fixed knobs and `knobs="auto"` below;
-offline tuning uses `--arch sm100 --implementation next --dtype mxfp4_mxfp8`.
+offline tuning uses `--arch sm100 --dtype mxfp4_mxfp8`.
 For GenPhase, use `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`
 with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
 
 Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
 weight, staging and shared-workspace graph-replay checks.
 
-The `sm100_nvfp4_nvfp4_bf16_cutedsl_next` and
-`sm100_mxfp8_mxfp8_bf16_cutedsl_next` selectors support `knobs="auto"` through
-`autotune_v2()`. The legacy selectors retain their existing tuner. Standard
+The `sm100_nvfp4_nvfp4_bf16_cutedsl` and
+`sm100_mxfp8_mxfp8_bf16_cutedsl` selectors support `knobs="auto"` through
+`autotune_v2()`. The retained NVFP4 `_legacy` selector keeps its existing tuner. Standard
 `knobs=None` still uses built-in defaults; explicit dictionaries retain the
 legacy spelling and also accept the native dictionaries returned by
 `get_tuned_knobs()`. Pass those results to `create_workspace(..., knobs=knobs)`
@@ -677,11 +613,13 @@ attributes, input scalars and per-token scales retain their configured values.
 The measured boundary is the native collective kernel; a separate terminal
 reducer, staging and weight preparation are outside it.
 
-Select this implementation explicitly in the offline CLI:
+If your offline tuner defaults to the legacy NVFP4 kernel, pass
+`--implementation next` with the following options to select Standard.
+With a tuner that defaults to Standard, run:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
-  --arch sm100 --implementation next --dtype nvfp4 \
+  --arch sm100 --dtype nvfp4 \
   --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
   --max-tokens 128 --live-tokens 65
 ```
@@ -695,9 +633,10 @@ because workspace capacity and actual staged tokens define these workloads.
 
 ## Blackwell GenPhase decoding (explicit opt-in)
 
-The existing SM100 MXFP8 config can select the independently owned GenPhase
-pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
-the legacy weight layout, workspace pool keys, knob cache and autotuner.
+The SM100 NVFP4 and MXFP8 configs select standard inference by default.
+Set `kernel_variant="genphase"` to use the GenPhase pipeline on SM100/SM103.
+Both variants use the `sources/` weight helpers, with separate workspace and
+tuning identities. The retained NVFP4 `_legacy` selector uses its own layout.
 
 ```python
 from flashinfer.moe_ep import (
@@ -733,9 +672,9 @@ BF16 reduction, with physical capacity at most 1024 tokens per rank.
 | MXFP4/MXFP8 | 128 | 128 | K128, N128/CGA4 or N64/CGA4 |
 
 NVFP4 uses `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` with
-`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"` and
+`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"` and
 `kernel_variant="genphase"`. E4M3/E5M2 and mixed MXFP4/MXFP8 use the MXFP8
-config with either its existing selector or `_cutedsl_next`. For example,
+config with `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"`. For example,
 set `kind="mxfp8_e5m2"` or `kind="mxfp4_mxfp8"` in the example above.
 Early and late routing weights are supported. In-kernel FC2 reduction,
 per-token FC1 scales, SiTU and custom finalization remain unsupported.
@@ -853,29 +792,18 @@ runnable with `torchrun --nproc_per_node=<2|4> -m pytest`.
 
 ## Adding a new mega-kernel backend
 
-A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
-vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
+A mega kernel owns communication and local MoE execution. Add its backend under
+`flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`.
+Place provider adaptation under `flashinfer/moe_ep/shims/<sm>/` and source
+implementations under `flashinfer/moe_ep/kernels/<owner>/`. See the
+[source layout](../../flashinfer/moe_ep/kernels/README.md) for the existing
+families and their independent source roots.
 
-- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
-- `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  and BF16 (a fork of the same kernel repo)
-- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
-  JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
-- `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
-  (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
-- `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
-  block-scaled inference export; generic inference is integrated, with
-  GenPhase included for future integration (see its `VENDOR.md`)
-
-Each tree exposes its kernels through its own package public API (e.g. the
-sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
-trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
-own drop revision and are **process-exclusive** — the top-level kernel module
-names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
-sibling tree's modules are already imported (a process runs on one
-architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
-reference template.
+Backends call the shim package API. The shim imports provider sources, prepares
+weights and workspaces, and preserves its provider's compiler and communication
+contract. The combined CuTe DSL export uses full FI package namespaces so
+Blackwell, Rubin and Hopper can coexist without process-wide `common` or `src`
+aliases. Other drops retain the import contracts in their vendoring records.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
@@ -931,12 +859,12 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-Add both functions under the owning tree's `shim/` — e.g.
-`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
-`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+Add both functions under the implementation's adapter package, for example
+`shims/sm100/cutedsl_megamoe/pre_unification/` for Blackwell kernels (alongside
+`nvfp4.py` / `mxfp8.py`), `shims/sm90/cutedsl_megamoe/`
 for Hopper — and re-export them from that package's `__init__.py` (or point at
-your own kernel module). Raw kernel sources live under the tree's `src/` — see
-the tree's `SKILL.md` for how to update that directory when the kernel team
+your own kernel module). Raw kernel sources live under `kernels/<owner>/`; see
+the source family's `SKILL.md` for how to update that directory when the kernel team
 ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
@@ -1209,7 +1137,7 @@ CUDA 13 host with at least four supported GPUs is still required to execute
 these regressions; ordinary pytest collection skips them without `torchrun`.
 
 ```bash
-NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+NPROC=4 BACKEND=both bash scripts/infra/task_test_moe_ep_smoke.sh
 ```
 
 To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):

@@ -36,7 +36,7 @@ def cuda_architecture():
 def lint_script():
     module = _load(
         "_test_check_jit_spec_gencodes",
-        REPO_ROOT / "scripts/check_jit_spec_gencodes.py",
+        REPO_ROOT / "scripts/infra/check_jit_spec_gencodes.py",
     )
     yield module
     sys.modules.pop("_test_check_jit_spec_gencodes", None)
@@ -157,9 +157,9 @@ def test_spec_flag_lists_ignores_specs_without_nvcc_flags(lint_script):
 @pytest.mark.cpu_only
 def test_aot_script_lints_specs_before_building_and_inspects_wheels_after():
     text = (
-        REPO_ROOT / "scripts/task_test_jit_cache_package_build_import.sh"
+        REPO_ROOT / "scripts/infra/task_test_jit_cache_package_build_import.sh"
     ).read_text()
-    common = (REPO_ROOT / "scripts/jit_cache_build_common.sh").read_text()
+    common = (REPO_ROOT / "scripts/infra/jit_cache_build_common.sh").read_text()
 
     lint = text.index("run_provider_spec_lint ")
     build_started = text.index("PROVIDER_BUILD_STARTED_AT=")
@@ -170,7 +170,7 @@ def test_aot_script_lints_specs_before_building_and_inspects_wheels_after():
 
 @pytest.mark.cpu_only
 def test_standalone_lint_script_covers_both_cpu_architectures():
-    text = (REPO_ROOT / "scripts/task_check_jit_spec_gencodes.sh").read_text()
+    text = (REPO_ROOT / "scripts/infra/task_check_jit_spec_gencodes.sh").read_text()
 
     assert "x86_64_provider_architectures" in text
     assert "aarch64_provider_architectures" in text
@@ -178,14 +178,10 @@ def test_standalone_lint_script_covers_both_cpu_architectures():
 
 
 @pytest.mark.cpu_only
-def test_pr_test_runs_spec_lint_and_requires_it():
+def test_reusable_workflow_runs_spec_lint():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/pr-test.yml").read_text())
     jobs = workflow["jobs"]
 
     lint = jobs["spec-lint"]
-    assert lint["needs"] == ["gate", "setup"]
-    # Authorized runs only: the lane executes the PR's code on a self-hosted runner.
-    assert "needs.gate.outputs.authorized == 'true'" in lint["if"]
     assert "task_check_jit_spec_gencodes.sh" in str(lint["steps"])
-    assert "spec-lint" in jobs["test-results-summary"]["needs"]

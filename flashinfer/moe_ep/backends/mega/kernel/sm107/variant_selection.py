@@ -17,11 +17,12 @@ from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
 from .forward_tuning import ForwardExecution
 from .automatic import prepared_for_serving, record_prepared
+from .shared_expert import Sm107SharedExpertWeights
 
 if TYPE_CHECKING:
     from .....config import FleetParams
     from .....tensors import MoEEpTensors
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
     )
     from .automatic import RubinBackend
@@ -44,7 +45,7 @@ def _json(value):
 
 
 def _context() -> TuningContext:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         validate_context,
     )
 
@@ -54,7 +55,7 @@ def _context() -> TuningContext:
 
 
 def _cache_identity(context: TuningContext) -> tuple:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 
@@ -100,6 +101,8 @@ class RubinVariantBackend(MegaKernelBackend):
     )
     supports_output_view = True
     supports_auto_workspaces = True
+
+    supports_shared_expert = True
 
     def __init__(self, config, backend_type):
         super().__init__(config)
@@ -174,7 +177,7 @@ class RubinVariantBackend(MegaKernelBackend):
         return backend
 
     def _fixed_backend(self, workspace):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         knobs = {key: getattr(workspace.config, key) for key in KNOB_KEYS}
         return self._backend(workspace.config.kernel_variant, knobs)
@@ -184,11 +187,11 @@ class RubinVariantBackend(MegaKernelBackend):
         return VariantWorkspace(fleet_params, self._fixed_backend(workspace), workspace)
 
     def _eligible(self, fleet):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
             sm107_candidates,
         )
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             is_valid_sm107,
         )
 
@@ -204,6 +207,8 @@ class RubinVariantBackend(MegaKernelBackend):
                     kernel_variant=variant,
                     allow_in_kernel_fc2_reduce=self._config.in_kernel_fc2_reduce
                     and cfg.combine_dtype == "bf16",
+                    combine_dedup=cfg.combine_dedup,
+                    token_back_mode=cfg.token_back_mode,
                 ):
                     if not is_valid_sm107(knobs, cfg):
                         continue
@@ -257,6 +262,9 @@ class RubinVariantBackend(MegaKernelBackend):
             raise RuntimeError(
                 "Warm up pending variant tuning before CUDA graph capture"
             )
+        from .shared_expert import bind_shared_weights
+
+        bind_shared_weights(workspace.workspace, weights)
         workspace.workspace.prepare(*weights)
 
     def stage_inputs(self, t, workspace, *, quantize_input):
@@ -340,7 +348,7 @@ class _VariantProtocol:
         self,
         backend: RubinVariantBackend,
         owner: VariantWorkspace,
-        weights: TransformedMegaWeights,
+        weights: TransformedMegaWeights | Sm107SharedExpertWeights,
         output: torch.Tensor | None,
         *,
         candidates: dict[str, list[dict]] | None = None,
@@ -358,7 +366,7 @@ class _VariantProtocol:
         self.install_winner = install_winner
 
     def _contract(self, variants, context):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             RubinTuningProtocol,
         )
 
@@ -368,8 +376,11 @@ class _VariantProtocol:
             self.tensors,
             quantize_input=owner.quantize_input,
             output=self.output,
+            shared_weights=getattr(self.weights, "shared", None),
         )
         # Native compatibility covers numerical settings, SM budget and environment.
+        if isinstance(self.weights, Sm107SharedExpertWeights):
+            owner.workspace.bind_shared_weights(self.weights.shared)
         native = RubinTuningProtocol(
             self.output,
             self.weights[0],
@@ -399,7 +410,7 @@ class _VariantProtocol:
         }
 
     def _install(self, record):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _prepare_collectively,
         )
 
@@ -407,7 +418,7 @@ class _VariantProtocol:
         kernel = backend._backend(record["variant"], record["knobs"])
         workspace = kernel._allocate_workspace(owner.fleet)
         _prepare_collectively(
-            lambda: workspace.prepare(*self.weights),
+            lambda: kernel.ep_prepare_fixed(workspace, self.weights),
             backend.ep_world_size,
             backend.ep_comm_group if backend.ep_world_size > 1 else None,
         )
@@ -422,10 +433,10 @@ class _VariantProtocol:
         if record.get("variant") not in contract["variants"]:
             return False
         try:
-            from .....kernel_src.sm107.next_cutedsl_megamoe import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
                 Sm107BlockScaledSymmBuffer,
             )
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.knob_cache import (
                 _knobs_from_json,
             )
 
@@ -454,7 +465,7 @@ class _VariantProtocol:
 
     def run(self, context: TuningContext):
         from .....core.tuning_measurement import measurement_settings
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             NAMESPACE as NATIVE_NAMESPACE,
             RubinTuningProtocol,
             _publish_record,
@@ -530,9 +541,9 @@ class _VariantProtocol:
             state.record_selection(None, _cache_identity(context), None)
             return TuningResult(None)
         if record is None:
-            from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
                 NoPassingCandidate,
                 _sweep_sm107_block_scaled_mega_moe,
                 sm107_candidates,
@@ -550,7 +561,10 @@ class _VariantProtocol:
                     self.tensors,
                     quantize_input=owner.quantize_input,
                     output=self.output,
+                    shared_weights=getattr(self.weights, "shared", None),
                 )
+                if isinstance(self.weights, Sm107SharedExpertWeights):
+                    workspace.bind_shared_weights(self.weights.shared)
                 kernel.stage_inputs(
                     self.tensors, workspace, quantize_input=owner.quantize_input
                 )
@@ -566,6 +580,14 @@ class _VariantProtocol:
                         kernel_variant=variant,
                         allow_in_kernel_fc2_reduce=backend._config.in_kernel_fc2_reduce
                         and workspace.config.combine_dtype == "bf16",
+                        **(
+                            dict(
+                                combine_dedup=True,
+                                token_back_mode=workspace.config.token_back_mode,
+                            )
+                            if workspace.config.combine_dedup
+                            else {}
+                        ),
                     )
                 )
                 protocol = RubinTuningProtocol(
@@ -645,7 +667,7 @@ class _VariantProtocol:
                 "measurement": measurement,
             }
         # Managed JSON decoding preserves payload lists; native knobs use tuples.
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
         record = deepcopy(record)
         record["knobs"] = knob_cache._knobs_from_json(record["knobs"])

@@ -22,6 +22,7 @@ one-slot smem hand-off per direction (the online softmax's `m` is a serial state
 
 from __future__ import annotations
 
+import functools
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -136,15 +137,23 @@ def shared_storage_struct(
 def arch_smem_cap(device=None) -> int:
     """The dynamic shared memory one CTA may allocate on the compile target of ``device`` (default: the current device): the DSL's
     per-architecture table (328 KB on sm_107, 228 KB on sm_100 / sm_103; the CUDA device attribute under-reports sm_107),
-    ``SMEM_CAP`` when the target is not in the table."""
+    ``SMEM_CAP`` when the target is not in the table. Cached per device: it is read on every launch."""
     import torch
-
-    from ....cute_dsl.availability import cute_dsl_compile_arch
-    from ....utils import get_compute_capability
 
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    major, minor = get_compute_capability(torch.device(device))
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _arch_smem_cap(device)
+
+
+@functools.cache
+def _arch_smem_cap(device) -> int:
+    from ....cute_dsl.availability import cute_dsl_compile_arch
+    from ....utils import get_compute_capability
+
+    major, minor = get_compute_capability(device)
     arch = cute_dsl_compile_arch(int(major), int(minor))  # "sm_107a", "sm_100f", ...
     key = "sm_" + arch[3:].rstrip("af")
     try:
@@ -214,13 +223,23 @@ class SwapsPlan:
     """Tiled MMAs, tilers, smem / TMEM layouts, stage counts and the producer views of the swapped body."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        *,
+        causal: bool = True,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
+        self.causal = causal  # the mask mode (blocks/operands.StaticPlan.causal)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
         self.D, self.g, self.page, self.n_pad = D, g, page, n_pad
+        self.sinks = False  # set by the kernel compiled for attention sinks
         self.ragged = (
             ragged  # the packed-token KV view (blocks/operands.StaticPlan.ragged)
         )

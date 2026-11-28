@@ -1140,7 +1140,8 @@ struct LamportComm {
       data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) +
                      static_cast<int64_t>(data_offset) * comm_size;
     }
-    clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
+    clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) +
+                static_cast<int64_t>(clear_offset) * comm_size;
     __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
@@ -1532,9 +1533,6 @@ struct neg_zero<float> {
 };
 
 template <typename T>
-__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T>
 __device__ bool is_negative_zero(T) {
   return false;
 }
@@ -1585,7 +1583,7 @@ __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 template <typename T>
 __device__ __forceinline__ void set_neg_zero(T* addr) {
   vec_t<T, details::kBytesPerAccess / sizeof(T)> val;
-  val.fill(neg_zero_v<T>);
+  val.fill(neg_zero<T>::value);
   val.store_global_volatile(addr);
 }
 

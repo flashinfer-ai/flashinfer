@@ -378,8 +378,19 @@ it, since the crossovers depend on the fabric.
 ``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
 the kernels cannot run.
 
-The kernels spin on peer flags with no timeout, so ranks that disagree on
-shape, dtype or call order hang rather than raise. One workspace serves one
+By default the kernels spin on peer flags with no timeout, so ranks that
+disagree on shape, dtype or call order usually hang rather than raise; two
+swapped calls with the same shape and configuration can instead complete and
+combine unrelated inputs, which no timeout detects. Setting
+``FLASHINFER_PCIE_IPC_TIMEOUT_S`` before the first workspace is built bounds
+the kernels' wait for a peer: a rank that waits longer than that many seconds
+reports where it was waiting and traps, so the call fails with a CUDA error
+instead of hanging. The CUDA context is unusable afterwards, so the process
+must restart. The bound covers the kernels only: the first call for a shape
+without an explicit launch configuration runs a process-group collective,
+which the process group's own timeout governs. Unset or ``0`` keeps the
+unbounded wait and builds the same kernels as before.
+One workspace serves one
 CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
 ordering the two if a move is genuinely needed.
 
@@ -579,8 +590,11 @@ e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
 (NVLink's ``exchange_chunks`` runs ``all_to_all_single`` too) require
 ``group`` to support CUDA all-to-all (an NCCL process group), checked at
 construction before any resource is armed. Operands must be contiguous 4-D
-CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-plus the PCIe types listed below) on the construction device, every dim positive,
+CUDA tensors on the construction device, using the construction ``dtype``
+(float16 / bfloat16 / float32 plus the PCIe types listed below) for
+``scatter_heads`` and ``gather_heads`` unless the PCIe backend receives a
+per-call ``dtype`` override. ``exchange_chunks`` also accepts a per-call
+``dtype`` override, including packed uint8. Every dim must be positive,
 and ``nbytes`` at most
 ``max_bytes``; the element count of any one operand must additionally stay
 within the int32 kernel index range. ``scatter_heads`` requires
@@ -881,10 +895,12 @@ producer build with the folded cross-rank rendezvous (a rendezvous warp of
 CTA 0 runs the NVLink barrier of the call's phase and releases the stores
 through a rank-local arrive flag: one extra warp per CTA on SM100 / SM103, the
 idle TMA warp on SM90) on the caller's stream and the wait kernel on the
-consumer stream: two launches.  ``fold_barrier=False`` (or the environment
-variable ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER=0``) selects the three-launch
-path instead: the barrier kernel, the plain producer and the wait kernel; both
-paths are delivered on every architecture.  Both paths store identical bits;
+consumer stream: two launches when there is one producer launch.
+``fold_barrier=False`` (or the environment variable ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER=0``) selects the three-launch
+path instead: the barrier kernel, the plain producer and the wait kernel.
+The per-destination producer path described below adds producer launches to
+these totals. Both paths are delivered on every architecture. Both paths
+store identical bits;
 ``describe()`` reports the resolved path (``fold_barrier``) and its launch
 count (``launches_per_call``).
 

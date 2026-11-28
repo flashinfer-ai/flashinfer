@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -109,6 +109,10 @@ kernel_cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9(__nv_bfloat16* q_in
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#else
+#endif
     int rank = cta_rank;
     int cid = bid / 8;
     int head = cid % grid_heads;
@@ -584,7 +588,10 @@ kernel_cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9(__nv_bfloat16* q_in
             }
         }
     }
+#if __CUDA_ARCH__ == 1030
+#else
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 }
 
 } // extern "C"

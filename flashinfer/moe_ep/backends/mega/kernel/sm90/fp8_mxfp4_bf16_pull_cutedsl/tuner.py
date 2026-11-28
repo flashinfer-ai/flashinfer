@@ -142,7 +142,7 @@ def _create_canonical_inputs(
     """Build canonical raw weights, preprocess them, and stage live inputs."""
     import torch
 
-    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
         get_symm_buffer_for_hopper_mxfp4_mega_moe,
     )
     from .staging import stage_mega_moe_inputs
@@ -241,7 +241,7 @@ def _create_canonical_inputs(
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+    from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
     mode = "fused"
     pkg.require_hopper_mxfp4_fused_tuning_device()
@@ -308,7 +308,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
 
 
 def run_tuning(args) -> int:
-    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+    from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
     return _run_tuning(args, tune_one, pkg=pkg)
 

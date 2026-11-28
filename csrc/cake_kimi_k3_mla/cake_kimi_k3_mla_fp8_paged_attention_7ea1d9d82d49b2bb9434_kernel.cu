@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -1180,8 +1180,13 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_7ea1d9d82d49b2bb9434(const __grid_co
                             asm volatile("barrier.sync 2, 64;" ::: "memory");
                         }
                         unsigned int smem_regs[4];
+#if defined(_MSC_VER)
+                        uint64_t _smem_raw_35[2];
+                        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_35[0]), "=l"(_smem_raw_35[1]) : "r"(smem_stats_line_addr + (unsigned int)(my_row * 4 * 4)));
+#else
                         __int128_t _smem_raw_35;
                         asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_35) : "r"(smem_stats_line_addr + (unsigned int)(my_row * 4 * 4)));
+#endif
                         smem_regs[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[0];
                         smem_regs[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[1];
                         smem_regs[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[2];
@@ -2646,8 +2651,13 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_7ea1d9d82d49b2bb9434(const __grid_co
                             asm volatile("barrier.sync 5, 64;" ::: "memory");
                         }
                         unsigned int smem_regs_9[4];
+#if defined(_MSC_VER)
+                        uint64_t _smem_raw_35[2];
+                        asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_35[0]), "=l"(_smem_raw_35[1]) : "r"(smem_stats_line_addr + (unsigned int)((256 + my_row_1 * 4) * 4)));
+#else
                         __int128_t _smem_raw_35;
                         asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_35) : "r"(smem_stats_line_addr + (unsigned int)((256 + my_row_1 * 4) * 4)));
+#endif
                         smem_regs_9[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[0];
                         smem_regs_9[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[1];
                         smem_regs_9[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[2];

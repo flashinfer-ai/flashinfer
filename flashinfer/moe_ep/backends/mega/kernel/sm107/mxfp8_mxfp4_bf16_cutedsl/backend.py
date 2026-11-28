@@ -11,6 +11,10 @@ if TYPE_CHECKING:
 
 from ......core.kernel.registry import register_mega_kernel
 from ..mxfp8_mxfp8_bf16_cutedsl.backend import Sm107Mxfp8BlockScaledMegaKernelBackend
+from ..shared_expert import (
+    prepare_shared_weights,
+    validate_shared_weights,
+)
 from .config import Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import preprocess_mega_weights, validate_transformed_mega_weights
 
@@ -31,15 +35,21 @@ class Sm107Mxfp8Mxfp4MegaKernelBackend(Sm107Mxfp8BlockScaledMegaKernelBackend):
         return "sm107_mxfp8_mxfp4_bf16_cutedsl"
 
     def preprocess_weights(self, weights, fleet_params):
-        return preprocess_mega_weights(
+        routed = preprocess_mega_weights(
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+        )
+        return prepare_shared_weights(
+            self._kernel_config, weights, routed, fleet_params
         )
 
     def validate_transformed_weights(
         self, transformed_weights, bootstrap, fleet_params
     ):
+        transformed_weights = validate_shared_weights(
+            self._kernel_config, transformed_weights, fleet_params
+        )
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,

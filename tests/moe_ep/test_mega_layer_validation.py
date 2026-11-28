@@ -266,6 +266,7 @@ def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     layer = _mega_layer()
     with (
         mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}),
+        mock.patch("torch.cuda.current_device", return_value=0),
         pytest.raises(RuntimeError, match="torch.distributed"),
     ):
         layer._ensure_workspace()
@@ -521,6 +522,31 @@ def test_mega_layer_init_accepts_valid_transformed_weights():
     assert layer._transformed is not None
 
 
+def test_mega_layer_transformed_weight_aliases_include_scales():
+    transformed = _fake_deep_gemm_transformed()
+    layer = _mega_layer(transformed_weights=transformed)
+    try:
+        prepared = layer.get_transformed_weights()
+        assert prepared is transformed
+        for stage in prepared:
+            for tensor in stage:
+                tensor.fill_(3)
+        for stage in transformed:
+            for tensor in stage:
+                assert (tensor == 3).all()
+    finally:
+        layer.destroy()
+
+
+def test_mega_layer_transformed_weights_reject_destroyed_layer():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer = _mega_layer()
+    layer.destroy()
+    with pytest.raises(MoEEpConfigError, match="destroyed"):
+        layer.get_transformed_weights()
+
+
 def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():
     import torch
 
@@ -701,9 +727,9 @@ def test_mega_layer_workspace_alloc_raises_during_capture():
 
 def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         ensure_not_capturing,
     )
 

@@ -169,7 +169,6 @@ def test_live_profiles_preserve_capacity_and_handle_lifetime():
         "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
         "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
         "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
-        "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
         "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
         "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
         "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
@@ -185,6 +184,8 @@ def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, confi
         "flashinfer.jit.cake_megamoe_topk_reduce.supports_device", lambda: False
     )
     options = {"knobs": "cache"} if config_name.startswith("Sm107") else {}
+    if config_name == "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig":
+        options["kernel_name"] = "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"
     backend = create_mega_kernel(
         getattr(moe_ep, config_name)(intermediate_size=256, top_k=2, **options)
     )
@@ -209,7 +210,7 @@ def test_live_tactics_change_pool_key_for_all_cached_backends(monkeypatch, confi
         # test independent of the mutually exclusive SM90/SM100 kernel imports.
         monkeypatch.setitem(
             sys.modules,
-            "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel",
+            "flashinfer.moe_ep.shims.sm90.cutedsl_megamoe",
             SimpleNamespace(
                 resolve_hopper_fp8_mega_moe_config=lambda **kwargs: tuple(
                     sorted((key, repr(value)) for key, value in kwargs.items())
@@ -237,7 +238,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     import torch
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.knob_cache import (
         record_knobs,
     )
 
@@ -249,6 +250,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
         finalize_mode=FinalizeMode.NONE,
         apply_routing_weights_before_fc2=False,
     )
@@ -496,8 +498,10 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
+    from flashinfer.moe_ep.kernels.flashinfer import bf16_nvfp4 as bf16_nvfp4
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import (
+        pre_unification as cutedsl_megamoe,
+    )
 
     capacity, top_k, hidden = 7, 2, 128
     partials = torch.randn(capacity, top_k, hidden, dtype=torch.bfloat16)
@@ -520,6 +524,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     allocate = mock.Mock(return_value=raw)
     if backend == "nvfp4":
         config_cls = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        options["kernel_name"] = "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"
         monkeypatch.setattr(cutedsl_megamoe, "get_symm_buffer_for_mega_moe", allocate)
         raw._frontend.custom_finalize_workspace.return_value = (
             partials,
@@ -622,7 +627,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
 def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import nvfp4
 
     allocate = mock.Mock(
         side_effect=AssertionError("allocation before knob validation")
@@ -632,6 +637,7 @@ def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
         moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=128,
             top_k=2,
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
             finalize_mode=FinalizeMode.NONE,
             knobs=knobs,
         )
@@ -688,7 +694,7 @@ def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
 
     from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+    from flashinfer.moe_ep.kernels.flashinfer import bf16_nvfp4 as bf16_nvfp4
 
     kernel = create_mega_kernel(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(

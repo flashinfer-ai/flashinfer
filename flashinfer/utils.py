@@ -82,6 +82,16 @@ def check_lse_layout(lse_layout: str) -> None:
         raise ValueError(f"lse_layout must be one of {LSE_LAYOUTS}, got {lse_layout!r}")
 
 
+def check_has_sinks_undeclared(has_sinks: Optional[bool]) -> None:
+    """``plan(has_sinks=)`` is a declaration of the batch-invariant attention; the other backends that support sinks take
+    them per ``run()``."""
+    if has_sinks is not None:
+        raise ValueError(
+            f"has_sinks={has_sinks} is only supported with batch_invariant=True; "
+            "without it, leave has_sinks unset; sinks are passed at run(), on the backends that support them."
+        )
+
+
 class GPUArchitectureError(Exception):
     """Custom exception for GPU architecture-related errors."""
 
@@ -342,7 +352,13 @@ def _get_stream_cache_buf(
     index = device.index
     if index is None:
         index = torch.cuda.current_device()
-    key = (name, device, torch._C._cuda_getCurrentRawStream(index))
+    if torch.compiler.is_dynamo_compiling():
+        # Under torch.compile(dynamic=True) Dynamo can pass a symbolic index, which
+        # the raw binding rejects; the Stream object is traceable and has the same handle.
+        stream = torch.cuda.current_stream(device).cuda_stream
+    else:
+        stream = torch._C._cuda_getCurrentRawStream(index)
+    key = (name, device, stream)
     buf = _stream_cache_buf.get(key)
     if buf is None or buf.size(0) < num_bytes:
         if buf is not None:

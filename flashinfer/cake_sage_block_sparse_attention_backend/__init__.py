@@ -92,8 +92,23 @@ def _device_index(device: torch.device) -> int:
     )
 
 
+_CUDA_AVAILABLE = False
+
+
+def _cuda_available() -> bool:
+    """``torch.cuda.is_available()``, remembered once true.
+
+    The torch call reads an environment variable on every call (about a microsecond of
+    host time per dispatched call); a process that has seen a CUDA device keeps it.
+    """
+    global _CUDA_AVAILABLE
+    if not _CUDA_AVAILABLE:
+        _CUDA_AVAILABLE = torch.cuda.is_available()
+    return _CUDA_AVAILABLE
+
+
 def _capability(device: Optional[torch.device]) -> Optional[tuple[int, int]]:
-    if not torch.cuda.is_available():
+    if not _cuda_available():
         return None
     device = torch.device("cuda") if device is None else torch.device(device)
     if device.type != "cuda":
@@ -117,6 +132,21 @@ def is_cake_sage_sm120_supported(device: Optional[torch.device] = None) -> bool:
     """Whether ``device`` (the current CUDA device by default) runs the SM120 programs."""
 
     return _capability(device) in SM120_CAPABILITIES
+
+
+#: :func:`is_cake_sage_sm100_supported` per device a dispatched call ran on: answers that
+#: cannot change in the process (an indexed CUDA device once CUDA is available, or
+#: another device type).
+_SM100_SUPPORTED: dict = {}
+
+
+def _sm100_supported_on(device: torch.device) -> bool:
+    supported = _SM100_SUPPORTED.get(device)
+    if supported is None:
+        supported = is_cake_sage_sm100_supported(device)
+        if device.type != "cuda" or (device.index is not None and _CUDA_AVAILABLE):
+            _SM100_SUPPORTED[device] = supported
+    return supported
 
 
 def _sm100_arch(device_index: int) -> str:
@@ -157,6 +187,33 @@ def _check_tensor(
         )
 
 
+def _check_operands(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    device: torch.device,
+    kv_shape: tuple[int, int, int, int],
+    q_scale_shape: tuple[int, int, int],
+    k_scale_shape: tuple[int, int, int],
+) -> None:
+    """The checks of the attention's FP8 Q/K/V and scales, in order: raises at the first
+    that fails (``kv_shape`` is ``(B, Sk, Hkv, head_dim)``, ``q_scale_shape`` ``(B, H, Sq)``)."""
+    dim, kv_heads, heads = kv_shape[3], kv_shape[2], q_scale_shape[1]
+    if dim != HEAD_DIM:
+        raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
+    if kv_heads < 1 or heads % kv_heads != 0:
+        raise ValueError("num_heads must be a positive multiple of num_kv_heads")
+    _check_tensor("q", q, device, torch.float8_e4m3fn)
+    _check_tensor("k", k, device, torch.float8_e4m3fn, kv_shape)
+    _check_tensor("v", v, device, torch.float8_e4m3fn, kv_shape)
+    _check_tensor("q_scale", q_scale, device, torch.float32, q_scale_shape)
+    _check_tensor("k_scale", k_scale, device, torch.float32, k_scale_shape)
+    _check_tensor("v_scale", v_scale, device, torch.float32)
+
+
 #: Byte alignment of the BF16 Q/K/V the quantizers read with 32-byte vector loads.
 QUANTIZE_INPUT_ALIGNMENT = 32
 #: Byte alignment of the attention's FP8 Q/K/V (TMA bases), BF16 output (16-byte stores)
@@ -179,6 +236,9 @@ def _check_aligned(name: str, tensor: torch.Tensor, alignment: int) -> None:
 
 
 def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
+    # A finite positive float (NaN fails the comparison) is its own value.
+    if type(softmax_scale) is float and 0.0 < softmax_scale < math.inf:
+        return softmax_scale
     if softmax_scale is None:
         softmax_scale = dim**-0.5
     if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)):
@@ -195,19 +255,21 @@ def _softmax_scale(softmax_scale: Optional[float], dim: int) -> float:
 def _ffi_takes_torch_stream() -> bool:
     """Whether tvm-ffi launches on torch's current stream without a stream context.
 
-    From apache-tvm-ffi 0.1.16 a call whose arguments include CUDA torch tensors exported
-    through torch's DLPack exchange API (``torch.Tensor.__c_dlpack_exchange_api__``) sets
-    the call's environment stream to the producer's current work stream, i.e. what
-    ``tvm_ffi.use_torch_stream()`` sets; the context costs a few microseconds of host
-    time per call, which the small Sage-FP8 rows pay end to end.
+    From apache-tvm-ffi 0.1.11 (FlashInfer's minimum) a call whose arguments include a
+    CUDA torch tensor sets the environment stream of that tensor's device to torch's
+    current stream there (the capture stream inside a CUDA-graph capture) for the call's
+    duration: through the DLPack exchange API's ``current_work_stream`` when torch has
+    one (``__dlpack_c_exchange_api__``, native or installed by ``import tvm_ffi``), else
+    through ``torch._C._cuda_getCurrentRawStream``.  Every launch here passes Q (or the
+    quantizer's BF16 Q) first, so it runs on the current stream of Q's device, as torch
+    kernels do; a ``tvm_ffi.use_torch_stream()`` context around it costs several
+    microseconds of host time per call, which the small Sage-FP8 rows pay end to end.
     """
-    if getattr(torch.Tensor, "__c_dlpack_exchange_api__", None) is None:
-        return False
     try:
         version = tuple(int(x) for x in tvm_ffi.__version__.split(".")[:3])
     except (AttributeError, ValueError):
         return False
-    return version >= (0, 1, 16)
+    return version >= (0, 1, 11)
 
 
 _FFI_TAKES_TORCH_STREAM = _ffi_takes_torch_stream()
@@ -239,24 +301,270 @@ def _record(role: str, pdl: bool) -> Tuple[str, Tuple[int, ...]]:
 
 #: The one-launch quantizer record: 8-CTA clusters of 16 warps; a PDL build.
 _ONE_LAUNCH_RECORD = "quantize_qkv_c8w16"
-#: Selected KV blocks per row from which each architecture runs its second attention
-#: build: on SM100 the build whose next QK^T starts as soon as S is loaded
-#: (``qk_split``), which pays off from about ten blocks a row; on SM103 the per-tile
-#: step schedule (``cross_tile=False``), which the cross-tile stream does not beat on
-#: long rows.  Below the threshold, and when the record is absent, the default build runs.
-_SECOND_ATTENTION = {
-    "sm_100a": ("attention_qs", 10),
-    "sm_103a": ("attention_per_tile", 192),
+#: Selected KV blocks per row from which each architecture runs another attention
+#: build than the default, the highest threshold first.  ``attention_sd`` keeps two S
+#: buffers per softmax group, so the next QK^T of a group does not wait for its P.V; it
+#: pays off from about 23 blocks a row on both architectures.  On SM100,
+#: ``attention_qs`` (the next QK^T starts as soon as S is loaded) pays off from about
+#: ten.  Below every threshold, and when a record is absent, the default build runs.
+#: All these builds compute the same bits.
+_ATTENTION_ROUTES = {
+    "sm_100a": (("attention_sd", 23), ("attention_qs", 10)),
+    "sm_103a": (("attention_sd", 23),),
+}
+#: The tail-split build of ``attention_sd`` and, per architecture, the selected blocks a
+#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103;
+#: ``attention_sd_tsplit_p3`` below takes the split rows from 24 blocks a row, up to 64
+#: on SM103, once the grid holds a tile per SM): clusters of two CTAs, where the tiles
+#: of the last,
+#: partial wave of the persistent grid run as two halves of their KV blocks, one per
+#: CTA of a cluster, and the first half folds the second half's output and softmax
+#: statistics into its own.
+#: A split tile sums its softmax in another order (within the kernel's tolerances, the
+#: same bits on every run); the split depends on how the grid fills.
+_TAIL_SPLIT_ROLE = "attention_sd_tsplit"
+_TAIL_SPLIT = {"sm_100a": 24, "sm_103a": 32}
+#: The tail split of ``attention_sdp3`` (below) and, per architecture, the band of
+#: selected blocks a row ``(lo, hi)`` (``hi`` ``None``: no bound) in which it replaces
+#: ``attention_sd_tsplit`` once the grid holds a tile per SM (``total_tiles >= SMs``).
+#: It splits the same tiles, with the occupancy of its own record.
+_TAIL_SPLIT_P3_ROLE = "attention_sd_tsplit_p3"
+_TAIL_SPLIT_P3 = {"sm_100a": (24, None), "sm_103a": (24, 64)}
+#: Per architecture, how a combined call launches a split row of
+#: ``attention_sd_tsplit_p3`` with programmatic dependent launch after the one-launch
+#: quantizer.  On SM100 an eager PDL launch behind that quantizer runs this build's
+#: tiles about a fifth slower (most on the CTAs that hold a split tile), which costs
+#: more than the overlap saves; launched after the quantizer ends, or in a CUDA graph,
+#: it runs at full speed.  Each rule ``(waves, parts, max_selected)``: when the
+#: persistent grid runs at least ``waves`` waves, the split tiles fill at most
+#: ``1/parts`` of its slots (a tail split fills at most half of them) and the call
+#: selects at most ``max_selected`` blocks a row (``None``: no bound), the call
+#: launches the build without PDL.  When no rule holds it launches
+#: ``attention_sd_tsplit`` with PDL, which is then as fast or faster.  The other
+#: builds, and every build after the other quantizers, keep PDL.
+_TAIL_SPLIT_P3_SERIAL = {"sm_100a": ((3, 3, None), (3, 2, 47))}
+#: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
+#: next tile runs) and, per architecture, the band of selected blocks a row
+#: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
+#: every CTA of the persistent grid runs at least ``waves`` tiles
+#: (``total_tiles >= waves x SMs``).  It writes the default bits.
+_P3_ROLE = "attention_p3"
+_P3_BANDS = {"sm_100a": (6, 10, 5), "sm_103a": (8, 22, 2)}
+#: The ``s_dbuf`` build with the ``p3`` epilogue warpgroup and, per architecture, the
+#: windows ``(lo, hi, min_waves, max_waves[, min_q_blocks, max_rows])`` in which it
+#: replaces the build of an unsplit call: ``lo <= block_sparse_num <= hi`` and
+#: ``min_waves x SMs <= total_tiles`` (``< max_waves x SMs``; ``None``: no bound); the
+#: tiles per SM may be fractional.  The two optional fields bound the (batch, head) rows
+#: of the call: each holds at least ``min_q_blocks`` query blocks and there are at most
+#: ``max_rows`` of them.  Below half a wave, SM103 runs this build faster at 9 and 11
+#: blocks a row only on a single row of 24 query blocks or more (shorter rows, or more
+#: rows, lose on long KV).  A combined call after the one-launch quantizer skips the
+#: windows with these fields: an eager PDL launch of this build behind that quantizer
+#: runs slower there.  The windows come before ``_P3_BANDS``.  It writes the default
+#: bits.
+_SDP3_ROLE = "attention_sdp3"
+#: Per architecture, the unsplit ``attention_sdp3`` calls that a combined call gives up
+#: with PDL after the one-launch quantizer: up to ``sel`` selected blocks a row on fewer
+#: than ``waves`` waves (``total_tiles < waves x SMs``), ``(sel, waves)``.  On SM103 the
+#: eager PDL launch of that build behind the quantizer runs up to 12 % slower there;
+#: the call then launches ``attention_p3`` or the default build (the same bits).
+_SDP3_GIVE_WAY = {"sm_103a": (22, 3)}
+_SDP3_BANDS = {
+    "sm_100a": (
+        (6, 10, 0, 5),
+        (9, 9, 5, 42),
+        (10, 10, 5, 12),
+        (11, 22, 0, None),
+        (23, 127, 1, None),
+    ),
+    "sm_103a": (
+        (5, 6, 0, 0.5),
+        (5, 5, 1, 8),
+        (6, 6, 2.5, 5),
+        (7, 7, 3, 8),
+        (6, 22, 1, 2),
+        (23, 127, 1, None),
+        (9, 9, 0, 0.5, 24, 1),
+        (11, 11, 0, 0.5, 24, 1),
+    ),
 }
 
 
 def _attention_role(arch: str, block_sparse_num: int) -> str:
     """The attention record of a call with ``block_sparse_num`` selected blocks a row
     (the index capacity with per-row counts)."""
-    role, min_sel = _SECOND_ATTENTION.get(arch, ("", 0))
-    if role and block_sparse_num >= min_sel and role in _loader.MODULES:
-        return role
+    for role, min_sel in _ATTENTION_ROUTES.get(arch, ()):
+        if block_sparse_num >= min_sel and role in _loader.MODULES:
+            return role
     return "attention"
+
+
+def _p3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
+    """Does a call with ``block_sparse_num`` selected blocks a row and ``tiles`` tiles
+    run the ``p3`` build on a device of ``sms`` SMs?"""
+    band = _P3_BANDS.get(arch)
+    return (
+        band is not None
+        and band[0] <= block_sparse_num <= band[1]
+        and tiles >= band[2] * sms
+        and _P3_ROLE in _loader.MODULES
+    )
+
+
+def _sdp3(
+    arch: str, block_sparse_num: int, tiles: int, sms: int, q_blocks: int = 0
+) -> bool:
+    """Does an unsplit call with ``block_sparse_num`` selected blocks a row, ``tiles``
+    tiles and ``q_blocks`` query blocks a (batch, head) row run the ``attention_sdp3``
+    build on a device of ``sms`` SMs?  ``tiles`` is ``q_blocks`` times the rows."""
+    if _SDP3_ROLE not in _loader.MODULES:
+        return False
+    return any(
+        lo <= block_sparse_num <= hi
+        and tiles >= min_waves * sms
+        and (max_waves is None or tiles < max_waves * sms)
+        and (not rows or (q_blocks >= rows[0] and tiles <= rows[1] * q_blocks))
+        for lo, hi, min_waves, max_waves, *rows in _SDP3_BANDS.get(arch, ())
+    )
+
+
+def _tail_split(
+    arch: str, tiles: int, block_sparse_num: int, device_index: int, p3: bool = False
+) -> Optional[Tuple[int, int, int]]:
+    """``(grid, split_from, items)`` of the tail-split build for a call, else ``None``.
+
+    It runs when the last wave of the persistent grid is partial, leaves at least 10 %
+    of the tile slots idle and fits twice in them: its tiles, from ``split_from`` on,
+    become two items each, and ``items`` is the stream length.  ``None`` below the
+    selected-block threshold, without the record, and inside a CUDA-graph capture
+    whose occupancy no eager call has queried yet.  ``p3=True``: the plan of
+    ``attention_sd_tsplit_p3``, ``None`` outside its band of selected blocks or below
+    a tile per SM.
+    """
+    if p3:
+        name, band = _TAIL_SPLIT_P3_ROLE, _TAIL_SPLIT_P3.get(arch)
+        if (
+            band is None
+            or block_sparse_num < band[0]
+            or (band[1] is not None and block_sparse_num > band[1])
+            or tiles < _loader.sm_count(device_index)
+        ):
+            return None
+    else:
+        name, min_sel = _TAIL_SPLIT_ROLE, _TAIL_SPLIT.get(arch)
+        if min_sel is None or block_sparse_num < min_sel:
+            return None
+    if name not in _loader.MODULES:
+        return None
+    resident = _tma_resident(name, device_index)
+    if not resident:
+        return None
+    slots = 2 * min(_loader.sm_count(device_index) // 2, resident)
+    if slots < 2:
+        return None
+    full = tiles // slots * slots
+    tail = tiles - full
+    waves = _ceil_div(tiles, slots)
+    if not tail or 2 * tail > slots or 10 * waves * slots < 11 * tiles:
+        return None
+    return min(full + 2 * tail, slots), full, full + 2 * tail
+
+
+def _p3_serial(
+    arch: str, plan: Tuple[int, int, int], block_sparse_num: int
+) -> Optional[bool]:
+    """After the one-launch quantizer, does the ``attention_sd_tsplit_p3`` plan
+    ``(grid, split_from, items)`` of a call with ``block_sparse_num`` selected blocks a
+    row launch without PDL (``True``) or give way to ``attention_sd_tsplit``
+    (``False``)?  ``None``: the architecture keeps PDL."""
+    rules = _TAIL_SPLIT_P3_SERIAL.get(arch)
+    if rules is None:
+        return None
+    grid, split_from, items = plan
+    tail = (items - split_from) // 2
+    return any(
+        split_from >= (waves - 1) * grid
+        and parts * tail <= grid
+        and (max_selected is None or block_sparse_num <= max_selected)
+        for waves, parts, max_selected in rules
+    )
+
+
+def _sdp3_gives_way(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
+    """After the one-launch quantizer, does a PDL call give up ``attention_sdp3``
+    (``_SDP3_GIVE_WAY``)?"""
+    rule = _SDP3_GIVE_WAY.get(arch)
+    return rule is not None and block_sparse_num <= rule[0] and tiles < rule[1] * sms
+
+
+#: The launch route of each call key ``(arch, block_sparse_num, total_tiles, device,
+#: pdl, after_one_launch, q_blocks)``: ``(record, items, split, tail)``, where
+#: ``items`` is the ``total_tiles`` argument, ``split`` the tail-split parameters and
+#: ``tail`` the PDL flag and the grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
+#: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
+#: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_TAIL_SPLIT_P3_SERIAL``,
+#: ``_SDP3_GIVE_WAY``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
+_ROUTES: dict = {}
+
+
+def _route(
+    arch: str,
+    block_sparse_num: int,
+    total_tiles: int,
+    device_index: int,
+    pdl: bool,
+    after_one_launch: bool = False,
+    q_blocks: int = 0,
+) -> Tuple[str, int, Tuple[int, ...], Tuple[int, ...]]:
+    key = (
+        arch,
+        block_sparse_num,
+        total_tiles,
+        device_index,
+        pdl,
+        after_one_launch,
+        q_blocks,
+    )
+    hit = _ROUTES.get(key)
+    if hit is not None:
+        return hit
+    role = _attention_role(arch, block_sparse_num)
+    sms = _loader.sm_count(device_index)
+    grid = max(1, min(total_tiles, sms))
+    items = total_tiles
+    split: Tuple[int, ...] = ()
+    serial = False
+    if role == "attention_sd":
+        for p3, name in ((True, _TAIL_SPLIT_P3_ROLE), (False, _TAIL_SPLIT_ROLE)):
+            plan = _tail_split(arch, total_tiles, block_sparse_num, device_index, p3)
+            if plan is None:
+                continue
+            if p3 and pdl and after_one_launch:
+                launch = _p3_serial(arch, plan, block_sparse_num)
+                if launch is False:
+                    continue
+                serial = launch is True
+            role = name
+            grid, split_from, items = plan
+            split = (split_from,)
+            break
+    if not split:
+        rows_q_blocks = 0 if after_one_launch else q_blocks
+        if _sdp3(arch, block_sparse_num, total_tiles, sms, rows_q_blocks) and not (
+            pdl
+            and after_one_launch
+            and _sdp3_gives_way(arch, block_sparse_num, total_tiles, sms)
+        ):
+            role = _SDP3_ROLE
+        elif _p3(arch, block_sparse_num, total_tiles, sms):
+            role = _P3_ROLE
+    record, flag = _record(role, pdl)
+    if serial and flag:
+        flag = (0,)
+    hit = (record, items, split, flag + (grid, 1, 1))
+    if not torch.cuda.is_current_stream_capturing():
+        _ROUTES[key] = hit
+    return hit
 
 
 def _attention_operands(
@@ -277,6 +585,7 @@ def _attention_operands(
     enable_pdl: Optional[bool],
     operands_checked: bool = False,
     check_addresses: bool = True,
+    after_one_launch: bool = False,
 ):
     """Validate one attention call and return ``(record, arch, args, out, lse)``.
 
@@ -284,9 +593,20 @@ def _attention_operands(
     nothing is launched or loaded.  ``operands_checked`` skips the checks of Q/K/V and
     their scales, which the quantizer of :func:`bsa_attn_sm100_sage_quantize_fwd_cake`
     has just allocated in this layout.  ``check_addresses=False`` skips the alignment
-    checks (fake tensors have no data).
+    checks (fake tensors have no data).  ``after_one_launch``: the call follows the
+    one-launch quantizer in the same launch sequence (``_TAIL_SPLIT_P3_SERIAL``).
     """
-    if not operands_checked:
+    # Each fast path below is one expression that holds exactly when none of the checks
+    # it guards would raise; when it does not hold, those checks run in their order and
+    # raise the same exception (the host time of the checks is most of a small call's).
+    if not operands_checked and not (
+        isinstance(q, torch.Tensor)
+        and q.ndim == 4
+        and isinstance(k, torch.Tensor)
+        and k.ndim == 4
+        and isinstance(v, torch.Tensor)
+        and v.ndim == 4
+    ):
         for name, t in (("q", q), ("k", k), ("v", v)):
             if not isinstance(t, torch.Tensor) or t.ndim != 4:
                 raise ValueError(f"{name} must be a rank-4 BSHD tensor")
@@ -295,34 +615,60 @@ def _attention_operands(
         raise ValueError("q must be a CUDA tensor")
     device_index = _device_index(device)
     arch = _sm100_arch(device_index)
-    batch, seqlen_q, heads, dim = (int(x) for x in q.shape)
-    seqlen_k, kv_heads = int(k.shape[1]), int(k.shape[2])
+    batch, seqlen_q, heads, dim = map(int, q.shape)
+    k_shape = k.shape
+    seqlen_k, kv_heads = int(k_shape[1]), int(k_shape[2])
     q_blocks = _ceil_div(seqlen_q, BLOCK_M)
     k_blocks = _ceil_div(seqlen_k, KV_BLOCK)
     k_scale_groups = _ceil_div(seqlen_k, K_SCALE_GROUP)
     if not operands_checked:
-        if dim != HEAD_DIM:
-            raise ValueError(f"head_dim must be {HEAD_DIM}, got {dim}")
-        if kv_heads < 1 or heads % kv_heads != 0:
-            raise ValueError("num_heads must be a positive multiple of num_kv_heads")
-        _check_tensor("q", q, device, torch.float8_e4m3fn)
-        _check_tensor(
-            "k", k, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
-        )
-        _check_tensor(
-            "v", v, device, torch.float8_e4m3fn, (batch, seqlen_k, kv_heads, dim)
-        )
-        _check_tensor(
-            "q_scale", q_scale, device, torch.float32, (batch, heads, seqlen_q)
-        )
-        _check_tensor(
-            "k_scale",
-            k_scale,
-            device,
-            torch.float32,
-            (batch, kv_heads, k_scale_groups),
-        )
-        _check_tensor("v_scale", v_scale, device, torch.float32)
+        kv_shape = (batch, seqlen_k, kv_heads, dim)
+        # The element limit of q_scale, k_scale and v follows from those of q and k
+        # and the shapes (head_dim 128, 16 tokens per K scale).
+        if not (
+            dim == HEAD_DIM
+            and kv_heads >= 1
+            and heads % kv_heads == 0
+            and q.dtype == torch.float8_e4m3fn
+            and q.is_contiguous()
+            and q.numel() <= MAX_FLAT_ELEMENTS
+            and k.dtype == torch.float8_e4m3fn
+            and k_shape == kv_shape
+            and k.device == device
+            and k.is_contiguous()
+            and k.numel() <= MAX_FLAT_ELEMENTS
+            and v.dtype == torch.float8_e4m3fn
+            and v.shape == kv_shape
+            and v.device == device
+            and v.is_contiguous()
+            and isinstance(q_scale, torch.Tensor)
+            and q_scale.dtype == torch.float32
+            and q_scale.shape == (batch, heads, seqlen_q)
+            and q_scale.device == device
+            and q_scale.is_contiguous()
+            and isinstance(k_scale, torch.Tensor)
+            and k_scale.dtype == torch.float32
+            and k_scale.shape == (batch, kv_heads, k_scale_groups)
+            and k_scale.device == device
+            and k_scale.is_contiguous()
+            and isinstance(v_scale, torch.Tensor)
+            and v_scale.dtype == torch.float32
+            and v_scale.device == device
+            and v_scale.is_contiguous()
+            and v_scale.numel() <= MAX_FLAT_ELEMENTS
+        ):
+            _check_operands(
+                q,
+                k,
+                v,
+                q_scale,
+                k_scale,
+                v_scale,
+                device,
+                kv_shape,
+                (batch, heads, seqlen_q),
+                (batch, kv_heads, k_scale_groups),
+            )
         if (
             check_addresses
             and (q.data_ptr() | k.data_ptr() | v.data_ptr() | v_scale.data_ptr())
@@ -330,22 +676,32 @@ def _attention_operands(
         ):
             for name, t in (("q", q), ("k", k), ("v", v), ("v_scale", v_scale)):
                 _check_aligned(name, t, ATTENTION_ALIGNMENT)
-    if v_scale.dim() == 3 and tuple(v_scale.shape) == (batch, kv_heads, dim):
+    v_scale_shape = v_scale.shape
+    if v_scale_shape == (batch, kv_heads, dim):
         v_scale_batch_stride = kv_heads * dim
-    elif tuple(v_scale.shape) == (kv_heads, dim):
+    elif v_scale_shape == (kv_heads, dim):
         v_scale_batch_stride = 0
     else:
         raise ValueError(
             f"v_scale must be [Hkv,128]={(kv_heads, dim)} or [B,Hkv,128]={(batch, kv_heads, dim)}, "
-            f"got {tuple(v_scale.shape)}"
+            f"got {tuple(v_scale_shape)}"
         )
-    if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
-        batch,
-        heads,
-        q_blocks,
+    if not (
+        q2k_block_index.ndim == 4
+        and q2k_block_index.shape[:3] == (batch, heads, q_blocks)
+        and isinstance(q2k_block_index, torch.Tensor)
+        and q2k_block_index.dtype == torch.int32
+        and q2k_block_index.device == device
+        and q2k_block_index.is_contiguous()
+        and q2k_block_index.numel() <= MAX_FLAT_ELEMENTS
     ):
-        raise ValueError(f"q2k_block_index must be int32 [B,H,{q_blocks},capacity]")
-    _check_tensor("q2k_block_index", q2k_block_index, device, torch.int32)
+        if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
+            batch,
+            heads,
+            q_blocks,
+        ):
+            raise ValueError(f"q2k_block_index must be int32 [B,H,{q_blocks},capacity]")
+        _check_tensor("q2k_block_index", q2k_block_index, device, torch.int32)
     capacity = int(q2k_block_index.shape[-1])
     if capacity < 1:
         raise ValueError("q2k_block_index must have positive capacity")
@@ -398,8 +754,17 @@ def _attention_operands(
     if return_lse and lse is not None:
         _check_tensor("lse", lse, device, torch.float32, (batch, heads, seqlen_q))
     if out is None:
-        out = torch.empty(
-            (batch, seqlen_q, heads, dim), dtype=torch.bfloat16, device=device
+        # Shaped like Q: ``empty_like`` costs about half a microsecond less host time
+        # than ``empty`` with a shape and device.  Fake tensors (``check_addresses=False``)
+        # keep ``empty``, the op a fake-mode trace of the call records.
+        out = (
+            torch.empty_like(
+                q, dtype=torch.bfloat16, memory_format=torch.contiguous_format
+            )
+            if check_addresses
+            else torch.empty(
+                (batch, seqlen_q, heads, dim), dtype=torch.bfloat16, device=device
+            )
         )
     if return_lse:
         if lse is None:
@@ -410,14 +775,25 @@ def _attention_operands(
     else:
         lse_arg = q_scale
 
-    total_tiles = batch * heads * q_blocks
+    block_sparse_num = int(block_sparse_num)
     pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
+    key = (
+        arch,
+        block_sparse_num,
+        batch * heads * q_blocks,
+        device_index,
+        pdl,
+        after_one_launch,
+        q_blocks,
+    )
+    hit = _ROUTES.get(key)
+    record, items, split, tail = _route(*key) if hit is None else hit
     # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
-    # the PDL launch flag, grid).
+    # the PDL launch flag, grid).  The bindings take the float8_e4m3fn Q/K/V as they are.
     args: Tuple[Any, ...] = (
-        q.view(torch.uint8),
-        k.view(torch.uint8),
-        v.view(torch.uint8),
+        q,
+        k,
+        v,
         out,
         lse_arg,
         q_scale,
@@ -434,23 +810,17 @@ def _attention_operands(
         k_blocks,
         k_scale_groups,
         capacity,
-        int(block_sparse_num),
+        block_sparse_num,
         int(has_block_nums),
         block_sizes_mode,
         v_scale_batch_stride,
-        total_tiles,
+        items,
         scale * _LOG2E,
         int(return_lse),
+        *split,
+        *tail,
     )
-    record, tail = _record(_attention_role(arch, int(block_sparse_num)), pdl)
-    args += tail + (max(1, min(total_tiles, _loader.sm_count(device_index))), 1, 1)
     return record, arch, args, out, (lse if return_lse else None)
-
-
-def _attention_call(*args, **kwargs):
-    """Validate one attention call and return ``((run, args), out, lse)``; launches nothing."""
-    record, arch, call_args, out, lse = _attention_operands(*args, **kwargs)
-    return (_loader.entry(record, arch), call_args), out, lse
 
 
 def bsa_attn_sm100_sage_fwd_cake(
@@ -504,7 +874,7 @@ def bsa_attn_sm100_sage_fwd_cake(
     kernel parameters, so the call is CUDA-Graph capturable and shares no device
     state between streams.
     """
-    call, out, lse = _attention_call(
+    record, arch, args, out, lse = _attention_operands(
         q,
         k,
         v,
@@ -521,7 +891,11 @@ def bsa_attn_sm100_sage_fwd_cake(
         lse,
         enable_pdl,
     )
-    _launch(call)
+    run = _loader.entry(record, arch)
+    if _FFI_TAKES_TORCH_STREAM:
+        run(*args)
+    else:
+        _launch((run, args))
     return out, lse
 
 
@@ -542,14 +916,16 @@ _TMA_MAX_SEQLEN_K = 4096
 _TMA_CLUSTER_CTAS, _TMA_VBOX_TOKENS, _TMA_VBOXES = 4, 256, 4
 
 
-#: Resident clusters per (TMA record, device), queried outside any CUDA-graph capture:
-#: the occupancy query loads a probe module, which invalidates a capture in progress.
+#: Resident clusters per (cluster record, device), queried outside any CUDA-graph
+#: capture: the occupancy query loads a probe module, which invalidates a capture in
+#: progress.
 _TMA_RESIDENT: dict = {}
 
 
 def _tma_resident(name: str, device_index: int) -> Optional[int]:
-    """Clusters of ``name`` the device holds at once; ``None`` inside a capture before
-    any eager call has queried them (the caller then takes another quantizer)."""
+    """Clusters of record ``name`` (a TMA-ring quantizer or the tail-split attention)
+    the device holds at once; ``None`` inside a capture before any eager call has
+    queried them (the caller then takes another build)."""
     key = (name, device_index)
     resident = _TMA_RESIDENT.get(key)
     if resident is None:
@@ -649,6 +1025,19 @@ def _quantize_calls(
     enable_pdl: Optional[bool],
 ):
     """Validate one quantizer call and return ``(calls, outputs)``; launches nothing."""
+    calls, outputs, _ = _quantize_program(q, k, v, impl, enable_pdl)
+    return calls, outputs
+
+
+def _quantize_program(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    impl: str,
+    enable_pdl: Optional[bool],
+):
+    """``(calls, outputs, impl)`` of one quantizer call, ``impl`` the program it runs
+    (``"one_launch"``, ``"tma"`` or ``"two_launch"``); launches nothing."""
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.ndim != 4:
             raise ValueError(f"{name} must be a rank-4 BSHD tensor")
@@ -771,7 +1160,7 @@ def _quantize_calls(
                     ),
                 ),
             )
-            return calls_tma, (q8, k8, v8, q_scale, k_scale, v_scale)
+            return calls_tma, (q8, k8, v8, q_scale, k_scale, v_scale), "tma"
         passes = _ceil_div(max(seqlen_q, seqlen_k), 16 * _CLUSTER_WARPS * _CLUSTER_CTAS)
         calls: Tuple[Tuple[Any, Tuple[Any, ...]], ...] = (
             (
@@ -800,7 +1189,7 @@ def _quantize_calls(
                 ),
             ),
         )
-        return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
+        return calls, (q8, k8, v8, q_scale, k_scale, v_scale), "one_launch"
     q_scale = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=device)
     k_scale = torch.empty((batch, kv_heads, groups), dtype=torch.float32, device=device)
     v_scale = torch.empty((batch, kv_heads, dim), dtype=torch.float32, device=device)
@@ -857,7 +1246,7 @@ def _quantize_calls(
             ),
         ),
     )
-    return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
+    return calls, (q8, k8, v8, q_scale, k_scale, v_scale), "two_launch"
 
 
 def sage_fp8_quantize_sm100(
@@ -926,10 +1315,10 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
     host time of the attention call does not separate the quantizer from the attention
     kernel on the device.
     """
-    calls, (q8, k8, v8, q_scale, k_scale, v_scale) = _quantize_calls(
+    calls, (q8, k8, v8, q_scale, k_scale, v_scale), impl = _quantize_program(
         q, k, v, "auto", enable_pdl
     )
-    attention, out, lse = _attention_call(
+    record, arch, args, out, lse = _attention_operands(
         q8,
         k8,
         v8,
@@ -946,8 +1335,9 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
         lse,
         enable_pdl,
         operands_checked=True,
+        after_one_launch=impl == "one_launch",
     )
-    _launch(*calls, attention)
+    _launch(*calls, (_loader.entry(record, arch), args))
     return out, lse
 
 
@@ -980,9 +1370,7 @@ def sm100_sage_fwd_cake_dispatch(
     loads the kernel and returns the allocated outputs without launching it; the address
     checks are skipped (fake tensors have no data).
     """
-    if fallback and not (
-        isinstance(q, torch.Tensor) and is_cake_sage_sm100_supported(q.device)
-    ):
+    if fallback and not (isinstance(q, torch.Tensor) and _sm100_supported_on(q.device)):
         return None
     try:
         record, arch, args, out, lse = _attention_operands(
@@ -1009,7 +1397,10 @@ def sm100_sage_fwd_cake_dispatch(
         raise
     run = _loader.entry(record, arch)
     if not fake:
-        _launch((run, args))
+        if _FFI_TAKES_TORCH_STREAM:
+            run(*args)
+        else:
+            _launch((run, args))
     return out, lse
 
 

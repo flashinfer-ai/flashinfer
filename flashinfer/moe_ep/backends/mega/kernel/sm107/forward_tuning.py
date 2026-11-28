@@ -21,8 +21,10 @@ class ForwardExecution:
         *,
         quantize_input: bool,
         output: torch.Tensor | None,
+        shared_weights=None,
     ):
         self.backend, self.tensors = backend, tensors
+        self.shared_weights = shared_weights
         self.quantize_input, self.output = quantize_input, output
 
     def contract(self):
@@ -48,6 +50,11 @@ class ForwardExecution:
             "fc1_activation_per_token_scale",
         )
         inputs = {name: getattr(self.tensors, name) for name in batched}
+        for name in ("shared_hidden_states", "shared_scales"):
+            value = getattr(self.tensors, name, None)
+            if value is not None:
+                inputs[name] = value
+                batched = (*batched, name)
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             value = getattr(self.tensors, name)
             inputs[name] = (
@@ -80,7 +87,7 @@ class ForwardExecution:
         }
 
     def make_trial(self, workspace):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         config = dataclasses.replace(
             self.backend._kernel_config,
@@ -89,13 +96,15 @@ class ForwardExecution:
         )
         backend = type(self.backend)(config)
         backend.bind_ep_bootstrap(self.backend._ep_bootstrap)
+        if self.shared_weights is not None:
+            workspace.bind_shared_weights(self.shared_weights)
         return _ForwardTrial(self, backend, workspace)
 
     def tune(self, l1, l2, workspace, *, force_tune=False, **kwargs):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _choose_protocol,
         )
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             RubinTuningProtocol,
         )
 
@@ -121,4 +130,9 @@ class _ForwardTrial:
         self.backend.stage_inputs(
             execution.tensors, self.workspace, quantize_input=execution.quantize_input
         )
-        self.backend.compute(self.workspace, (l1, l2), output=execution.output)
+        weights = (l1, l2)
+        if execution.shared_weights is not None:
+            from .shared_expert import Sm107SharedExpertWeights
+
+            weights = Sm107SharedExpertWeights(weights, execution.shared_weights)
+        self.backend.compute(self.workspace, weights, output=execution.output)

@@ -3,8 +3,41 @@
 """The delegate behind ``batch_invariant=True`` on ``BatchDecodeWithPagedKVCacheWrapper``, ``BatchPrefillWithPagedKVCacheWrapper`` and
 ``BatchPrefillWithRaggedKVCacheWrapper``: the wrappers' ``plan`` / ``run`` hand their arguments here, the class's typed checks raise
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
-engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
-its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
+engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim and mask mode: under the causal
+class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class (``causal=False`` on
+the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key count and its head
+alone. The three wrappers compute the same bits for the same token of the same class.
+Chunked prefill: under the causal class a request cut into chunks (each later chunk over the keys cached so far) reproduces the
+one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
+KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
+
+``run(..., return_lse=True)`` also returns the class's LSE member (``spec.lse_term``): fp32, ``(total_q, num_qo_heads)``, base 2,
+or -- on the prefill wrappers -- base e (``lse_base="ln"``, the declared in-kernel multiply by ``fp32(ln 2)``) and the
+``(num_qo_heads, total_q)`` layout (``lse_layout="HN"``, a copy of the same bits). It reads the ``(m, l)`` that normalise the
+output: the output bits are the same with and without it, and its receipt is its own
+(``fingerprint(<wrapper>, head_dim=..., causal=..., lse_base=...)``).
+
+``sinks`` (``run(..., sinks=)`` on the paged wrappers, the ``_sinks`` attribute of the ragged one), an fp32 ``(num_qo_heads,)``
+tensor of per-head sink logits, selects the class's sink member (``spec.sink_merge``): head ``h``'s rows get one virtual key
+of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
+row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
+are ``fingerprint(<wrapper>, head_dim=..., causal=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
+which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
+choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
+The values are not checked. A ``+inf`` or NaN sink gives NaN on its head's rows and a ``-inf`` sink the bits of the run
+without sinks (``spec.sink_merge``); the step works on the base-2 value ``mul(sinks[h], LOG2E)``, so a finite sink above
+about ``2.36e38`` (the value overflows to ``+inf``) gives NaN as well, and one below about ``-2.36e38`` (``-inf``) the
+bits of the run without sinks.
+
+Both members exist in both mask modes: they read a row's final ``(m, l)``, which the non-causal class forms over the request's
+whole key range. Under ``causal=False`` (``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) every query row of
+a request has the same visible keys, so a row's LSE depends on its request's key count, its head and its own query alone, and
+the sink joins that key set; a window stays refused, ``has_sinks`` and the buffer checks are the same, and the receipts take the
+mode (``fingerprint(<wrapper>, head_dim=..., causal=False, lse_base=... | sinks=True)``: ``attn-bf16-d<D>-nc-lse-<base>-...``,
+``attn-bf16-d<D>-nc-sink-...``, ``attn-bf16-d<D>-nc-sink-lse-<base>-...``). No row of either class is empty (``plan()``
+requires ``kv_len >= q_len`` under the causal class and a key for every request with query tokens under the non-causal one),
+so no stored LSE is that of an empty row.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -24,7 +57,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, LSE_BASES, scale_log2
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -87,6 +120,7 @@ class BatchInvariantAttention:
         self._sm_scale: Optional[float] = None
         self._scale_log2 = 0.0
         self._window_left = -1
+        self._causal = True  # the planned class's mask mode
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
         self._page = 1
@@ -150,25 +184,28 @@ class BatchInvariantAttention:
         page_size: int,
         window_left: int = -1,
         q_len_per_req: int = 1,
+        *,
+        causal: bool = True,
     ) -> int:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
         fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits)."""
-        D = int(head_dim)
-        if D not in HEAD_DIMS:
-            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
-        kv_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        if self.kind == "decode":
-            qo_host = torch.arange(0, kv_host.numel(), dtype=torch.int64) * int(
-                q_len_per_req
+        D = self._check_head_dim(head_dim)
+        self._check_heads(num_qo_heads, num_kv_heads)
+        page_size = self._check_page_size(page_size)
+        causal, window_left = self._check_mask_mode(causal, window_left)
+        qo_host, kv_host = self._host_offsets(qo_indptr, kv_indptr, q_len_per_req)
+        last_host = None
+        if self.kind != "ragged":
+            if kv_last_page_len is None:
+                raise unsupported(
+                    CLASS,
+                    "a paged plan without kv_last_page_len",
+                    "the paged KV CSR triple",
+                )
+            last_host = self._host_last_page_len(
+                kv_last_page_len, kv_host.numel() - 1, page_size
             )
-        else:
-            assert qo_indptr is not None
-            qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        last_host = (
-            kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
-            if (self.kind != "ragged" and kv_last_page_len is not None)
-            else None
-        )
+        self._check_requests(qo_host, kv_host, last_host, page_size, causal)
         return engine.workspace_bytes(
             qo_host,
             kv_host,
@@ -176,12 +213,182 @@ class BatchInvariantAttention:
             num_qo_heads,
             num_kv_heads,
             D,
-            1 if self.kind == "ragged" else page_size,
-            -1 if window_left is None else int(window_left),
+            page_size,
+            window_left,
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
+            causal=causal,
         )
+
+    # ------------------------------------------------------------------ the checks plan() and workspace_bytes() share
+    @staticmethod
+    def _check_head_dim(head_dim: int) -> int:
+        D = int(head_dim)
+        if D not in HEAD_DIMS:
+            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
+        return D
+
+    @staticmethod
+    def _check_heads(num_qo_heads: int, num_kv_heads: int) -> None:
+        if (
+            num_kv_heads <= 0
+            or num_qo_heads < num_kv_heads
+            or num_qo_heads % num_kv_heads
+        ):
+            raise unsupported(
+                CLASS,
+                f"{num_qo_heads} query heads over {num_kv_heads} KV heads",
+                "num_qo_heads a positive multiple of num_kv_heads",
+            )
+        g = num_qo_heads // num_kv_heads
+        if g > 128:
+            raise unsupported(
+                CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
+            )
+
+    def _check_page_size(self, page_size: int) -> int:
+        """The planner's page size: 1 for the ragged layout, else the caller's (a power of two up to ``_MAX_PAGE``)."""
+        if self.kind == "ragged":
+            page_size = 1
+        if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):
+            raise unsupported(
+                CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
+            )
+        return page_size
+
+    @staticmethod
+    def _check_mask_mode(causal: bool, window_left: Optional[int]) -> Tuple[bool, int]:
+        """The mask mode and the window as the planner takes them: a window belongs to the causal class alone."""
+        causal = bool(causal)
+        if window_left is None:
+            window_left = -1
+        window_left = int(window_left)
+        if window_left < -1:
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left}",
+                "window_left >= 0, or -1 for no window",
+            )
+        if not causal and window_left >= 0:
+            # a symmetric window over a non-causal row would be a further class; the non-causal class sees every key
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} with causal=False",
+                "the whole key range under the non-causal class (a window belongs to the causal class)",
+            )
+        return causal, window_left
+
+    def _host_offsets(
+        self,
+        qo_indptr: Optional[torch.Tensor],
+        kv_indptr: torch.Tensor,
+        q_len_per_req: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The query and KV offsets on the host as int64 (decode: ``q_len_per_req`` query tokens per request), checked for
+        the planner: one KV range per request, non-negative offsets below 2^31, query rows from row 0."""
+        if self.kind == "decode":
+            if q_len_per_req < 1:
+                raise unsupported(
+                    CLASS,
+                    f"q_len_per_req {q_len_per_req}",
+                    "at least one query token per request",
+                )
+            batch = int(kv_indptr.numel()) - 1
+            qo_indptr = torch.arange(
+                0, batch + 1, dtype=torch.int32, device="cpu"
+            ) * int(q_len_per_req)
+        else:
+            if qo_indptr is None:
+                raise unsupported(
+                    CLASS, "a plan without qo_indptr", "the packed query offsets"
+                )
+        kv_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        if bool((kv_host < 0).any()):
+            raise unsupported(
+                CLASS,
+                f"a negative kv_indptr entry ({int(kv_host.min())})",
+                "non-negative KV offsets",
+            )
+        if qo_host.numel() != kv_host.numel():
+            raise unsupported(
+                CLASS,
+                f"{qo_host.numel() - 1} query requests over {kv_host.numel() - 1} KV requests",
+                "one KV range per request",
+            )
+        if qo_host.numel() and int(qo_host[0]) != 0:
+            raise unsupported(
+                CLASS,
+                f"qo_indptr starting at {int(qo_host[0])}",
+                "qo_indptr[0] == 0 (the packed query rows start at row 0)",
+            )
+        if kv_host.numel() and int(kv_host[-1]) >= 2**31:
+            raise unsupported(
+                CLASS,
+                f"kv_indptr[-1] = {int(kv_host[-1])}",
+                "page-table offsets below 2^31 (the kernels read them as int32)",
+            )
+        return qo_host, kv_host
+
+    @staticmethod
+    def _host_last_page_len(
+        kv_last_page_len: torch.Tensor, n_requests: int, page_size: int
+    ) -> torch.Tensor:
+        last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
+        if last_host.numel() != n_requests:
+            raise unsupported(
+                CLASS,
+                f"kv_last_page_len of {last_host.numel()} entries for {n_requests} requests",
+                "one last-page length per request",
+            )
+        if bool(((last_host < 0) | (last_host > page_size)).any()):
+            raise unsupported(
+                CLASS,
+                "a kv_last_page_len outside 0..page_size",
+                f"last-page lengths in 0..{page_size}",
+            )
+        return last_host
+
+    @staticmethod
+    def _check_requests(
+        qo_host: torch.Tensor,
+        kv_host: torch.Tensor,
+        last_host: Optional[torch.Tensor],
+        page_size: int,
+        causal: bool,
+    ) -> None:
+        """Every request's query and key counts against the planned class (``last_host`` is ``None`` for the ragged layout,
+        whose ``kv_host`` holds token offsets): the causal class needs ``kv_len >= q_len``, the non-causal class a key for
+        every request with query tokens."""
+        kv_spans = kv_host[1:] - kv_host[:-1]  # tokens (ragged) or pages
+        if last_host is None:
+            kv_lens = kv_spans.tolist()
+        else:
+            # a request without pages has no keys, whatever its last-page entry (the planner's rule)
+            kv_lens = torch.where(
+                kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
+            ).tolist()
+        q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
+        for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
+            if ql < 0 or kl < 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with a decreasing qo_indptr / kv_indptr",
+                    "non-decreasing offsets",
+                )
+            if causal and ql > kl:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with {ql} query tokens over {kl} keys",
+                    "kv_len >= q_len per request (the causal class)",
+                )
+            if not causal and ql > 0 and kl == 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with {ql} query tokens over no key",
+                    "at least one key per request with query tokens (a non-causal row sees its request's keys)",
+                )
 
     # ------------------------------------------------------------------ plan
     def plan(
@@ -214,32 +421,20 @@ class BatchInvariantAttention:
         use_token_head_sf: bool = False,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        has_sinks: Optional[bool] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
-        D = int(head_dim_qk)
-        if D not in HEAD_DIMS:
-            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``has_sinks`` declares
+        whether every ``run()`` of this plan is given sinks (``True`` / ``False``: a run that departs from it raises);
+        ``None`` leaves the choice to each run."""
+        D = self._check_head_dim(head_dim_qk)
         if head_dim_vo is not None and int(head_dim_vo) != D:
             raise unsupported(
                 CLASS,
                 f"head_dim_vo {head_dim_vo} with head_dim_qk {D}",
                 "equal query and value head dims",
             )
-        if (
-            num_kv_heads <= 0
-            or num_qo_heads < num_kv_heads
-            or num_qo_heads % num_kv_heads
-        ):
-            raise unsupported(
-                CLASS,
-                f"{num_qo_heads} query heads over {num_kv_heads} KV heads",
-                "num_qo_heads a positive multiple of num_kv_heads",
-            )
+        self._check_heads(num_qo_heads, num_kv_heads)
         g = num_qo_heads // num_kv_heads
-        if g > 128:
-            raise unsupported(
-                CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
-            )
         for name, dt in (
             ("q_data_type", q_data_type),
             ("kv_data_type", kv_data_type),
@@ -251,16 +446,7 @@ class BatchInvariantAttention:
                     f"{name} {_dtype(dt)}",
                     "bf16 queries, keys, values and output",
                 )
-        if self.kind == "ragged":
-            page_size = 1
-        if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):
-            raise unsupported(
-                CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
-            )
-        if self.kind != "decode" and not causal:
-            raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
-            )
+        page_size = self._check_page_size(page_size)
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
                 CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
@@ -293,14 +479,7 @@ class BatchInvariantAttention:
             )
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
-        if window_left is None:
-            window_left = -1
-        if window_left < -1:
-            raise unsupported(
-                CLASS,
-                f"window_left {window_left}",
-                "window_left >= 0, or -1 for no window",
-            )
+        causal, window_left = self._check_mask_mode(causal, window_left)
         if sm_scale is not None:
             ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
             if ok:
@@ -314,73 +493,21 @@ class BatchInvariantAttention:
                     f"sm_scale {sm_scale}",
                     "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
                 )
-        if self.kind == "decode":
-            if q_len_per_req < 1:
-                raise unsupported(
-                    CLASS,
-                    f"q_len_per_req {q_len_per_req}",
-                    "at least one query token per request",
-                )
-            batch = int(kv_indptr.numel()) - 1
-            qo_indptr = torch.arange(
-                0, batch + 1, dtype=torch.int32, device="cpu"
-            ) * int(q_len_per_req)
-        else:
-            if qo_indptr is None:
-                raise unsupported(
-                    CLASS, "a plan without qo_indptr", "the packed query offsets"
-                )
-        kv_indptr_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        if bool((kv_indptr_host < 0).any()):
-            raise unsupported(
-                CLASS,
-                f"a negative kv_indptr entry ({int(kv_indptr_host.min())})",
-                "non-negative KV offsets",
-            )
-        if qo_host.numel() != kv_indptr_host.numel():
-            raise unsupported(
-                CLASS,
-                f"{qo_host.numel() - 1} query requests over {kv_indptr_host.numel() - 1} KV requests",
-                "one KV range per request",
-            )
-        kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
-        if qo_host.numel() and int(qo_host[0]) != 0:
-            raise unsupported(
-                CLASS,
-                f"qo_indptr starting at {int(qo_host[0])}",
-                "qo_indptr[0] == 0 (the packed query rows start at row 0)",
-            )
-        if kv_indptr_host.numel() and int(kv_indptr_host[-1]) >= 2**31:
-            raise unsupported(
-                CLASS,
-                f"kv_indptr[-1] = {int(kv_indptr_host[-1])}",
-                "page-table offsets below 2^31 (the kernels read them as int32)",
-            )
+        qo_host, kv_indptr_host = self._host_offsets(
+            qo_indptr, kv_indptr, q_len_per_req
+        )
         last_host = None
         max_page = -1
-        if self.kind == "ragged":
-            kv_lens = kv_spans.tolist()
-        else:
+        if self.kind != "ragged":
             if kv_last_page_len is None or kv_indices is None:
                 raise unsupported(
                     CLASS,
                     "a paged plan without kv_indices / kv_last_page_len",
                     "the paged KV CSR triple",
                 )
-            last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
-            if last_host.numel() != kv_spans.numel():
-                raise unsupported(
-                    CLASS,
-                    f"kv_last_page_len of {last_host.numel()} entries for {kv_spans.numel()} requests",
-                    "one last-page length per request",
-                )
-            if bool(((last_host < 0) | (last_host > page_size)).any()):
-                raise unsupported(
-                    CLASS,
-                    "a kv_last_page_len outside 0..page_size",
-                    f"last-page lengths in 0..{page_size}",
-                )
+            last_host = self._host_last_page_len(
+                kv_last_page_len, kv_indptr_host.numel() - 1, page_size
+            )
             n_pages = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
             if kv_indices.numel() < n_pages:
                 raise unsupported(
@@ -401,34 +528,24 @@ class BatchInvariantAttention:
                         CLASS, "a negative page index", "page indices in 0..num_pages-1"
                     )
                 max_page = hi  # checked against the cache at run()
-            # a request without pages has no keys, whatever its last-page entry (the planner's rule)
-            kv_lens = torch.where(
-                kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
-            ).tolist()
-        q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
-        for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
-            if ql < 0 or kl < 0:
-                raise unsupported(
-                    CLASS,
-                    f"request {i} with a decreasing qo_indptr / kv_indptr",
-                    "non-decreasing offsets",
-                )
-            if ql > kl:
-                raise unsupported(
-                    CLASS,
-                    f"request {i} with {ql} query tokens over {kl} keys",
-                    "kv_len >= q_len per request (the causal class)",
-                )
+        self._check_requests(qo_host, kv_indptr_host, last_host, page_size, causal)
         config = engine.default_config(D=D)
-        if D == 64 and self.kind != "decode":
+        if (
+            D in engine.Q2_DEFAULT_DIMS
+            and self.kind != "decode"
+            and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
+        ):
             from dataclasses import replace
 
             from .swaps.operands import arch_smem_cap
 
-            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill. Its two Q tiles and the
-            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
-            slots = 4 if arch_smem_cap(self.device) >= (300 << 10) else 3
-            config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
+            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill (paged and ragged) from GQA
+            # group engine.Q2_DEFAULT_MIN_GROUP up (smaller groups keep the one-warpgroup body). Its two Q tiles and the
+            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103) at
+            # D = 64; at D = 128 the placement fits the 328 KB parts only (engine.Q2_RING)
+            slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
+            if slots:
+                config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -443,6 +560,8 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                causal=causal,
+                has_sinks=has_sinks,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -464,6 +583,8 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    causal=causal,
+                    has_sinks=has_sinks,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -471,12 +592,10 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
-        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
-        # everything it runs with exists
-        kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
-        ).contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
+        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
+        # only once everything it runs with exists
         kv_indices_dev = (
             kv_indices.to(
                 device=self.device,
@@ -489,13 +608,14 @@ class BatchInvariantAttention:
         )
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr_dev
+        self._kv_indptr = planned.kv_indptr
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
         self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
         self._scale_log2 = scale_log2(self._sm_scale)
         self._window_left = int(window_left)
+        self._causal = causal
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
@@ -544,9 +664,11 @@ class BatchInvariantAttention:
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
-        if causal is not None and not causal and self.kind != "decode":
+        if causal is not None and bool(causal) != self._causal:
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                CLASS,
+                f"causal={bool(causal)} at forward() after planning causal={self._causal}",
+                "the planned mask mode (the causal and the non-causal class are two classes)",
             )
         if use_fp16_qk_reduction:
             raise unsupported(
@@ -579,28 +701,41 @@ class BatchInvariantAttention:
         enable_pdl: Optional[bool] = None,
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """Validate changing run-time inputs once, then launch with the fixed plan."""
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
+    ):
+        """Validate changing run-time inputs once, then launch with the fixed plan. ``return_lse``: ``(out, lse)`` with the LSE
+        member in ``lse_base`` (``"log2"`` | ``"ln"``) and ``lse_layout`` (``"NH"`` | ``"HN"``), written to ``lse`` when given (as
+        on the other backends, an ``lse`` buffer without ``return_lse`` is not used). ``sinks``: the fp32 ``(num_qo_heads,)``
+        per-head sink logits of the sink member."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        mismatch = engine.sinks_declaration_mismatch(self._planned.has_sinks, sinks)
+        if mismatch is not None:
+            raise unsupported(
+                CLASS,
+                mismatch,
+                "the same sinks choice at every run() of the plan (a new plan() changes the declaration)",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
                 "use_fp16_softmax / uses_spcompress",
                 "the fp32 softmax of the class",
             )
-        if return_lse or lse is not None:
-            raise unsupported(
-                CLASS,
-                "return_lse",
-                "the attention output alone (the class has no LSE member yet)",
-            )
+        if return_lse:
+            if lse_base not in LSE_BASES:
+                raise unsupported(
+                    CLASS, f"lse_base {lse_base!r}", 'lse_base "log2" or "ln"'
+                )
+            if lse_layout not in ("NH", "HN"):
+                raise unsupported(
+                    CLASS, f"lse_layout {lse_layout!r}", 'lse_layout "NH" or "HN"'
+                )
         if any(s is not None for s in scales):
             raise unsupported(
                 CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
             )
-        if sinks is not None:
-            raise unsupported(CLASS, "attention sinks", "plain softmax")
         if kv_cache_sf is not None:
             raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
         if skip_softmax_threshold_scale_factor is not None:
@@ -614,6 +749,8 @@ class BatchInvariantAttention:
                 "the planned window",
             )
         Hq, Hkv, D = self._heads
+        # the caller's tensor: the kernels may run on a reshaped or packed copy of it
+        q_source = q
         if q.dim() == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
         if q.dim() != 3 or q.shape[1] != Hq or q.shape[2] != D:
@@ -683,6 +820,7 @@ class BatchInvariantAttention:
                 "a q whose base address is not 16-byte aligned",
                 "a 16-byte-aligned q (the TMA descriptor's requirement)",
             )
+        storage = engine.plan_storage(self._planned)
         if out is None:
             out = torch.empty_like(q)
         elif (
@@ -703,6 +841,52 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        elif engine._overlaps_any(out, storage):
+            raise unsupported(
+                CLASS,
+                "an output that aliases the float workspace buffer",
+                "an output byte span disjoint from the workspace (the launch stores its split-KV partials there)",
+            )
+        lse_nh = None
+        if return_lse:
+            nh_shape = (q.shape[0], Hq)
+            if lse is not None:
+                shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
+                # the page table a run reads is the plan's own copy (plan() snapshots kv_indptr and kv_indices)
+                tables = (self._kv_indices, *engine.plan_tables(self._planned))
+                bad = engine.check_lse_buffer(
+                    lse,
+                    q,
+                    out,
+                    k,
+                    v,
+                    shape,
+                    q_source=q_source,
+                    storage=storage,
+                    tables=tables,
+                )
+                if bad is not None:
+                    raise unsupported(
+                        CLASS,
+                        f"an lse buffer {bad}",
+                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out, the KV cache nor the float workspace buffer",
+                    )
+            # the kernels write the (total_q, Hq) rows; the HN layout is a copy of them
+            lse_nh = (
+                lse
+                if lse is not None and lse_layout == "NH"
+                else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
+            )
+        if sinks is not None:
+            # the HN layout's copy writes the caller's buffer after the launch
+            written = (out, lse_nh, lse if return_lse else None, *storage)
+            bad = engine.check_sinks(sinks, Hq, self.device, written)
+            if bad is not None:
+                raise unsupported(
+                    CLASS,
+                    f"sinks {bad}",
+                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out, lse nor the float workspace buffer",
+                )
         engine._run_attention_validated(
             self._planned,
             q,
@@ -716,5 +900,16 @@ class BatchInvariantAttention:
             out,
             self._config,
             ragged=self.kind == "ragged",
+            enable_pdl=enable_pdl,
+            lse=lse_nh,
+            lse_mode=engine.LSE_MODES[lse_base] if return_lse else 0,
+            sinks=sinks,
         )
-        return out
+        if not return_lse:
+            return out
+        if lse_layout == "NH":
+            return out, lse_nh
+        if lse is None:
+            lse = torch.empty(nh_shape[::-1], dtype=torch.float32, device=self.device)
+        lse.copy_(lse_nh.t())
+        return out, lse

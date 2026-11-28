@@ -253,7 +253,7 @@ def test_forward_rejects_bad_tensor_contracts(field, value, message):
 
 
 def test_fp4_ties_saturation_and_signed_zero():
-    from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.shim.weights import (
+    from flashinfer.moe_ep.shims.sm100.kimi_k3.weights import (
         _pack_fp4,
         _quantize_expert,
     )
@@ -299,7 +299,7 @@ def test_fp4_ties_saturation_and_signed_zero():
 
 
 def test_weight_layouts_match_scalar_index_maps():
-    from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as native
+    from flashinfer.moe_ep.shims.sm100 import kimi_k3 as native
 
     weights = torch.arange(2 * 64 * 3).reshape(2, 64, 3)
     expected = torch.empty_like(weights)

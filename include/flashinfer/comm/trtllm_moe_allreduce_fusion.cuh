@@ -736,7 +736,8 @@ struct LamportComm {
       data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) +
                      static_cast<int64_t>(data_offset) * comm_size;
     }
-    clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
+    clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) +
+                static_cast<int64_t>(clear_offset) * comm_size;
     __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
@@ -872,9 +873,6 @@ struct neg_zero<float> {
 };
 
 template <typename T>
-__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T>
 __device__ bool is_negative_zero(T) {
   return false;
 }
@@ -925,7 +923,7 @@ __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 template <typename T>
 __device__ __forceinline__ void set_neg_zero(T* addr) {
   vec_t<T, 16 / sizeof(T)> val;
-  val.fill(neg_zero_v<T>);
+  val.fill(neg_zero<T>::value);
   val.store_global_volatile(addr);
 }
 
@@ -1321,8 +1319,13 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     }
 
     // * MoE finalize
-    vec_t<T, VEC_SIZE> accumulator;
-    accumulator.fill(0.f);
+    // Accumulate the top-k terms and the shared expert in fp32 and round to T once for the
+    // Lamport store; rounding after every term biases the routed output (TRT-LLM #16778).
+    float facc[VEC_SIZE];
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      facc[i] = 0.f;
+    }
 
     for (int k = 0; k < top_k; k++) {
       int const expanded_idx = token_id * top_k + k;
@@ -1341,11 +1344,13 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
             static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
 #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
-          // assume computation is done in ScaleType
-          accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
+          facc[i] += static_cast<float>(permuted_data[i]) * block_scale;
         }
       } else {
-        accumulator = vec_add<T, VEC_SIZE>(accumulator, permuted_data);
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          facc[i] += static_cast<float>(permuted_data[i]);
+        }
       }
     }
 
@@ -1353,7 +1358,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
     if (use_routed_scaling_factor) {
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        accumulator[i] = static_cast<T>(static_cast<float>(accumulator[i]) * routed_scaling_factor);
+        facc[i] *= routed_scaling_factor;
       }
     }
 
@@ -1365,7 +1370,15 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
                                 thread_offset_across_token);
 #pragma unroll
-      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        facc[i] += static_cast<float>(shared_expert_output[i]);
+      }
+    }
+
+    vec_t<T, VEC_SIZE> accumulator;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      accumulator[i] = static_cast<T>(facc[i]);
     }
 
     // * AR Store

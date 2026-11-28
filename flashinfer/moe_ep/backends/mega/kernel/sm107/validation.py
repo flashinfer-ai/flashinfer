@@ -13,7 +13,7 @@ from .....core.validation.common import MoEEpConfigError
 def make_workspace_config(
     k, fleet_params, *, rank, world_size, quant_kind, gate_up_clamp, overrides
 ):
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         KNOB_KEYS,
         Sm107BlockScaledMoeConfig,
     )
@@ -60,6 +60,10 @@ def make_workspace_config(
                 if getattr(k, "batch_invariant", False)
                 else {}
             ),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **block_scaled_batch_invariant_metadata(k),

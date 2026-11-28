@@ -26,6 +26,7 @@ import flashinfer
 from flashinfer import batch_invariant as bi
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.batch_invariant.fp_interface import exact
+from flashinfer.gemm.batch_invariant import api as bi_api
 from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.api import (
     GEMM_FP8BS_ARCHS,
@@ -520,15 +521,16 @@ def test_k_native_scale_staging_is_a_placement():
     seen = []
     real = compile_fp8bs.get_compiled_fp8bs
 
-    def recording(cfg, clusters, out_fmt="bf16", family="", native_k=False):
+    def recording(cfg, out_fmt="bf16", family="", native_k=False):
         seen.append(native_k)
-        return real(cfg, clusters, out_fmt, family, native_k)
+        return real(cfg, out_fmt, family, native_k)
 
     compile_fp8bs.get_compiled_fp8bs = recording
     try:
         for M, mode, want in ((16, "K", True), (128, "K", False), (16, "MN", False)):
             a, w, sa, sb = operands(M, 2048, 1024, seed=85)
             seen.clear()
+            bi_api.clear_kernel_cache()  # the launch asks the compile again (its handle cache is per record and staging)
             api(a, w, sa, sb, mode)
             assert seen and all(v == want for v in seen), (M, mode, seen)
     finally:
@@ -798,6 +800,39 @@ def test_trace_apply_does_not_replace_the_class():
         assert ta.stats().get(key, {}).get("fallback_batch_invariant", 0) >= 1
     finally:
         ta.disable_apply()
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (300, 576, 1024)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    a, w, sa, sb = operands(M, N, K, seed=181)
+    ref = bits(ours(a, w, sa, sb))
+    for mode in ("K", "MN"):
+        assert torch.equal(bits(api(a, w, sa, sb, mode)), ref)
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        assert api(a, w, sa, sb, mode, out=out) is out and torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        api(a, w, sa, sb, "K", out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            api(a, w, sa, sb, "K", out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    buf = torch.empty(M * max(2 * N, K), dtype=torch.uint8, device="cuda")
+    alias_a = buf[: M * K].view(E4).view(M, K)
+    alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        api(alias_a, w, sa, sb, "K", out=alias_out)
 
 
 @needs_device

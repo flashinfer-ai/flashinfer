@@ -34,7 +34,7 @@ def test_explicit_workspace_knobs_and_graph_replay(monkeypatch, tmp_path):
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
@@ -74,7 +74,7 @@ def test_explicit_workspace_knobs_and_graph_replay(monkeypatch, tmp_path):
             MegaConfig(
                 megakernel=dataclasses.replace(config, knobs=None),
                 preprocess_weights=False,
-                transformed_weights=reference._get_transformed_weights(),
+                transformed_weights=reference.get_transformed_weights(),
             ),
         )
         selected = fixed.create_workspace(fleet.max_tokens_per_rank, knobs=knobs)
