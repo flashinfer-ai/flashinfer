@@ -145,7 +145,15 @@ def _checkpoint(experts: int, k: int, i: int, device):
     )
 
 
-def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
+def _prepare_experts(
+    fused_moe,
+    experts: int,
+    k: int,
+    i: int,
+    device,
+    *,
+    activation: str = "silu",
+):
     """Plan and prepare synthetic MXFP8 experts through the public API."""
     w13, w13_scale, w2, w2_scale = _checkpoint(experts, k, i, device)
     plan = fused_moe.plan_weights(
@@ -155,7 +163,7 @@ def _prepare_experts(fused_moe, experts: int, k: int, i: int, device):
         ),
         activation=fused_moe.ActivationSpec(
             mode=fused_moe.ActivationMode.A8,
-            nonlinearity="silu",
+            nonlinearity=activation,
             io_dtype=torch.bfloat16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -692,9 +700,12 @@ def test_mxfp8_scaled_roundtrip_matches_the_device_ue8m0_rule() -> None:
 # 640 is the TP=1 MTP shard (128-aligned, shared FC1 descriptor); 320 the TP=2
 # shard and 96 a sub-128 shard, both on the split up/gate FC1 descriptors
 # with a TMA zero-filled tail tile.
+@pytest.mark.parametrize("activation", ["silu", "situ"])
 @pytest.mark.parametrize("i", [INTERMEDIATE_SIZE, 320, 96])
 @pytest.mark.parametrize("tokens", [1, 5, 16])
-def test_w8a8_matches_oracle_on_model_geometry(tokens: int, i: int) -> None:
+def test_w8a8_matches_oracle_on_model_geometry(
+    tokens: int, i: int, activation: str
+) -> None:
     """Native MXFP8 experts reproduce the pure-torch oracle.
 
     tokens=1 is the sparsest grouped tile, 5 a partial 128-row tile, 16 the
@@ -711,7 +722,9 @@ def test_w8a8_matches_oracle_on_model_geometry(tokens: int, i: int) -> None:
 
     device = torch.device("cuda")
     experts, k = NUM_EXPERTS, HIDDEN_SIZE
-    prepared, native = _prepare_experts(fused_moe, experts, k, i, device)
+    prepared, native = _prepare_experts(
+        fused_moe, experts, k, i, device, activation=activation
+    )
     a = (torch.randn(tokens, k, device=device) * 0.25).to(torch.bfloat16)
     topk_ids, topk_weights = _routes(experts, tokens, TOP_K, device)
     output = torch.empty(tokens, k, dtype=torch.bfloat16, device=device)
@@ -741,6 +754,7 @@ def test_w8a8_matches_oracle_on_model_geometry(tokens: int, i: int) -> None:
         i,
         a1_gscale=native["a1_gscale"],
         a2_gscale=native["a2_gscale"],
+        activation=activation,
     )
     assert bool(torch.isfinite(actual.float()).all().item())
     metrics = compare_to_reference(actual.float(), reference)

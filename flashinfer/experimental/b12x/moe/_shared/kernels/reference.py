@@ -1371,8 +1371,10 @@ def moe_reference_w8a8_mx(
             swiglu_beta,
         )
     )
-    if activation != "silu":
-        raise NotImplementedError("the W8A8-MXFP8 recipe is qualified for silu only")
+    if activation not in {"silu", "situ"}:
+        raise NotImplementedError(
+            "the W8A8-MXFP8 recipe is qualified for silu and situ only"
+        )
     _validate_reference_inputs(w1_e4m3, I_tp, activation)
     if K % 128 != 0 or I_tp % 32 != 0:
         raise ValueError("w8a8_mx requires K % 128 == 0 and I_tp % 32 == 0")
