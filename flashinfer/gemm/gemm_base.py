@@ -12641,6 +12641,14 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
     )
 
 
+def _gemm_fp8_nt_blockscaled_scale_granularity(a: torch.Tensor) -> Tuple[int, int, int]:
+    # At M=1 the block scale is already a per-row scale. Reuse the SM12x
+    # per-row kernel without padding or materializing a new scale tensor.
+    if a.shape[0] == 1 and is_sm12x_supported(a.device):
+        return (1, 128, 128)
+    return (128, 128, 128)
+
+
 @supported_compute_capability([100, 103, 107, 120, 121])
 def _check_gemm_fp8_nt_blockscaled_problem_size(
     a: torch.Tensor,
@@ -12672,7 +12680,7 @@ def _check_gemm_fp8_nt_blockscaled_problem_size(
         b_scale,
         scale_major_mode,
         mma_sm,
-        scale_granularity_mnk=(128, 128, 128),
+        scale_granularity_mnk=_gemm_fp8_nt_blockscaled_scale_granularity(a),
         out=out,
         out_dtype=out_dtype,
         backend="cutlass",
@@ -12701,6 +12709,10 @@ def gemm_fp8_nt_blockscaled(
     Block-scaled scaling is a special case of groupwise scaling where the scale
     granularity is ``(128, 128, 128)``.  See :func:`gemm_fp8_nt_groupwise` for the
     semantics of each parameter.
+
+    On SM120/121, ``M=1`` is supported with 128-aligned ``N`` and ``K``. The
+    single-row block scale is reused as a per-row scale without padding or
+    re-quantization; other partial M blocks remain unsupported on these devices.
 
     Parameters
     ----------
@@ -12734,7 +12746,7 @@ def gemm_fp8_nt_blockscaled(
         b,
         a_scale,
         b_scale,
-        scale_granularity_mnk=(128, 128, 128),
+        scale_granularity_mnk=_gemm_fp8_nt_blockscaled_scale_granularity(a),
         scale_major_mode=scale_major_mode,
         mma_sm=mma_sm,
         out=out,
