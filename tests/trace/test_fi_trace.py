@@ -1244,6 +1244,54 @@ def test_gqa_paged_decode_fi_trace():
     ]
 
 
+def test_gqa_paged_decode_reference_partial_last_page():
+    """Verify that _gqa_paged_decode_reference respects kv_last_page_len and ignores unused slots."""
+    import math
+    from flashinfer.trace.templates.attention import _gqa_paged_decode_reference
+
+    batch_size = 2
+    num_qo_heads = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 16
+    total_pages = 4  # Seq 0 has 1 page, Seq 1 has 3 pages
+
+    q = torch.zeros(batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.zeros(total_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
+    v_cache = torch.full((total_pages, page_size, num_kv_heads, head_dim), 10.0, dtype=torch.bfloat16)
+
+    # For sequence 0: only slot 0 of page 0 is valid and has value 0.0; remaining 15 slots have 10.0
+    v_cache[0, 0] = 0.0
+    # For sequence 1: pages 1 and 2 are full (32 tokens with 10.0); page 3 has only 5 valid tokens with 10.0,
+    # and the trailing 11 slots are junk (filled with 1000.0)
+    v_cache[3, 5:] = 1000.0
+
+    kv_indptr = torch.tensor([0, 1, 4], dtype=torch.int32)
+    kv_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    kv_last_page_len = torch.tensor([1, 5], dtype=torch.int32)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    out, lse = _gqa_paged_decode_reference(
+        q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale, kv_last_page_len=kv_last_page_len
+    )
+
+    # Seq 0 has 1 valid token with V=0.0: output must be 0.0, lse = log2(1) = 0.0
+    assert torch.allclose(out[0], torch.zeros_like(out[0]), atol=1e-5)
+    assert torch.allclose(lse[0], torch.zeros_like(lse[0]), atol=1e-5)
+
+    # Seq 1 has 32 + 5 = 37 valid tokens all with V=10.0: output must be 10.0 (the 1000.0 junk tokens are excluded)
+    assert torch.allclose(out[1], torch.full_like(out[1], 10.0), atol=1e-3)
+    assert torch.allclose(lse[1], torch.full_like(lse[1], math.log2(37)), atol=1e-3)
+
+    # When kv_last_page_len is None, all slots are included (backward compatibility)
+    out_all, lse_all = _gqa_paged_decode_reference(
+        q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale, kv_last_page_len=None
+    )
+    # Seq 0 includes all 16 slots (1 of 0.0 + 15 of 10.0 -> mean 9.375)
+    assert out_all[0].float().mean() > 5.0
+    assert torch.allclose(lse_all[0], torch.full_like(lse_all[0], math.log2(16)), atol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # GQA ragged prefill
 # ---------------------------------------------------------------------------

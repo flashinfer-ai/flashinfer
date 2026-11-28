@@ -113,7 +113,9 @@ def _attention_check(
 
 
 @torch.no_grad()
-def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
+def _gqa_paged_decode_reference(
+    q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale, kv_last_page_len=None
+):
     batch_size, num_qo_heads, head_dim = q.shape
     _, page_size, num_kv_heads, _ = k_cache.shape
 
@@ -139,6 +141,14 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
         page_ids = kv_indices[page_start:page_end].to(torch.long)
         k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
         v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
+        if kv_last_page_len is not None:
+            last_len = int(kv_last_page_len[b].item())
+            valid_len = (page_end - page_start - 1) * page_size + last_len
+            if valid_len <= 0:
+                output[b].zero_()
+                continue
+            k_b = k_b[:valid_len]
+            v_b = v_b[:valid_len]
         q_b = q[b].to(torch.float32)  # [num_qo_heads, head_dim]
         for h in range(num_qo_heads):
             kv_h = h // gqa_ratio
@@ -252,6 +262,11 @@ gqa_paged_decode_trace = TraceTemplate(
             ["num_kv_indices"],
             optional=True,
             description="Page IDs for KV cache lookups. Set during plan(), not run().",
+        ),
+        "kv_last_page_len": Tensor(
+            ["batch_size"],
+            optional=True,
+            description="Length of valid KV tokens in the last page for each sequence. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
