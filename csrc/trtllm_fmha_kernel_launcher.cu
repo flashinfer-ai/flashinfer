@@ -1328,7 +1328,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   int const sparse_kv_stride_batch = kv_stride_keys_values;
   int const q_stride_tokens = query.stride(0);
   int const q_stride_heads = query.stride(1);
-  int const sparse_num_pages_in_mem_pool = primary_kv_cache.size(0) * primary_kv_cache.size(-2);
+  int const sparse_num_pages_in_mem_pool =
+      (primary_kv_cache.size(0) - 1) * primary_layout.page_coordinate_stride +
+      primary_layout.page_size;
 
   int* sparse_indices_ptr = static_cast<int*>(sparse_indices.data_ptr());
   bool const needs_index_remap =

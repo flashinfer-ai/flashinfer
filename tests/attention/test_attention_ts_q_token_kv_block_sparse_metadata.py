@@ -17,7 +17,6 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import math
-from contextlib import contextmanager
 from itertools import accumulate
 
 import pytest
@@ -39,6 +38,7 @@ from flashinfer.decode import (
     suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size,
 )
+from tests.attention.test_helpers.test_helpers import tensor_at_unmapped_boundary
 
 
 # The sparse attention specialization targets SM100/SM103/SM107. Metadata-only tests
@@ -48,57 +48,6 @@ _REQUIRES_PRIMS_TS_ATTENTION = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="QToken-KvBlock-Sparse-Attention tests require SM100, SM103 or SM107",
 )
-
-
-@contextmanager
-def _query_at_unmapped_boundary(shape, dtype):
-    """Place the last query byte immediately before an unmapped VMM page."""
-    from cuda.bindings import driver as cu
-
-    def check(result):
-        assert result[0] == cu.CUresult.CUDA_SUCCESS, result
-        return result[1] if len(result) > 1 else None
-
-    torch.cuda.init()
-    prop = cu.CUmemAllocationProp()
-    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-    prop.location.id = torch.cuda.current_device()
-    granularity = check(
-        cu.cuMemGetAllocationGranularity(
-            prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
-        )
-    )
-    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-    assert nbytes <= granularity
-    reservation = check(cu.cuMemAddressReserve(2 * granularity, granularity, 0, 0))
-    handle, mapped = None, False
-    try:
-        handle = check(cu.cuMemCreate(granularity, prop, 0))
-        check(cu.cuMemMap(reservation, granularity, 0, handle, 0))
-        mapped = True
-        access = cu.CUmemAccessDesc()
-        access.location = prop.location
-        access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        check(cu.cuMemSetAccess(reservation, granularity, [access], 1))
-
-        class Array:
-            __cuda_array_interface__ = {
-                "shape": (nbytes,),
-                "typestr": "|u1",
-                "data": (int(reservation) + granularity - nbytes, False),
-                "version": 3,
-            }
-
-        raw = torch.as_tensor(Array(), device="cuda")
-        yield raw.view(dtype).view(shape)
-        torch.cuda.synchronize()
-    finally:
-        if mapped:
-            check(cu.cuMemUnmap(reservation, granularity))
-        if handle is not None:
-            check(cu.cuMemRelease(handle))
-        check(cu.cuMemAddressFree(reservation, 2 * granularity))
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
@@ -120,7 +69,7 @@ def test_packed_fp8_query_allocation_boundary_graph(head_dim, group_size):
     )
     key, value = cache[..., :head_dim], cache[..., head_dim:]
     host_key, host_value = key.float().cpu(), value.float().cpu()
-    with _query_at_unmapped_boundary(
+    with tensor_at_unmapped_boundary(
         (tokens, heads, head_dim), torch.float8_e4m3fn
     ) as query:
         query.copy_(torch.randn(query.shape, device="cuda") * 0.25)
