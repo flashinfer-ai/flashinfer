@@ -1,0 +1,99 @@
+{
+ "tree": "deep_gemm",
+ "description": "Include closure of DeepGEMM's SM100 FP8 x FP4 MegaMoE kernel header (deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh), byte-identical to upstream, without that header itself: this package owns its MOSCA-modified copy (derived_sources). No host code, no Python, no other kernels; CuTe/CUTLASS come from FlashInfer's 3rdparty/cutlass.",
+ "upstream": {
+  "repository": "https://github.com/sgl-project/DeepGEMM",
+  "commit": "1ff3932f0f9d9187b92afb476da4e3ade10a6575",
+  "include_root": "deep_gemm/include"
+ },
+ "derived_sources": {
+  "description": "Files of this package (paths relative to it) that are an upstream file (path relative to the upstream repository) with MOSCA's changes. Each keeps upstream's layout, and formatters skip it. On re-sync, merge the upstream change into the file (VENDOR.md).",
+  "files": {
+   "csrc/megamoe/sm100_fp8_fp4_mega_moe.cuh": {
+    "upstream": "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh",
+    "upstream_sha256": "1cc2fcc1d9de2852658b6213aad3ffb6ec53486b2ef3f377dc13e7e54c74a110",
+    "lines_added": 163,
+    "lines_removed": 13,
+    "macros": [
+     "DGX_SMALL_T",
+     "DGX_SPARSE_COUNT",
+     "DGX_BCAST"
+    ],
+    "regions": {
+     "DGX_SMALL_T": [
+      "481-494",
+      "502-515",
+      "540-544",
+      "564-581"
+     ],
+     "DGX_SPARSE_COUNT": [
+      "483-491",
+      "516-518",
+      "572-576"
+     ],
+     "DGX_BCAST": [
+      "135-143",
+      "895-899",
+      "1776-1782",
+      "1970-1984",
+      "2001-2011"
+     ]
+    },
+    "outside_regions": "the license and provenance header (40 lines), comments, two upstream blocks wrapped in braces for the small-T branch, and the parameter rename num_tokens -> num_tokens_arg"
+   }
+  }
+ },
+ "ported_host_sources": {
+  "description": "Upstream host files (paths relative to the upstream repository, at the upstream commit) that this package re-implements instead of vendoring. MOSCA's host-side additions are this package's own code. Re-check them on every re-sync; a changed hash means the port must be re-diffed.",
+  "files": {
+   "csrc/apis/mega_moe.hpp": {
+    "sha256": "769886ce57b36198296dd1697898d98ef853ed47f379901f6f1b2fd6023888e0",
+    "ported_to": "csrc/megamoe/sm100_fp8_fp4_planner.cu"
+   },
+   "csrc/jit_kernels/heuristics/mega_moe.hpp": {
+    "sha256": "53b86592ba17ad7d7914d2132d995ac121c588396f0eac3efa96e46d0a818146",
+    "ported_to": "csrc/megamoe/sm100_fp8_fp4_planner.cu"
+   },
+   "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp": {
+    "sha256": "89a72d20dc0f45887b798a47b8c66763841e8cc9645f5907d3cca1c8f2d484ca",
+    "ported_to": "csrc/megamoe/sm100_fp8_fp4_launcher.cu"
+   },
+   "csrc/jit_kernels/impls/runtime_utils.hpp": {
+    "sha256": "3176d09392629d7f2f016bfa7e9c5004f3990d368b05565db8e924d921f9758b",
+    "ported_to": "csrc/megamoe/sm100_fp8_fp4_launcher.cu"
+   },
+   "deep_gemm/mega/__init__.py": {
+    "sha256": "66b80993b9a0f5ad9b2b1abb01cead454e3e74c2897dac7a1d28762b075268c5",
+    "ported_to": "megamoe/weights.py"
+   },
+   "deep_gemm/utils/math.py": {
+    "sha256": "f6c76feaf76f917bb869b12b73dd83a34ec33b46445fdb6e2f731e2b561b640d",
+    "ported_to": "megamoe/weights.py, megamoe/staging.py"
+   }
+  }
+ },
+ "toolchain": {
+  "description": "The vendored kernel compiles against FlashInfer's CUTLASS/CuTe and CCCL, not DeepGEMM's submodules; outputs are checked bitwise against the stable backend built on DeepGEMM's own toolchain.",
+  "deep_gemm_cutlass_submodule": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
+  "flashinfer_cutlass_submodule": "b46b16d003484063bca4ed365e44095c4c6ed633"
+ },
+ "files": {
+  "deep_gemm/comm/barrier.cuh": "682e351a48c6b143e4556a883cceaa455bc108f47b42e5cf03aadc7adc6e3d11",
+  "deep_gemm/common/compile.cuh": "a13373053608b286c1ac39ce771cdd6ab133f44ec4f016bd6fcbc5032132a1a9",
+  "deep_gemm/common/cute_tie.cuh": "872af0b873a9b367c01eaf68c321ddcd9d0f3c26ce7b8d3abfc8a66d89b8ad65",
+  "deep_gemm/common/exception.cuh": "ab6b2bd75c06c054fbbe97d5897efa7909d380ad531620770c031b3debdf2123",
+  "deep_gemm/common/math.cuh": "4b611735478d5610831fe90f8cfefbc6237860ea555a722e6029bf0e6fe540b7",
+  "deep_gemm/common/packing.cuh": "7b216c4a4f94e6691e2f553b204f697257eac1312b71fd7d24e7b420815c67b8",
+  "deep_gemm/common/tma_copy.cuh": "56d1da681f345a9fe59a850f35ad580bcb6b4defab695e42e50d0ed919ba5daa",
+  "deep_gemm/common/types.cuh": "8b1fc343a774f3025855249eecf3bf9402ccd6e688b285a1956e320e8e2faeb2",
+  "deep_gemm/common/utils.cuh": "55e53fc49a096c6b24774b0c99ce947dbb3f81a55ccf61a20581ed78a9c98702",
+  "deep_gemm/layout/mega_moe.cuh": "1fe869794b95d2540c5dd8615d7279b6e45da1f3fe5ff7909e82bf1d1061953f",
+  "deep_gemm/layout/sym_buffer.cuh": "b157512fd62a20bf09a8fab489d4dc209751d0560c1343829e78374dbf6578cb",
+  "deep_gemm/mma/sm100.cuh": "439c57d8aa4914c01dcb55a874ace4fdaecec4682ea1099ba36e3cb8b23f41ab",
+  "deep_gemm/ptx/ld_st.cuh": "36f4d320b4dbef7f6428e111d08ce5b0217e959dad7f19f739b571cf484a72c2",
+  "deep_gemm/ptx/tcgen05.cuh": "69a3f9a8c6291aa44b16ab5e3c8fee9a66c64bab569561ad3cbc860ab53aae53",
+  "deep_gemm/ptx/tma.cuh": "1cb2adfa2e0d836ac8c6ed5d9c72fb9dc920761e69082a88cbbd81bfe488d0d9",
+  "deep_gemm/ptx/utils.cuh": "8a9d5e03afdeb20f53b1027e9f6f3a2ef45bb33152dba2b61d778684e1716412",
+  "deep_gemm/scheduler/mega_moe.cuh": "3973754847e0a5e571672565124b352fc21ab2d523f25966c2d9de340b5b0d10"
+ }
+}
